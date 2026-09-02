@@ -258,8 +258,7 @@ impl<const WORDS: usize> SliceMap<WORDS> {
 
     /// Whether slice `idx` is free and known to be all zero.
     pub fn is_zero(&self, idx: usize) -> bool {
-        let rel = self.rel(idx, 1);
-        (self.zero[rel / BITS] >> (rel % BITS)) & 1 == 1
+        bit(&self.zero, self.rel(idx, 1))
     }
 
     /// Whether every slice of `[start, start + count)` is free; vacuously true for `count == 0`.
@@ -417,7 +416,7 @@ impl<const WORDS: usize> SliceMap<WORDS> {
 
     #[inline]
     fn bit_is_free(&self, rel: usize) -> bool {
-        (self.free[rel / BITS] >> (rel % BITS)) & 1 == 1
+        bit(&self.free, rel)
     }
 
     /// Highest non-free slice strictly below `pos` (`pos <= CAPACITY`).
@@ -426,7 +425,8 @@ impl<const WORDS: usize> SliceMap<WORDS> {
         if pos == 0 {
             return None;
         }
-        let mut w = (pos - 1) / BITS;
+        // `min` keeps the index provably in bounds; `pos <= CAPACITY` makes it a no-op.
+        let mut w = ((pos - 1) / BITS).min(WORDS - 1);
         let mut b = !self.free[w] & (u64::MAX >> (BITS - 1 - (pos - 1) % BITS));
         loop {
             if b != 0 {
@@ -464,6 +464,9 @@ impl<const WORDS: usize> SliceMap<WORDS> {
     #[inline]
     fn next_clear(&self, pos: usize) -> usize {
         let mut w = pos / BITS;
+        if w >= WORDS {
+            return Self::CAPACITY;
+        }
         // Bits below `pos` are treated as set so they cannot end the run early.
         let mut b = self.free[w] | !(u64::MAX << (pos % BITS));
         loop {
@@ -484,6 +487,12 @@ impl<const WORDS: usize> SliceMap<WORDS> {
         debug_assert!(all_set(&self.free, rel, count));
         let mut zeroed = true;
         for (w, m) in word_masks(rel, count) {
+            if w >= WORDS {
+                // Unreachable for a range inside the map (the caller's precondition, checked in
+                // debug builds); the test is what lets the indexing below compile without a
+                // bounds-check panic path.
+                break;
+            }
             self.free[w] &= !m;
             zeroed &= self.zero[w] & m == m;
             self.zero[w] &= !m;
@@ -499,6 +508,14 @@ impl<const WORDS: usize> SliceMap<WORDS> {
         set_bits(&mut self.free, rel, count);
         self.hint = self.hint.min(rel / BITS);
     }
+}
+
+/// Bit `rel` of a bitmap; false for an index beyond it (a caller bug that debug builds report
+/// in `rel`; the test keeps the release build free of a bounds-check panic path).
+#[inline]
+fn bit<const WORDS: usize>(bits: &[u64; WORDS], rel: usize) -> bool {
+    let w = rel / BITS;
+    w < WORDS && (bits[w] >> (rel % BITS)) & 1 == 1
 }
 
 /// `n` consecutive bits starting at `bit`, with `1 <= n` and `bit + n <= 64`.
@@ -560,19 +577,28 @@ fn word_masks(rel: usize, count: usize) -> WordMasks {
     }
 }
 
+// The three range helpers take the bitmap array, not a slice, and test each word index against
+// WORDS before indexing: a range that leaves the map is a caller bug that debug builds report,
+// and the release build must not carry a bounds-check panic path for it (roofline 12.3 and 12.6:
+// __rust_realloc held three such paths and the strings they keep alive). A range beyond the
+// map counts as neither all set nor all clear, and setting bits there does nothing.
+
 #[inline]
-fn all_set(bits: &[u64], rel: usize, count: usize) -> bool {
-    word_masks(rel, count).all(|(w, m)| bits[w] & m == m)
+fn all_set<const WORDS: usize>(bits: &[u64; WORDS], rel: usize, count: usize) -> bool {
+    word_masks(rel, count).all(|(w, m)| w < WORDS && bits[w] & m == m)
 }
 
 #[inline]
-fn all_clear(bits: &[u64], rel: usize, count: usize) -> bool {
-    word_masks(rel, count).all(|(w, m)| bits[w] & m == 0)
+fn all_clear<const WORDS: usize>(bits: &[u64; WORDS], rel: usize, count: usize) -> bool {
+    word_masks(rel, count).all(|(w, m)| w < WORDS && bits[w] & m == 0)
 }
 
 #[inline]
-fn set_bits(bits: &mut [u64], rel: usize, count: usize) {
+fn set_bits<const WORDS: usize>(bits: &mut [u64; WORDS], rel: usize, count: usize) {
     for (w, m) in word_masks(rel, count) {
+        if w >= WORDS {
+            break;
+        }
         bits[w] |= m;
     }
 }
@@ -605,11 +631,12 @@ impl GrowPolicy {
     };
 
     /// The growth step for a heap of `heap` slices: the policy's fraction of it, clamped to the
-    /// policy's range.
+    /// policy's range. A zero divisor (a caller bug that debug builds report) acts as one, so the
+    /// division carries no panic path into the release build.
     #[inline]
     pub fn step(&self, heap: usize) -> usize {
         debug_assert!(self.step_divisor > 0);
-        (heap / self.step_divisor)
+        (heap / self.step_divisor.max(1))
             .max(self.min_grow)
             .min(self.max_grow)
     }

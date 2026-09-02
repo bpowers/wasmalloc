@@ -62,7 +62,21 @@ use crate::slices::{self, GrowPolicy, SliceMap};
 
 /// Queue index for pages that are full.
 const FULL_QUEUE: usize = BIN_COUNT;
-const QUEUE_COUNT: usize = BIN_COUNT + 1;
+/// Queues: one per bin, the full queue, and padding to a power of two so that a queue index
+/// can be masked (see [`queue_index`]).
+const QUEUE_COUNT: usize = (BIN_COUNT + 1).next_power_of_two();
+const _: () = assert!(FULL_QUEUE < QUEUE_COUNT && QUEUE_COUNT.is_power_of_two());
+
+/// A queue index that is provably in bounds. Queue indices come from a page header's `bin` byte
+/// or from `bins::bin`, both in `1..=MAX_BIN` by the invariants, but the compiler cannot see
+/// that and would guard every `queues[..]` with a bounds-check panic path (three of them in
+/// `__rust_realloc`, roofline 12.3). Masking costs one instruction on cold paths and turns a
+/// broken invariant, which debug builds report here, into a wrong queue rather than an abort.
+#[inline(always)]
+fn queue_index(qi: usize) -> usize {
+    debug_assert!(qi < QUEUE_COUNT, "queue index {qi} out of range");
+    qi & (QUEUE_COUNT - 1)
+}
 
 /// Retirement: how many collection rounds an empty page survives before its slices are freed,
 /// so a page that oscillates between empty and one block is not freed and re-acquired
@@ -501,7 +515,7 @@ impl<M: Memory, const WORDS: usize> Heap<M, WORDS> {
         // with an immediately available block or after MAX_CANDIDATES extra pages.
         let mut candidate: *mut Page = ptr::null_mut();
         let mut limit = MAX_CANDIDATES as isize;
-        let mut cur = self.queues[qi].first;
+        let mut cur = self.queues[queue_index(qi)].first;
         while cur != 0 {
             let page = self.page_at(cur);
             // SAFETY: queue members are live pages of this heap.
@@ -593,7 +607,7 @@ impl<M: Memory, const WORDS: usize> Heap<M, WORDS> {
             }
             let qi = (*page).bin as usize;
             let bsize = (*page).block_size as usize;
-            let count = self.queues[qi].count;
+            let count = self.queues[queue_index(qi)].count;
             if count <= RETIRE_MAX_PAGES && (count == 1 || bsize < DIRECT_MAX_SIZE) {
                 (*page).retire_expire = if bsize <= SMALL_MAX_OBJ_SIZE {
                     RETIRE_CYCLES
@@ -623,7 +637,7 @@ impl<M: Memory, const WORDS: usize> Heap<M, WORDS> {
         let mut max = 0;
         if lo <= hi {
             for qi in lo..=hi.min(MAX_BIN as usize) {
-                let mut cur = self.queues[qi].first;
+                let mut cur = self.queues[queue_index(qi)].first;
                 let mut seen = 0;
                 while cur != 0 && seen < RETIRE_MAX_PAGES {
                     let page = self.page_at(cur);
@@ -684,20 +698,24 @@ impl<M: Memory, const WORDS: usize> Heap<M, WORDS> {
         if lo > hi {
             return;
         }
-        let first = self.queues[bin].first;
+        let first = self.queues[queue_index(bin)].first;
         let target = if first == 0 {
             sentinel()
         } else {
             self.page_at(first)
         };
-        for entry in &mut self.direct[lo..=hi] {
-            *entry = target;
+        // `hi` is below DIRECT_ENTRIES by construction. An index loop with the bound in its
+        // condition, rather than a range slice, is what compiles without a panic path.
+        let mut i = lo;
+        while i <= hi && i < DIRECT_ENTRIES {
+            self.direct[i] = target;
+            i += 1;
         }
     }
 
     unsafe fn push_front(&mut self, qi: usize, page: *mut Page) {
         let addr = page as usize;
-        let first = self.queues[qi].first;
+        let first = self.queues[queue_index(qi)].first;
         // SAFETY: `page` is a live page not in any queue; `first` is a live page or 0.
         unsafe {
             (*page).next = first;
@@ -706,7 +724,7 @@ impl<M: Memory, const WORDS: usize> Heap<M, WORDS> {
                 (*self.page_at(first)).prev = addr;
             }
         }
-        let q = &mut self.queues[qi];
+        let q = &mut self.queues[queue_index(qi)];
         if first == 0 {
             q.last = addr;
         }
@@ -717,7 +735,7 @@ impl<M: Memory, const WORDS: usize> Heap<M, WORDS> {
 
     unsafe fn push_back(&mut self, qi: usize, page: *mut Page) {
         let addr = page as usize;
-        let last = self.queues[qi].last;
+        let last = self.queues[queue_index(qi)].last;
         // SAFETY: as for push_front.
         unsafe {
             (*page).prev = last;
@@ -726,7 +744,7 @@ impl<M: Memory, const WORDS: usize> Heap<M, WORDS> {
                 (*self.page_at(last)).next = addr;
             }
         }
-        let q = &mut self.queues[qi];
+        let q = &mut self.queues[queue_index(qi)];
         let was_empty = q.first == 0;
         if was_empty {
             q.first = addr;
@@ -749,7 +767,7 @@ impl<M: Memory, const WORDS: usize> Heap<M, WORDS> {
             if next != 0 {
                 (*self.page_at(next)).prev = prev;
             }
-            let q = &mut self.queues[qi];
+            let q = &mut self.queues[queue_index(qi)];
             let was_first = q.first == addr;
             if was_first {
                 q.first = next;
@@ -768,7 +786,7 @@ impl<M: Memory, const WORDS: usize> Heap<M, WORDS> {
     }
 
     unsafe fn move_to_front(&mut self, qi: usize, page: *mut Page) {
-        if self.queues[qi].first == page as usize {
+        if self.queues[queue_index(qi)].first == page as usize {
             return;
         }
         // SAFETY: `page` is a live member of queue `qi`.
