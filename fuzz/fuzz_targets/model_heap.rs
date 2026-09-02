@@ -43,6 +43,7 @@ fuzz_target!(|data: &[u8]| {
         heap.set_grow_policy(GrowPolicy {
             min_grow: 2,
             max_grow: 64,
+            ..GrowPolicy::DEFAULT
         });
         if let Err(failure) = model::run_with(&mut heap, &mut source, usize::MAX, profile) {
             panic!("{failure}");

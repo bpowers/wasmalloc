@@ -24,6 +24,7 @@ fn heap(initial_slices: usize, heap_base_offset: usize) -> SimHeap {
     h.set_grow_policy(GrowPolicy {
         min_grow: 2,
         max_grow: 256,
+        ..GrowPolicy::DEFAULT
     });
     h
 }

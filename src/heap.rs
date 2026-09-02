@@ -899,6 +899,7 @@ mod tests {
         h.set_grow_policy(GrowPolicy {
             min_grow: 2,
             max_grow: 64,
+            ..GrowPolicy::DEFAULT
         });
         Fixture {
             heap: h,
@@ -1239,14 +1240,18 @@ mod tests {
             assert_eq!(h.mem.size_slices(), end);
             validate(h);
             // From there it grows in place: through the tail first, then through memory.grow
-            // once the tail is used up (37 free slices above it, 46 needed, so 9 missing; the
-            // half-heap step of 22 is larger and wins).
+            // once the tail is used up (37 free slices above it, 46 needed, so 9 missing; an
+            // eighth of the 44-slice heap is 5, so the need wins).
             fill(a2, four.size(), 0x23);
             let big = layout(50 * SLICE_SIZE, 8);
             let a3 = h.realloc(a2, four, big.size()).unwrap();
             assert_eq!(a3, a2);
             check(a3, four.size(), 0x23);
-            assert_eq!(h.mem.size_slices(), end + 22, "grew by the geometric step");
+            assert_eq!(
+                h.mem.size_slices(),
+                end + 9,
+                "grew by exactly the missing slices"
+            );
             // The slices the block left behind are free and the lowest fit reuses them.
             let c = h.alloc(two).unwrap();
             assert_eq!(c, a);

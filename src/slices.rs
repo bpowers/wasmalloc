@@ -553,28 +553,39 @@ fn set_bits(bits: &mut [u64], rel: usize, count: usize) {
 
 /// How much to grow linear memory when the map runs dry, in slices.
 ///
-/// Each `memory.grow` costs the same tens of microseconds in V8 whether it asks for one page or
-/// a thousand, so the step is half the current heap, clamped to this range; a request larger
-/// than the step is always granted in full.
+/// Each `memory.grow` costs the same tens of microseconds in V8 12.4 whether it asks for one
+/// page or a thousand (under a microsecond on V8 15.2, JavaScriptCore and wasmtime), so the step
+/// is a fraction of the current heap, clamped to a range; a request larger than the step is
+/// always granted in full. The fraction trades footprint for calls: a step of half the heap
+/// overshoots the peak by up to 50 percent and costs about three calls per doubling of the heap,
+/// an eighth overshoots by at most 12.5 percent and costs about six, which for a heap growing to
+/// 64 MiB is some 2 ms of `memory.grow` in total on V8 12.4 and negligible elsewhere.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GrowPolicy {
     /// Smallest step.
     pub min_grow: usize,
     /// Largest step (a single request may still exceed it).
     pub max_grow: usize,
+    /// The step is the heap size divided by this (an eighth for 8), before clamping. Non-zero.
+    pub step_divisor: usize,
 }
 
 impl GrowPolicy {
-    /// Between 1 MiB and 64 MiB per step.
+    /// An eighth of the heap, between 1 MiB and 64 MiB per step.
     pub const DEFAULT: GrowPolicy = GrowPolicy {
         min_grow: 16,
         max_grow: 1024,
+        step_divisor: 8,
     };
 
-    /// The growth step for a heap of `heap` slices: half of it, clamped to the policy's range.
+    /// The growth step for a heap of `heap` slices: the policy's fraction of it, clamped to the
+    /// policy's range.
     #[inline]
     pub fn step(&self, heap: usize) -> usize {
-        (heap / 2).max(self.min_grow).min(self.max_grow)
+        debug_assert!(self.step_divisor > 0);
+        (heap / self.step_divisor)
+            .max(self.min_grow)
+            .min(self.max_grow)
     }
 }
 
@@ -1479,14 +1490,34 @@ mod tests {
     }
 
     #[test]
+    fn grow_policy_step_is_the_clamped_fraction() {
+        let p = GrowPolicy::DEFAULT;
+        assert_eq!((p.min_grow, p.max_grow, p.step_divisor), (16, 1024, 8));
+        assert_eq!(p.step(0), 16);
+        assert_eq!(p.step(127), 16);
+        assert_eq!(p.step(128), 16);
+        assert_eq!(p.step(136), 17);
+        assert_eq!(p.step(8192), 1024);
+        assert_eq!(p.step(usize::MAX), 1024);
+        let half = GrowPolicy {
+            step_divisor: 2,
+            ..p
+        };
+        assert_eq!(half.step(100), 50);
+        assert_eq!(GrowPolicy::default(), p);
+    }
+
+    #[test]
     fn acquire_grows_geometrically_within_the_policy() {
         let mut r = Region::new(N, 2, 0);
         let first = region_start(&r.mem, 2);
         let mut m = SliceMap::<W>::new();
         m.init(first);
+        // An eighth of the heap reaches the cap of 12 once the heap holds 96 slices.
         let policy = GrowPolicy {
             min_grow: 2,
-            max_grow: 24,
+            max_grow: 12,
+            step_divisor: 8,
         };
         let mut heap = 2;
         let mut steps = Vec::new();
@@ -1497,7 +1528,7 @@ mod tests {
             assert!(run.start < after);
             if after != before {
                 let step = after - before;
-                assert_eq!(step, (heap / 2).clamp(2, 24), "step at heap size {heap}");
+                assert_eq!(step, (heap / 8).clamp(2, 12), "step at heap size {heap}");
                 assert_eq!(
                     run,
                     Run {
@@ -1510,7 +1541,7 @@ mod tests {
             }
         }
         assert_eq!(steps[0], 2);
-        assert!(steps.contains(&24), "the step reached the cap");
+        assert!(steps.contains(&12), "the step reached the cap");
         assert!(steps.windows(2).all(|w| w[0] <= w[1]), "steps never shrink");
         assert_eq!(r.mem.size_slices(), first + heap);
         check_invariants(&m);
@@ -1525,6 +1556,7 @@ mod tests {
         let policy = GrowPolicy {
             min_grow: 4,
             max_grow: 4,
+            step_divisor: 8,
         };
         let a = acquire(&mut m, &mut r.mem, 1, 1, &policy).unwrap();
         assert_eq!(a.start, first + 1);
@@ -1626,6 +1658,7 @@ mod tests {
         let policy = GrowPolicy {
             min_grow: 1,
             max_grow: 1,
+            step_divisor: 8,
         };
         // From end first + 4 an 8-aligned run needs 4 + 8 slices, but the region lands at
         // first + 9 and holds no aligned run; the retry asks for 15, lands at first + 26 and does.
@@ -1688,6 +1721,7 @@ mod tests {
         let policy = GrowPolicy {
             min_grow: 100,
             max_grow: 100,
+            step_divisor: 8,
         };
         assert_eq!(acquire(&mut m, &mut r.mem, N + 1, 1, &policy), None);
         assert_eq!(acquire(&mut m, &mut r.mem, N - 1, 1, &policy), None);
@@ -1778,6 +1812,7 @@ mod tests {
         let policy = GrowPolicy {
             min_grow: 2,
             max_grow: 64,
+            step_divisor: 2,
         };
         let run = acquire(&mut m, &mut r.mem, 3, 1, &policy).unwrap();
         assert_eq!(run.start, first);
@@ -2411,6 +2446,7 @@ mod verify {
         let policy = GrowPolicy {
             min_grow: kani::any::<usize>() % 4,
             max_grow: kani::any::<usize>() % 4,
+            step_divisor: if kani::any() { 2 } else { 8 },
         };
         let base = m.base;
         let got = extend_with_growth(&mut m, &mut mem, base + start, count, extra, &policy);
@@ -2477,6 +2513,7 @@ mod verify {
         let policy = GrowPolicy {
             min_grow: kani::any::<usize>() % 8,
             max_grow: kani::any::<usize>() % 8,
+            step_divisor: if kani::any() { 2 } else { 8 },
         };
         let had_run = m.has_run(count, align);
         let run = acquire(&mut m, &mut mem, count, align, &policy);
