@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# Run every Kani harness in the crate, each in its own memory-capped scope.
+#
+# Why per harness: one `cargo kani` invocation runs the harnesses sequentially inside one
+# cgroup, and CBMC's residue accumulates across them, so a set whose members each fit in the
+# cap can still be OOM-killed as a whole. Harness names are read from the `#[kani::proof]`
+# attributes in src/ so the list never goes stale. Prints a pass/fail line per harness and exits
+# non-zero if any failed. Takes about ten minutes.
+set -uo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+root="$(cd "$here/.." && pwd)"
+mapfile -t harnesses < <(grep -h -A4 '#\[kani::proof\]' "$root"/src/*.rs | grep -oE 'fn [a-z_0-9]+' | sed 's/fn //' | sort -u)
+[ "${#harnesses[@]}" -gt 0 ] || { echo "kani-full: no harnesses found" >&2; exit 2; }
+failed=0
+for h in "${harnesses[@]}"; do
+  start=$(date +%s)
+  if out=$(MEMLIMIT_QUIET=1 "$here/kani" --harness "$h" 2>&1); then
+    status=ok
+  else
+    status=FAILED; failed=$((failed + 1))
+  fi
+  printf '%-70s %-6s %4ds\n' "$h" "$status" "$(( $(date +%s) - start ))"
+  [ "$status" = FAILED ] && printf '%s\n' "$out" | grep -E 'FAILED|Failed|error|memlimit' | head -5
+done
+echo "kani-full: ${#harnesses[@]} harnesses, $failed failed"
+[ "$failed" -eq 0 ]
