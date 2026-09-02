@@ -15,8 +15,8 @@ use core::ptr::NonNull;
 
 use wasmalloc::backend::Memory;
 use wasmalloc::bins::{
-    self, Class, MAX_BINNED_OBJ_SIZE, MAX_NATURAL_ALIGN, MEDIUM_MAX_OBJ_SIZE, SLICE_SIZE,
-    SMALL_MAX_OBJ_SIZE, WORD,
+    self, Class, MAX_BINNED_OBJ_SIZE, MAX_NATURAL_ALIGN, MEDIUM_MAX_OBJ_SIZE, MEDIUM_PAGE_SIZE,
+    PageKind, SLICE_SIZE, SMALL_MAX_OBJ_SIZE, WORD,
 };
 use wasmalloc::slices::GrowPolicy;
 use wasmalloc::testing::model::RawAlloc;
@@ -150,7 +150,9 @@ fn realloc_shrink_then_grow_chains_keep_contents() {
             }
             h.dealloc(p, l);
         }
-        // A second pass frees with the shrunk Layout right after each shrink.
+        // A second pass frees with the resized Layout right after each realloc. A target above
+        // `from` is a growth inside the same block (1000 bytes at alignment 4096 occupy a 4 KiB
+        // block), and only the bytes the test wrote are defined afterwards.
         for from in [SMALL_MAX_OBJ_SIZE, MEDIUM_MAX_OBJ_SIZE, 1000, 96] {
             let l = layout(from, align);
             let block = match bins::classify(l) {
@@ -162,7 +164,7 @@ fn realloc_shrink_then_grow_chains_keep_contents() {
                     let p = h.alloc(l).unwrap();
                     fill(p, from, 7);
                     let q = h.realloc(p, l, target).unwrap();
-                    check(q, target, 7);
+                    check(q, target.min(from), 7);
                     h.dealloc(q, layout(target, align));
                 }
             }
@@ -212,12 +214,14 @@ fn exhausting_a_tiny_memory_is_clean() {
         let a = h.alloc(layout(100, 8)).unwrap();
         fill(a, 100, 1);
         // A medium page needs four aligned slices; the region may or may not have them.
+        let per_page = bins::blocks_per_page(PageKind::Medium, MEDIUM_MAX_OBJ_SIZE);
+        let most = 8 * SLICE_SIZE / MEDIUM_PAGE_SIZE * per_page;
         let mut mediums = Vec::new();
         while let Some(p) = h.alloc(layout(MEDIUM_MAX_OBJ_SIZE, 8)) {
             fill(p, MEDIUM_MAX_OBJ_SIZE, 2);
             mediums.push(p);
             assert!(
-                mediums.len() <= 12,
+                mediums.len() <= most,
                 "more medium blocks than eight slices can hold"
             );
         }

@@ -421,9 +421,12 @@ mod tests {
 
     #[test]
     fn classify_serves_alignment_by_construction() {
+        // The binned cap is a multiple of the largest natural alignment, so no size at or below
+        // it rounds past it.
+        assert_eq!(MAX_BINNED_OBJ_SIZE % MAX_NATURAL_ALIGN, 0);
         for shift in 0..=12 {
             let align = 1usize << shift;
-            for size in 1..=(LARGE_MAX_OBJ_SIZE / 16) {
+            for size in 1..=MAX_BINNED_OBJ_SIZE {
                 let layout = Layout::from_size_align(size, align).unwrap();
                 match classify(layout) {
                     Class::Bin(b) => {
