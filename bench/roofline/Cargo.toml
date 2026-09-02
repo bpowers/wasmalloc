@@ -1,0 +1,53 @@
+[package]
+name = "roofline"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Allocation-cost roofline harness for single-threaded wasm32"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "roofline-wasi"
+path = "src/bin/roofline-wasi.rs"
+
+# Exactly one allocator feature must be enabled (or none, which means the
+# std default, dlmalloc). The features are mutually exclusive; src/alloc/mod.rs
+# enforces this with compile_error!.
+[features]
+default = []
+# Floors (written in this crate):
+bump = []        # bump pointer over memory.grow, free is a no-op
+freelist = []    # one intrusive LIFO free list for <=32-byte blocks, bump otherwise
+sizeclass = []   # 16-byte-granular free lists up to 1024 B, class from Layout on free
+pages = []       # like sizeclass, but class recovered from a 64 KiB page header on free
+# Incumbents:
+dlmalloc = []    # marker only: std's default #[global_allocator] (dlmalloc port)
+talc = ["dep:talc"]
+lol_alloc = ["dep:lol_alloc"]
+
+[dependencies]
+talc = { version = "5.1", optional = true, default-features = false }
+lol_alloc = { version = "0.4", optional = true }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = false
+strip = "debuginfo"
+
+[profile.release-nolto]
+inherits = "release"
+lto = false
+codegen-units = 16
+
+[profile.release-z]
+inherits = "release"
+opt-level = "z"
+
+[profile.release-z-nolto]
+inherits = "release-nolto"
+opt-level = "z"

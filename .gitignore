@@ -1,0 +1,5 @@
+/target
+**/target/
+*.wasm
+!docs/**/*.wasm
+/.worktrees/

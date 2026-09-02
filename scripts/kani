@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# The only sanctioned way to run Kani in this repo.
+#
+# Forwards all arguments to `cargo kani` under scripts/memlimit. Defaults: 6 GiB hard cap
+# (KANI_MEM), 30 minute timeout (KANI_TIMEOUT). Several agents may verify concurrently on a
+# 60 GiB machine, so keep per-run caps modest and harnesses small (tiny simulated memories,
+# small unwind bounds) rather than raising the cap.
+#
+# Examples:
+#   scripts/kani --harness bins_round_trip
+#   KANI_MEM=12G KANI_TIMEOUT=1h scripts/kani --harness slices_find_run
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+exec "$here/memlimit" -m "${KANI_MEM:-6G}" -t "${KANI_TIMEOUT:-30m}" -- cargo kani "$@"

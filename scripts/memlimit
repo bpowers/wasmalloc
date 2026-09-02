@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# Run a command under a hard memory cap and a wall-clock timeout.
+#
+# Why: CBMC (Kani's backend) and a few other tools have unbounded memory use on hard inputs.
+# Once, an unbounded run took the whole machine down and killed every agent's work. A cgroup
+# cap turns that into one failed command.
+#
+# Usage: scripts/memlimit [-m MEM] [-t TIMEOUT] -- command args...
+#   MEM      systemd size (default 6G; env MEMLIMIT_MEM). Swap is pinned to 0.
+#   TIMEOUT  GNU timeout duration (default 30m; env MEMLIMIT_TIMEOUT).
+# Exit status: the command's, or 124 on timeout, or 137 when the kernel OOM-kills it.
+set -euo pipefail
+
+MEM="${MEMLIMIT_MEM:-6G}"
+TIMEOUT="${MEMLIMIT_TIMEOUT:-30m}"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -m) MEM="$2"; shift 2 ;;
+    -t) TIMEOUT="$2"; shift 2 ;;
+    --) shift; break ;;
+    -*) echo "memlimit: unknown option $1" >&2; exit 2 ;;
+    *) break ;;
+  esac
+done
+[ $# -gt 0 ] || { echo "usage: scripts/memlimit [-m MEM] [-t TIMEOUT] -- command args..." >&2; exit 2; }
+
+# systemd size suffixes to bytes, for the prlimit fallback only.
+to_bytes() {
+  local v="$1" n="${1%[KMGT]}"
+  case "${v: -1}" in
+    K) echo $((n * 1024)) ;;
+    M) echo $((n * 1024 * 1024)) ;;
+    G) echo $((n * 1024 * 1024 * 1024)) ;;
+    T) echo $((n * 1024 * 1024 * 1024 * 1024)) ;;
+    *) echo "$v" ;;
+  esac
+}
+
+run_timeout() { exec timeout --signal=TERM --kill-after=30s "$TIMEOUT" "$@"; }
+
+if command -v systemd-run >/dev/null 2>&1 \
+   && systemd-run --user --scope -q -p MemoryMax=64M -- true >/dev/null 2>&1; then
+  # A transient scope puts the command and every child in one cgroup; MemoryMax is a hard
+  # cap enforced by the kernel OOM killer inside that cgroup, and MemorySwapMax=0 stops it
+  # from spilling into swap first.
+  exec systemd-run --user --scope -q \
+    -p MemoryMax="$MEM" -p MemorySwapMax=0 \
+    -- timeout --signal=TERM --kill-after=30s "$TIMEOUT" "$@"
+else
+  echo "memlimit: systemd-run unavailable; falling back to prlimit --as (weaker)" >&2
+  exec prlimit --as="$(to_bytes "$MEM")" -- timeout --signal=TERM --kill-after=30s "$TIMEOUT" "$@"
+fi
