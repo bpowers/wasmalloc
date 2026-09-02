@@ -349,7 +349,8 @@ realloc_doubling 12.2/13.4/12.4/12.2 us (288, 5), large_alloc_free 2.24/1.95/2.1
    index, queue indices are masked over 64 queues, the direct table is written in an index
    loop, the step divisor is clamped). Module panic call sites 29 -> 6 (the harness's std and
    `page::extend`'s `MAX_EXTEND_SIZE / block_size`, an unsafe block under ledger PAGE-04 left
-   for a reviewed change); `__rust_realloc` 3 -> 0; raw module 47903 -> 47208 bytes, after
+   for a reviewed change, done on 2026-09-02, review fixes item 2 below); `__rust_realloc`
+   3 -> 0; raw module 47903 -> 47208 bytes, after
    wasm-opt -O3 20871 -> 20558. Timings unchanged (churn read 8.30 once on node and 7.00,
    7.25, 6.97 in three alternating reruns against 7.10 for the previous build). Kept.
 
@@ -386,3 +387,13 @@ fresh slices are known zero but are not yet reported as such to a zeroing reallo
    pair): alloc_free_32 2.50 to 2.52 -> 2.49 to 2.51 on node 22 `--no-liftoff`, 1.122 to 1.124
    -> 1.122 to 1.123 on d8 (V8 15.2) `--no-liftoff`; batch_lifo_32 2.98 to 3.00 -> 2.96 to 2.98
    on node (one run read 2.54), 1.87 to 1.88 -> 1.83 to 1.88 on d8. Kept.
+2. **No panic call site left in the allocator's release code** (ledger PAGE-04 and PAGE-01).
+   `page::extend` divides `MAX_EXTEND_SIZE` by the header's `block_size`, and `page::init`
+   divides the block area by it through `bins::blocks_per_page`; the compiler cannot see that
+   the field is at least 8, so both carried a division-by-zero check and the panic string it
+   pulls in. Both now divide by `block_size` or 1, identical for every reachable header. On the
+   roofline `wasmalloc` release build for wasm32-unknown-unknown (`wasm-tools demangle`, then
+   `print`, counting `call` instructions whose callee is a panic function; tuning-b item 6
+   counted differently): 14 -> 11 in the module, all remaining in the harness's std, 2 -> 0 in
+   `wasmalloc::` functions; "attempt to divide by zero" gone from the data segments; raw module
+   47932 -> 47617 bytes, 21418 -> 21186 after `wasm-opt -O3`. Kept.

@@ -46,7 +46,14 @@ Entries are grouped by module. Page invariants 1 to 5 refer to the numbered list
   `used` cost about 2 ns per alloc+free pair). The header is 36 bytes on wasm32 and 48 on the
   host, still within `PAGE_HEADER_RESERVE` (const asserted); the write is otherwise the same.
   The four page Kani harnesses and Miri (both aliasing models) were re-run on the new layout.
-- Reviewer: adversarial-reviewer, 2026-09-02: accepted.
+- Division: `bins::blocks_per_page(kind, block_size)` divides by `block_size == bin_size(bin)`,
+  at least `MIN_BLOCK_SIZE`, which the compiler cannot see (`bin_size(0)` would be 0), so the
+  release build carried a division-by-zero panic call site in `init`. Since 2026-09-02
+  `blocks_per_page` divides by `block_size`, or by 1 when it is zero (a caller bug that its
+  debug assertion reports), identical for every bin; the geometry harness
+  `every_block_of_every_bin_lies_inside_its_page_and_is_aligned` covers every bin's `reserved`
+  and was re-run (see PAGE-04 for the module-level check).
+- Reviewer: adversarial-reviewer, 2026-09-02: accepted (the 2026-09-02 division note is new).
 
 ### PAGE-02: `page::pop`, the free-list pop
 
@@ -116,23 +123,30 @@ Entries are grouped by module. Page invariants 1 to 5 refer to the numbered list
   Miri as above.
 - Changes: 2026-09-01, `capacity` and `reserved` are `u32` (see PAGE-01); the bound above was
   `u16::MAX`. Harnesses and Miri re-run.
-- Division: `MAX_EXTEND_SIZE / block_size` divides by a header field. It is non-zero because
-  `init` is the only writer of `block_size` and stores `bin_size(bin)` with `bin` in
-  `1..=MAX_BIN`, so at least `MIN_BLOCK_SIZE` (8); `pop`, `push` and `extend` write only `free`,
-  `used`, `capacity` and `free_is_zero`, and the heap writes only `next`, `prev`, `flags` and
-  `retire_expire` (HEAP-05, HEAP-07). The sentinel `EMPTY_PAGE` has `block_size == 0` but is
+- Division: `MAX_EXTEND_SIZE / block_size.max(1)` divides by a header field. The field is
+  non-zero because `init` is the only writer of `block_size` and stores `bin_size(bin)` with
+  `bin` in `1..=MAX_BIN`, so at least `MIN_BLOCK_SIZE` (8); `pop`, `push` and `extend` write only
+  `free`, `used`, `capacity` and `free_is_zero`, and the heap writes only `next`, `prev`, `flags`
+  and `retire_expire` (HEAP-05, HEAP-07). The sentinel `EMPTY_PAGE` has `block_size == 0` but is
   never extended: `extend` is called on `find_page`'s candidate and on `fresh_page`'s new page,
-  both queue members, and the sentinel is never linked into a queue (HEAP-01). Kani checks the
+  both queue members, and the sentinel is never linked into a queue (HEAP-01). So `.max(1)`
+  changes no reachable value; it is there so that the compiler can drop the division-by-zero
+  check, which was a panic call site in the allocator's release code. Kani checks the
   division-by-zero condition on every `extend` in the page harnesses and in the heap harnesses
   `first_allocation_builds_a_valid_heap`, `freeing_any_live_block_preserves_invariants` and the
-  full-page pair, where `block_size` is a value read back from the modelled header. The
-  remaining panic call site in the release build can be removed without unsafe code by dividing
-  by `block_size.max(1)` (identical for every reachable value, and LLVM drops the zero check);
-  this is proposed in the verification report (2026-09-02) rather than applied here.
-- Reviewer: adversarial-reviewer, 2026-09-02: accepted. Caveat: the `block_size.max(1)` proposal
-  is sound (identical for every reachable header, since `init` stores at least `MIN_BLOCK_SIZE`,
-  and LLVM drops the zero test) and worth applying to remove the last release-build panic path;
-  update this entry when it lands.
+  full-page pair, where `block_size` is a value read back from the modelled header.
+- Changes: 2026-09-02, the divisor is `block_size.max(1)` (the reviewer's proposal). Checked on
+  the roofline harness's `wasmalloc` release build for wasm32-unknown-unknown (`wasm-tools
+  demangle` then `print`): `call` instructions naming a panic function went from 14 to 11, all
+  remaining ones in the harness's std and none in a `wasmalloc::` function (before: one each in
+  `page::extend` and `page::init`, the latter through `bins::blocks_per_page`, which got the same
+  treatment, see PAGE-01); the string "attempt to divide by zero" is gone from the data
+  segments; the module went from 47932 to 47617 bytes raw and from 21418 to 21186 after
+  `wasm-opt -O3`. The two page operation-sequence harnesses and
+  `every_block_of_every_bin_lies_inside_its_page_and_is_aligned` were re-run.
+- Reviewer: adversarial-reviewer, 2026-09-02: accepted, with the caveat that the
+  `block_size.max(1)` proposal be applied and this entry updated; applied on 2026-09-02 as
+  described under Changes, fresh look pending.
 
 ### PAGE-05: header field reads in the predicates and helpers
 

@@ -288,10 +288,15 @@ pub const fn block_start(block_size: usize) -> usize {
     round_up_pow2(PAGE_HEADER_RESERVE, align)
 }
 
-/// Number of blocks a fresh page of `kind` holds for `block_size`.
+/// Number of blocks a fresh page of `kind` holds for `block_size`, which must be a bin size (at
+/// least [`MIN_BLOCK_SIZE`]). A zero size, a caller bug that debug builds report, acts as one so
+/// that the division carries no panic path into the release build: the compiler cannot see that
+/// `bin_size` never returns zero (the same idiom as `GrowPolicy::step`'s divisor).
 #[inline]
 pub const fn blocks_per_page(kind: PageKind, block_size: usize) -> usize {
-    (kind.page_size() - block_start(block_size)) / block_size
+    debug_assert!(block_size >= MIN_BLOCK_SIZE);
+    let divisor = if block_size == 0 { 1 } else { block_size };
+    (kind.page_size() - block_start(block_size)) / divisor
 }
 
 #[cfg(test)]
