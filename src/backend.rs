@@ -30,6 +30,9 @@ pub const MAX_SLICE_INDEX: usize = (1 << 16) - 1;
 /// - `ptr(addr)` yields a pointer valid for reads and writes at every address the allocator
 ///   owns, carrying provenance for the whole owned region, so pointer arithmetic that stays
 ///   inside owned memory is defined behaviour.
+/// - `ptr(addr).addr() == addr`: the pointer's address is the address asked for. The heap
+///   turns page header pointers back into addresses (queue links, `page::extend`, `free_page`,
+///   `header_of`), so a backend that placed memory elsewhere would break it.
 pub unsafe trait Memory {
     /// First address the allocator may use (the linker's `__heap_base` on wasm).
     fn heap_base(&self) -> usize;
