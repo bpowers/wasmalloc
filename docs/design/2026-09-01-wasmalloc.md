@@ -261,13 +261,27 @@ to try, each behind a benchmark and a proof, roughly in order of expected payoff
    from `alloc_zeroed` pages that were never written could be. Probably not worth it; note it.
 7. **Per-chunk kind binning in the slice map** (mimalloc's `mi_bbitmap_t`) if singleton churn
    is shown to fragment the aligned runs medium and large pages need.
-8. **Zero-initialised heap static.** The static heap is a 17.7 KB data segment because the
+8. **A one-entry hot-block cache per direct index (churn at 2x the floor).** The rerun in
+   `docs/research/roofline.md` section 14 shows churn over 10k live objects at 2x the free-list
+   floor on every engine while the hot pair is within 1.4 to 2x. The mechanism: a freed block
+   goes onto its own page's list, so the next allocation of that size pops a different, cold
+   block from the direct page, one cache miss per operation; a global LIFO list reuses the block
+   that was just written. Rust's Layout at dealloc makes a tiny per-size cache trivially correct:
+   `hot[direct_index(size)]` holds the most recently freed block of that size; `dealloc` stores
+   the block there and pushes the previously cached block (if any) to its page as today; `alloc`
+   pops `hot[idx]` when non-empty with no page-header access at all, else takes the direct page.
+   A cached block counts as used by its page (retirement is delayed by at most one block per
+   index), `alloc_zeroed` must clear it, and `realloc` is unaffected. Expected: the hot pair at
+   or below the floor and churn close to it, at the cost of 129 words of state and one branch.
+   Needs the model tester, a Kani harness for the used-count invariant with cached blocks, and
+   Liftoff measurements.
+9. **Zero-initialised heap static.** The static heap is a 17.7 KB data segment because the
    direct table holds sentinel pointers and a few fields are non-zero. A fully zero initial
    state (null direct entries with a null test in `alloc`) measured free on the optimizing tiers
    and +0.3 ns in Liftoff and cuts the raw module from 46 KB to 29 KB; wasm-opt already
    removes the zeros. Alternative without the extra test: keep the 16 KiB slice map in its own
    zero static. Decide once the fast path has settled.
-9. **Verification depth.** Kani harnesses for the heap's queue and direct-table invariants over
+10. **Verification depth.** Kani harnesses for the heap's queue and direct-table invariants over
    a tiny simulated memory, ledger entries for every unsafe block in `heap.rs` and `global.rs`,
    and an adversarial review of all entries.
 
