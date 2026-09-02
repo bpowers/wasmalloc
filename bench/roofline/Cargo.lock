@@ -32,6 +32,7 @@ version = "0.1.0"
 dependencies = [
  "lol_alloc",
  "talc",
+ "wasmalloc",
 ]
 
 [[package]]
@@ -58,3 +59,7 @@ dependencies = [
  "allocator-api2",
  "lock_api",
 ]
+
+[[package]]
+name = "wasmalloc"
+version = "0.0.1"

@@ -1,0 +1,72 @@
+wasmalloc-release.wasm: 45757 bytes, 85 functions
+  alloc_free_32: 109 instructions, 4 calls: __rust_no_alloc_shim_is_unstable_v2, wasmalloc::heap::Heap<M,_>::alloc_generic, wasmalloc::heap::Heap<M,_>::dealloc_transition, roofline::workloads::oom
+  churn: 230 instructions, 5 calls: wasmalloc::heap::Heap<M,_>::dealloc_generic, wasmalloc::heap::Heap<M,_>::dealloc_transition, __rust_no_alloc_shim_is_unstable_v2, wasmalloc::heap::Heap<M,_>::alloc_generic, roofline::workloads::oom
+  realloc_doubling: 340 instructions, 20 calls: __rust_no_alloc_shim_is_unstable_v2, wasmalloc::heap::Heap<M,_>::alloc_generic, __rust_realloc x16, wasmalloc::heap::Heap<M,_>::dealloc_generic, roofline::workloads::oom
+  __rust_alloc: 67 instructions, 2 calls: wasmalloc::heap::Heap<M,_>::alloc_generic x2
+  __rust_dealloc: 56 instructions, 2 calls: wasmalloc::heap::Heap<M,_>::dealloc_generic, wasmalloc::heap::Heap<M,_>::dealloc_transition
+  __rust_realloc: 664 instructions, 6 calls: core[c5930c85a12de822]::panicking::panic_bounds_check x3, wasmalloc::heap::Heap<M,_>::alloc_generic, wasmalloc::heap::Heap<M,_>::dealloc_generic, wasmalloc::heap::Heap<M,_>::dealloc_transition
+  __rust_no_alloc_shim_is_unstable_v2: 1 instructions, 0 calls
+
+wasmalloc-release-wasmopt-names.wasm: 22687 bytes, 58 functions
+  alloc_free_32: 96 instructions, 2 calls: wasmalloc::heap::Heap<M,_>::alloc_generic, wasmalloc::heap::Heap<M,_>::dealloc_transition
+  churn: 205 instructions, 3 calls: wasmalloc::heap::Heap<M,_>::dealloc_generic, wasmalloc::heap::Heap<M,_>::dealloc_transition, wasmalloc::heap::Heap<M,_>::alloc_generic
+  realloc_doubling: 327 instructions, 18 calls: wasmalloc::heap::Heap<M,_>::alloc_generic, __rust_realloc x16, wasmalloc::heap::Heap<M,_>::dealloc_generic
+  __rust_alloc: 62 instructions, 2 calls: wasmalloc::heap::Heap<M,_>::alloc_generic x2
+  __rust_dealloc$: no function matches
+  __rust_realloc: 637 instructions, 6 calls: core[c5930c85a12de822]::panicking::panic_bounds_check x3, wasmalloc::heap::Heap<M,_>::alloc_generic, wasmalloc::heap::Heap<M,_>::dealloc_generic, wasmalloc::heap::Heap<M,_>::dealloc_transition
+  no_alloc_shim: no function matches
+
+wasmalloc-release-nolto.wasm: 45969 bytes, 86 functions
+  alloc_free_32: 106 instructions, 4 calls: __rust_no_alloc_shim_is_unstable_v2, wasmalloc::heap::Heap<M,_>::alloc_generic, wasmalloc::heap::Heap<M,_>::dealloc_transition, roofline::workloads::oom
+  churn: 230 instructions, 5 calls: wasmalloc::heap::Heap<M,_>::dealloc_generic, wasmalloc::heap::Heap<M,_>::dealloc_transition, __rust_no_alloc_shim_is_unstable_v2, wasmalloc::heap::Heap<M,_>::alloc_generic, roofline::workloads::oom
+  realloc_doubling: 349 instructions, 20 calls: __rust_no_alloc_shim_is_unstable_v2, wasmalloc::heap::Heap<M,_>::alloc_generic, wasmalloc::heap::Heap<M,_>::realloc x16, wasmalloc::heap::Heap<M,_>::dealloc_generic, roofline::workloads::oom
+  __rust_alloc: 67 instructions, 2 calls: wasmalloc::heap::Heap<M,_>::alloc_generic x2
+  __rust_dealloc: 56 instructions, 2 calls: wasmalloc::heap::Heap<M,_>::dealloc_generic, wasmalloc::heap::Heap<M,_>::dealloc_transition
+  __rust_realloc: 6 instructions, 1 calls: wasmalloc::heap::Heap<M,_>::realloc
+  __rust_no_alloc_shim_is_unstable_v2: 1 instructions, 0 calls
+
+wasmalloc-release-nolto-wasmopt-names.wasm: 22757 bytes, 58 functions
+  alloc_free_32: 93 instructions, 2 calls: wasmalloc::heap::Heap<M,_>::alloc_generic, wasmalloc::heap::Heap<M,_>::dealloc_transition
+  churn: 205 instructions, 3 calls: wasmalloc::heap::Heap<M,_>::dealloc_generic, wasmalloc::heap::Heap<M,_>::dealloc_transition, wasmalloc::heap::Heap<M,_>::alloc_generic
+  realloc_doubling: 322 instructions, 18 calls: wasmalloc::heap::Heap<M,_>::alloc_generic, wasmalloc::heap::Heap<M,_>::realloc x16, wasmalloc::heap::Heap<M,_>::dealloc_generic
+  __rust_alloc: 62 instructions, 2 calls: wasmalloc::heap::Heap<M,_>::alloc_generic x2
+  __rust_dealloc$: no function matches
+  __rust_realloc$: no function matches
+  no_alloc_shim: no function matches
+
+wasmalloc-release-z.wasm: 44086 bytes, 116 functions
+  alloc_free_32: 42 instructions, 3 calls: alloc[3ca501edff3f0c7c]::alloc::alloc, __rust_dealloc, roofline::workloads::oom
+  churn: 138 instructions, 3 calls: __rust_dealloc, alloc[3ca501edff3f0c7c]::alloc::alloc, roofline::workloads::oom
+  realloc_doubling: 74 instructions, 4 calls: alloc[3ca501edff3f0c7c]::alloc::alloc, __rust_dealloc, __rust_realloc, roofline::workloads::oom
+  __rust_alloc: 4 instructions, 1 calls: wasmalloc::heap::Heap<M,_>::alloc
+  __rust_dealloc: 5 instructions, 1 calls: wasmalloc::heap::Heap<M,_>::dealloc
+  __rust_realloc: 6 instructions, 1 calls: wasmalloc::heap::Heap<M,_>::realloc
+  __rust_no_alloc_shim_is_unstable_v2: 1 instructions, 0 calls
+
+wasmalloc-release-z-wasmopt-names.wasm: 19655 bytes, 67 functions
+  alloc_free_32: 35 instructions, 2 calls: wasmalloc::heap::Heap<M,_>::alloc, wasmalloc::heap::Heap<M,_>::dealloc
+  churn: 125 instructions, 2 calls: wasmalloc::heap::Heap<M,_>::dealloc, wasmalloc::heap::Heap<M,_>::alloc
+  realloc_doubling: 67 instructions, 3 calls: wasmalloc::heap::Heap<M,_>::alloc, wasmalloc::heap::Heap<M,_>::dealloc, __rust_realloc
+  __rust_alloc$: no function matches
+  __rust_dealloc$: no function matches
+  __rust_realloc: 265 instructions, 9 calls: wasmalloc::bins::classify x2, <wasmalloc::slices::WordMasks as core::iter::traits::iterator::Iterator>::next, wasmalloc::slices::SliceMap<_>::claim, core[c5930c85a12de822]::panicking::panic_bounds_check, wasmalloc::bins::bin_size, wasmalloc::slices::SliceMap<_>::release, wasmalloc::heap::Heap<M,_>::alloc, wasmalloc::heap::Heap<M,_>::dealloc
+  no_alloc_shim: no function matches
+
+wasmalloc-release-z-nolto.wasm: 44331 bytes, 113 functions
+  alloc_free_32: 42 instructions, 3 calls: alloc[3ca501edff3f0c7c]::alloc::alloc, __rust_dealloc, roofline::workloads::oom
+  churn: 138 instructions, 3 calls: __rust_dealloc, alloc[3ca501edff3f0c7c]::alloc::alloc, roofline::workloads::oom
+  realloc_doubling: 74 instructions, 4 calls: alloc[3ca501edff3f0c7c]::alloc::alloc, __rust_dealloc, __rust_realloc, roofline::workloads::oom
+  __rust_alloc: 68 instructions, 2 calls: wasmalloc::heap::Heap<M,_>::alloc_generic x2
+  __rust_dealloc: 56 instructions, 2 calls: wasmalloc::heap::Heap<M,_>::dealloc_generic, wasmalloc::heap::Heap<M,_>::dealloc_transition
+  __rust_realloc: 6 instructions, 1 calls: wasmalloc::heap::Heap<M,_>::realloc
+  __rust_no_alloc_shim_is_unstable_v2: 1 instructions, 0 calls
+
+wasmalloc-release-z-nolto-wasmopt-names.wasm: 20279 bytes, 69 functions
+  alloc_free_32: 35 instructions, 2 calls: __rust_alloc, __rust_dealloc
+  churn: 125 instructions, 2 calls: __rust_dealloc, __rust_alloc
+  realloc_doubling: 67 instructions, 3 calls: __rust_alloc, __rust_dealloc, wasmalloc::heap::Heap<M,_>::realloc
+  __rust_alloc: 62 instructions, 1 calls: wasmalloc::heap::Heap<M,_>::alloc_generic
+  __rust_dealloc: 50 instructions, 2 calls: wasmalloc::heap::Heap<M,_>::dealloc_generic, wasmalloc::heap::Heap<M,_>::dealloc_transition
+  __rust_realloc$: no function matches
+  no_alloc_shim: no function matches
+

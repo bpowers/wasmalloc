@@ -1,0 +1,51 @@
+{
+  "engine": "node",
+  "engineVersion": "node 22.22.2 / V8 12.4.254.21-node.39",
+  "flags": "--no-liftoff",
+  "note": null,
+  "wasm": "/home/bpowers/src/wasm-clalloc/.worktrees/roofline/bench/roofline/target/dist/talc-release-nolto.wasm",
+  "variant": "talc",
+  "memoryPagesAtStart": 20,
+  "reps": 7,
+  "scale": 1,
+  "tierHint": "any",
+  "callOverheadNs": {
+    "median": 1.334865999999998,
+    "min": 0.36439899999999886,
+    "tier": "turbofan"
+  },
+  "results": [
+    {
+      "workload": "alloc_free_32",
+      "unit": "alloc+free pair",
+      "n": 2000000,
+      "opsPerCall": 2000000,
+      "medianNsPerOp": 11.21812633256701,
+      "minNsPerOp": 11.212601332567004,
+      "warmupCalls": 3,
+      "liftoffWarmupCalls": 0,
+      "firstCallNsPerOp": 11.848459332567005,
+      "tier": "turbofan",
+      "tierStable": true,
+      "pagesBefore": 20,
+      "pagesAfter": 21,
+      "checksum": 0
+    },
+    {
+      "workload": "churn",
+      "unit": "free+alloc step",
+      "n": 200000,
+      "opsPerCall": 200000,
+      "medianNsPerOp": 31.794338325670132,
+      "minNsPerOp": 31.74518832567002,
+      "warmupCalls": 3,
+      "liftoffWarmupCalls": 0,
+      "firstCallNsPerOp": 34.032028325670176,
+      "tier": "turbofan",
+      "tierStable": true,
+      "pagesBefore": 21,
+      "pagesAfter": 121,
+      "checksum": 3428655237
+    }
+  ]
+}

@@ -31,13 +31,22 @@ struct Workload {
 }
 
 // Mirrors WORKLOADS in harness.js; keep the two lists in sync.
-static WORKLOADS: [Workload; 9] = [
+static WORKLOADS: [Workload; 12] = [
     Workload {
         name: "alloc_free_32",
         unit: "alloc+free pair",
         n: 2_000_000,
         ops_per_iter: 1,
-        run: |n| w::alloc_free_fixed(n, 32),
+        run: |n| w::alloc_free_fixed(n, 32, 8),
+        setup: None,
+        teardown: None,
+    },
+    Workload {
+        name: "alloc_free_32_align16",
+        unit: "alloc+free pair, align 16",
+        n: 2_000_000,
+        ops_per_iter: 1,
+        run: |n| w::alloc_free_fixed(n, 32, 16),
         setup: None,
         teardown: None,
     },
@@ -67,6 +76,24 @@ static WORKLOADS: [Workload; 9] = [
         run: w::churn,
         setup: Some(w::churn_init),
         teardown: Some(w::churn_fini),
+    },
+    Workload {
+        name: "random_actions",
+        unit: "action (3/7 alloc, 3/7 free, 1/7 realloc)",
+        n: 100_000,
+        ops_per_iter: 1,
+        run: w::random_actions,
+        setup: None,
+        teardown: Some(w::random_actions_fini),
+    },
+    Workload {
+        name: "random_actions_norealloc",
+        unit: "action (1/2 alloc, 1/2 free)",
+        n: 100_000,
+        ops_per_iter: 1,
+        run: w::random_actions_norealloc,
+        setup: None,
+        teardown: Some(w::random_actions_fini),
     },
     Workload {
         name: "vec_push_growth",
@@ -146,13 +173,19 @@ fn parse_args() -> Args {
         match arg.as_str() {
             "--json" => a.json = true,
             "--reps" => {
-                a.reps = it.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| usage());
+                a.reps = it
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or_else(|| usage());
                 if a.reps == 0 || a.reps > MAX_REPS {
                     usage();
                 }
             }
             "--scale" => {
-                a.scale = it.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| usage());
+                a.scale = it
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or_else(|| usage());
                 if !(a.scale > 0.0) {
                     usage();
                 }
@@ -184,6 +217,10 @@ struct Row {
     median: f64,
     min: f64,
     warm: usize,
+    // memory.size before the first warm-up call and after the last timed call
+    // (and its teardown); None on native.
+    pages_before: Option<usize>,
+    pages_after: Option<usize>,
 }
 
 fn time_call(wl: &Workload, n: usize, sink: &mut u32) -> f64 {
@@ -204,6 +241,7 @@ fn time_call(wl: &Workload, n: usize, sink: &mut u32) -> f64 {
 fn measure(wl: &Workload, idx: usize, args: &Args, sink: &mut u32) -> Row {
     let n = ((wl.n as f64) * args.scale).round().max(1.0) as usize;
     let ops = n * wl.ops_per_iter;
+    let pages_before = roofline::alloc::memory_pages();
 
     // Warm-up: the last three call times must agree to within STABLE_RATIO.
     let mut last = [0.0f64; 3];
@@ -233,6 +271,8 @@ fn measure(wl: &Workload, idx: usize, args: &Args, sink: &mut u32) -> Row {
         median: samples[samples.len() / 2],
         min: samples[0],
         warm,
+        pages_before,
+        pages_after: roofline::alloc::memory_pages(),
     }
 }
 
@@ -246,8 +286,16 @@ fn target() -> &'static str {
     }
 }
 
+fn json_pages(p: Option<usize>) -> String {
+    match p {
+        Some(p) => p.to_string(),
+        None => "null".to_string(),
+    }
+}
+
 fn main() {
     let args = parse_args();
+    let pages_at_start = roofline::alloc::memory_pages();
     let mut sink = 0u32;
     let mut rows = [Row {
         idx: 0,
@@ -256,6 +304,8 @@ fn main() {
         median: 0.0,
         min: 0.0,
         warm: 0,
+        pages_before: None,
+        pages_after: None,
     }; WORKLOADS.len()];
     let mut nrows = 0;
     for (i, wl) in WORKLOADS.iter().enumerate() {
@@ -277,13 +327,23 @@ fn main() {
         println!("  \"reps\": {},", args.reps);
         println!("  \"scale\": {},", args.scale);
         println!("  \"callOverheadNs\": null,");
+        println!("  \"memoryPagesAtStart\": {},", json_pages(pages_at_start));
         println!("  \"results\": [");
         for (i, r) in rows.iter().enumerate() {
             let wl = &WORKLOADS[r.idx];
             let comma = if i + 1 < rows.len() { "," } else { "" };
             println!(
-                "    {{\"workload\": \"{}\", \"unit\": \"{}\", \"n\": {}, \"opsPerCall\": {}, \"medianNsPerOp\": {:.3}, \"minNsPerOp\": {:.3}, \"warmupCalls\": {}, \"tier\": \"n/a\"}}{}",
-                wl.name, wl.unit, r.n, r.ops, r.median, r.min, r.warm, comma
+                "    {{\"workload\": \"{}\", \"unit\": \"{}\", \"n\": {}, \"opsPerCall\": {}, \"medianNsPerOp\": {:.3}, \"minNsPerOp\": {:.3}, \"warmupCalls\": {}, \"tier\": \"n/a\", \"pagesBefore\": {}, \"pagesAfter\": {}}}{}",
+                wl.name,
+                wl.unit,
+                r.n,
+                r.ops,
+                r.median,
+                r.min,
+                r.warm,
+                json_pages(r.pages_before),
+                json_pages(r.pages_after),
+                comma
             );
         }
         println!("  ],");
@@ -297,13 +357,18 @@ fn main() {
             roofline::alloc::DETAIL
         );
         println!(
-            "{:<20} {:>10} {:>12} {:>12} {:>6}",
-            "workload", "ops/call", "median ns/op", "min ns/op", "warm"
+            "{:<26} {:>10} {:>12} {:>12} {:>6} {:>8}",
+            "workload", "ops/call", "median ns/op", "min ns/op", "warm", "pages"
         );
         for r in rows {
             println!(
-                "{:<20} {:>10} {:>12.2} {:>12.2} {:>6}",
-                WORKLOADS[r.idx].name, r.ops, r.median, r.min, r.warm
+                "{:<26} {:>10} {:>12.2} {:>12.2} {:>6} {:>8}",
+                WORKLOADS[r.idx].name,
+                r.ops,
+                r.median,
+                r.min,
+                r.warm,
+                r.pages_after.map_or("-".to_string(), |p| p.to_string())
             );
         }
         eprintln!("checksum: {sink}");

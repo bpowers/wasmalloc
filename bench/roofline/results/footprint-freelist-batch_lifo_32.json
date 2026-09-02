@@ -1,0 +1,35 @@
+{
+  "engine": "node",
+  "engineVersion": "node 22.22.2 / V8 12.4.254.21-node.39",
+  "flags": "--no-liftoff",
+  "note": null,
+  "wasm": "/home/bpowers/src/wasm-clalloc/.worktrees/roofline/bench/roofline/target/dist/freelist-release.wasm",
+  "variant": "freelist",
+  "memoryPagesAtStart": 20,
+  "reps": 3,
+  "scale": 1,
+  "tierHint": "any",
+  "callOverheadNs": {
+    "median": 1.348435000000002,
+    "min": 0.37290899999999993,
+    "tier": "turbofan"
+  },
+  "results": [
+    {
+      "workload": "batch_lifo_32",
+      "unit": "alloc+free pair",
+      "n": 2000,
+      "opsPerCall": 2000000,
+      "medianNsPerOp": 1.9120183257825007,
+      "minNsPerOp": 1.887182825782499,
+      "warmupCalls": 4,
+      "liftoffWarmupCalls": 0,
+      "firstCallNsPerOp": 2.0953473257824977,
+      "tier": "turbofan",
+      "tierStable": true,
+      "pagesBefore": 20,
+      "pagesAfter": 276,
+      "checksum": 0
+    }
+  ]
+}

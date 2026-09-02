@@ -1,0 +1,20 @@
+{
+  "engine": "d8",
+  "engineVersion": "V8 15.2.124",
+  "flags": null,
+  "note": null,
+  "wasm": "/home/bpowers/src/wasm-clalloc/.worktrees/roofline/bench/roofline/target/dist/talc-release.wasm",
+  "variant": "talc",
+  "memoryPagesAtStart": 20,
+  "tierup": {
+    "fn": "alloc_free_32",
+    "n": 1000,
+    "callsUntilTierUp": 75,
+    "itersUntilTierUp": 75000,
+    "gaveUpAfterCalls": null,
+    "tierAfter": "turbofan",
+    "liftoffNsPerOp": null,
+    "optimizedNsPerOp": 9.0298,
+    "checksum": 927067328
+  }
+}

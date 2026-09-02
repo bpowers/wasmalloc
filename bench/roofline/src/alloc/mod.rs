@@ -16,6 +16,22 @@ pub fn grow_pages(pages: usize) -> Option<usize> {
     }
 }
 
+/// Current size of linear memory in 64 KiB pages. Linear memory never shrinks,
+/// so reading this after a workload gives the peak footprint the allocator
+/// reached during it. `None` on non-wasm hosts, where there is no linear memory
+/// to measure.
+#[cfg(target_arch = "wasm32")]
+#[inline]
+pub fn memory_pages() -> Option<usize> {
+    Some(core::arch::wasm32::memory_size(0))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[inline]
+pub fn memory_pages() -> Option<usize> {
+    None
+}
+
 /// Non-wasm hosts (native sanity runs of the same driver) get a stand-in for
 /// linear memory: one large lazily-committed region from the system allocator,
 /// handed out sequentially, so that like wasm's `memory.grow` successive grows
@@ -65,19 +81,31 @@ macro_rules! count_enabled {
 }
 
 const ENABLED: usize = count_enabled!(
-    "bump", "freelist", "sizeclass", "pages", "dlmalloc", "talc", "lol_alloc"
+    "bump",
+    "freelist",
+    "sizeclass",
+    "pages",
+    "mimic",
+    "mimic_lean",
+    "mimic_u32",
+    "mimic_nozero",
+    "dlmalloc",
+    "talc",
+    "lol_alloc",
+    "wasmalloc"
 );
 
 #[allow(dead_code)]
 const _: () = assert!(
     ENABLED <= 1,
-    "enable at most one allocator feature (bump, freelist, sizeclass, pages, dlmalloc, talc, lol_alloc)"
+    "enable at most one allocator feature (bump, freelist, sizeclass, pages, mimic, mimic_lean, mimic_u32, mimic_nozero, dlmalloc, talc, lol_alloc, wasmalloc)"
 );
 
 // The floor allocators are always compiled so that they can share code
 // (pages reuses sizeclass helpers); only `selected` depends on features.
 pub mod bump;
 pub mod freelist;
+pub mod mimic;
 pub mod pages;
 pub mod sizeclass;
 
@@ -125,6 +153,50 @@ mod selected {
     }
 }
 
+#[cfg(feature = "mimic")]
+mod selected {
+    pub const NAME: &str = "mimic";
+    pub const DETAIL: &str = "wasmalloc's fast-path memory traffic (direct table, page header with used/free_is_zero/flags) and nothing else";
+    #[global_allocator]
+    static GLOBAL: super::mimic::Mimic<false, false, false> = super::mimic::Mimic::new();
+    pub fn reset() {
+        GLOBAL.reset();
+    }
+}
+
+#[cfg(feature = "mimic_lean")]
+mod selected {
+    pub const NAME: &str = "mimic_lean";
+    pub const DETAIL: &str = "mimic without the used/free_is_zero/flags bookkeeping: direct table and page-header free list only";
+    #[global_allocator]
+    static GLOBAL: super::mimic::Mimic<true, false, false> = super::mimic::Mimic::new();
+    pub fn reset() {
+        GLOBAL.reset();
+    }
+}
+
+#[cfg(feature = "mimic_u32")]
+mod selected {
+    pub const NAME: &str = "mimic_u32";
+    pub const DETAIL: &str = "mimic with the used counter read and written as a 32-bit word";
+    #[global_allocator]
+    static GLOBAL: super::mimic::Mimic<false, true, false> = super::mimic::Mimic::new();
+    pub fn reset() {
+        GLOBAL.reset();
+    }
+}
+
+#[cfg(feature = "mimic_nozero")]
+mod selected {
+    pub const NAME: &str = "mimic_nozero";
+    pub const DETAIL: &str = "mimic without the free_is_zero store on free";
+    #[global_allocator]
+    static GLOBAL: super::mimic::Mimic<false, false, true> = super::mimic::Mimic::new();
+    pub fn reset() {
+        GLOBAL.reset();
+    }
+}
+
 #[cfg(feature = "talc")]
 mod selected {
     pub const NAME: &str = "talc";
@@ -152,6 +224,19 @@ mod selected {
     pub fn reset() {}
 }
 
+#[cfg(feature = "wasmalloc")]
+mod selected {
+    pub const NAME: &str = "wasmalloc";
+    pub const DETAIL: &str = "wasmalloc (this repository): WasmAlloc over a static heap";
+    // wasmalloc::global only exists on wasm32; the crate refuses the atomics feature itself.
+    #[cfg(target_arch = "wasm32")]
+    #[global_allocator]
+    static GLOBAL: wasmalloc::WasmAlloc = wasmalloc::WasmAlloc::new();
+    #[cfg(not(target_arch = "wasm32"))]
+    compile_error!("the wasmalloc variant only exists for wasm32 targets");
+    pub fn reset() {}
+}
+
 // No feature: std's default. Which allocator that is depends on the target, and
 // the harness records it so the tables can say what was actually measured.
 #[cfg(not(any(
@@ -159,18 +244,25 @@ mod selected {
     feature = "freelist",
     feature = "sizeclass",
     feature = "pages",
+    feature = "mimic",
+    feature = "mimic_lean",
+    feature = "mimic_u32",
+    feature = "mimic_nozero",
     feature = "talc",
-    feature = "lol_alloc"
+    feature = "lol_alloc",
+    feature = "wasmalloc"
 )))]
 mod selected {
     #[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
     pub const NAME: &str = "dlmalloc";
     #[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
-    pub const DETAIL: &str = "std default on wasm32-unknown-unknown: dlmalloc-rs (Rust port of dlmalloc)";
+    pub const DETAIL: &str =
+        "std default on wasm32-unknown-unknown: dlmalloc-rs (Rust port of dlmalloc)";
     #[cfg(all(target_arch = "wasm32", target_os = "wasi"))]
     pub const NAME: &str = "dlmalloc";
     #[cfg(all(target_arch = "wasm32", target_os = "wasi"))]
-    pub const DETAIL: &str = "std default on wasm32-wasip1: wasi-libc malloc (C dlmalloc via System)";
+    pub const DETAIL: &str =
+        "std default on wasm32-wasip1: wasi-libc malloc (C dlmalloc via System)";
     #[cfg(not(target_arch = "wasm32"))]
     pub const NAME: &str = "system";
     #[cfg(not(target_arch = "wasm32"))]

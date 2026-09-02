@@ -1,0 +1,51 @@
+{
+  "engine": "d8",
+  "engineVersion": "V8 15.2.124",
+  "flags": "--no-liftoff",
+  "note": null,
+  "wasm": "/home/bpowers/src/wasm-clalloc/.worktrees/roofline/bench/roofline/target/dist/sizeclass-release-z-nolto-wasmopt.wasm",
+  "variant": "sizeclass",
+  "memoryPagesAtStart": 20,
+  "reps": 7,
+  "scale": 1,
+  "tierHint": "any",
+  "callOverheadNs": {
+    "median": 0.9630000000000001,
+    "min": 0.4529999999999994,
+    "tier": "turbofan"
+  },
+  "results": [
+    {
+      "workload": "alloc_free_32",
+      "unit": "alloc+free pair",
+      "n": 2000000,
+      "opsPerCall": 2000000,
+      "medianNsPerOp": 0.8934995185000013,
+      "minNsPerOp": 0.8914995184999989,
+      "warmupCalls": 4,
+      "liftoffWarmupCalls": 0,
+      "firstCallNsPerOp": 1.0124995185000003,
+      "tier": "turbofan",
+      "tierStable": true,
+      "pagesBefore": 20,
+      "pagesAfter": 276,
+      "checksum": 0
+    },
+    {
+      "workload": "churn",
+      "unit": "free+alloc step",
+      "n": 200000,
+      "opsPerCall": 200000,
+      "medianNsPerOp": 3.194995184999979,
+      "minNsPerOp": 3.17499518499999,
+      "warmupCalls": 4,
+      "liftoffWarmupCalls": 0,
+      "firstCallNsPerOp": 5.334995185000001,
+      "tier": "turbofan",
+      "tierStable": true,
+      "pagesBefore": 276,
+      "pagesAfter": 276,
+      "checksum": 2976094273
+    }
+  ]
+}

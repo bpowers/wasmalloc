@@ -1,0 +1,72 @@
+talc-release.wasm: 19952 bytes, 72 functions
+  alloc_free_32: 50 instructions, 4 calls: __rust_no_alloc_shim_is_unstable_v2, talc::base::Talc<S,B>::allocate, talc::base::Talc<S,B>::deallocate, roofline::workloads::oom
+  churn: 146 instructions, 4 calls: talc::base::Talc<S,B>::deallocate, __rust_no_alloc_shim_is_unstable_v2, talc::base::Talc<S,B>::allocate, roofline::workloads::oom
+  realloc_doubling: 316 instructions, 20 calls: __rust_no_alloc_shim_is_unstable_v2, talc::base::Talc<S,B>::allocate, __rust_realloc x16, talc::base::Talc<S,B>::deallocate, roofline::workloads::oom
+  __rust_alloc: 4 instructions, 1 calls: talc::base::Talc<S,B>::allocate
+  __rust_dealloc: 4 instructions, 1 calls: talc::base::Talc<S,B>::deallocate
+  __rust_realloc: 329 instructions, 4 calls: <talc::wasm::WasmBinning as talc::base::binning::Binning>::size_to_bin x2, talc::base::Talc<S,B>::allocate, talc::base::Talc<S,B>::deallocate
+  __rust_no_alloc_shim_is_unstable_v2: 1 instructions, 0 calls
+
+talc-release-wasmopt-names.wasm: 15470 bytes, 47 functions
+  alloc_free_32: 42 instructions, 2 calls: talc::base::Talc<S,B>::allocate, talc::base::Talc<S,B>::deallocate
+  churn: 126 instructions, 2 calls: talc::base::Talc<S,B>::deallocate, talc::base::Talc<S,B>::allocate
+  realloc_doubling: 306 instructions, 18 calls: talc::base::Talc<S,B>::allocate, __rust_realloc x16, talc::base::Talc<S,B>::deallocate
+  __rust_alloc$: no function matches
+  __rust_dealloc$: no function matches
+  __rust_realloc: 353 instructions, 2 calls: talc::base::Talc<S,B>::allocate, talc::base::Talc<S,B>::deallocate
+  no_alloc_shim: no function matches
+
+talc-release-nolto.wasm: 20753 bytes, 75 functions
+  alloc_free_32: 48 instructions, 4 calls: __rust_no_alloc_shim_is_unstable_v2, talc::base::Talc<S,B>::allocate, talc::base::Talc<S,B>::deallocate, roofline::workloads::oom
+  churn: 147 instructions, 4 calls: talc::base::Talc<S,B>::deallocate, __rust_no_alloc_shim_is_unstable_v2, talc::base::Talc<S,B>::allocate, roofline::workloads::oom
+  realloc_doubling: 662 instructions, 52 calls: __rust_no_alloc_shim_is_unstable_v2, talc::base::Talc<S,B>::allocate x17, talc::base::Talc<S,B>::try_realloc_in_place x16, talc::base::Talc<S,B>::deallocate x17, roofline::workloads::oom
+  __rust_alloc: 4 instructions, 1 calls: talc::base::Talc<S,B>::allocate
+  __rust_dealloc: 5 instructions, 1 calls: talc::base::Talc<S,B>::deallocate
+  __rust_realloc: 37 instructions, 3 calls: talc::base::Talc<S,B>::try_realloc_in_place, talc::base::Talc<S,B>::allocate, talc::base::Talc<S,B>::deallocate
+  __rust_no_alloc_shim_is_unstable_v2: 1 instructions, 0 calls
+
+talc-release-nolto-wasmopt-names.wasm: 15616 bytes, 49 functions
+  alloc_free_32: 39 instructions, 2 calls: talc::base::Talc<S,B>::allocate, talc::base::Talc<S,B>::deallocate
+  churn: 126 instructions, 2 calls: talc::base::Talc<S,B>::deallocate, talc::base::Talc<S,B>::allocate
+  realloc_doubling: 563 instructions, 50 calls: talc::base::Talc<S,B>::allocate x17, talc::base::Talc<S,B>::try_realloc_in_place x16, talc::base::Talc<S,B>::deallocate x17
+  __rust_alloc$: no function matches
+  __rust_dealloc$: no function matches
+  __rust_realloc: 28 instructions, 3 calls: talc::base::Talc<S,B>::try_realloc_in_place, talc::base::Talc<S,B>::allocate, talc::base::Talc<S,B>::deallocate
+  no_alloc_shim: no function matches
+
+talc-release-z.wasm: 19036 bytes, 90 functions
+  alloc_free_32: 42 instructions, 3 calls: alloc[3ca501edff3f0c7c]::alloc::alloc, __rust_dealloc, roofline::workloads::oom
+  churn: 138 instructions, 3 calls: __rust_dealloc, alloc[3ca501edff3f0c7c]::alloc::alloc, roofline::workloads::oom
+  realloc_doubling: 74 instructions, 4 calls: alloc[3ca501edff3f0c7c]::alloc::alloc, __rust_dealloc, __rust_realloc, roofline::workloads::oom
+  __rust_alloc: 4 instructions, 1 calls: talc::base::Talc<S,B>::allocate
+  __rust_dealloc: 5 instructions, 1 calls: talc::base::Talc<S,B>::deallocate
+  __rust_realloc: 7 instructions, 1 calls: <talc::cell::TalcCell<S,B> as core::alloc::global::GlobalAlloc>::realloc
+  __rust_no_alloc_shim_is_unstable_v2: 1 instructions, 0 calls
+
+talc-release-z-wasmopt-names.wasm: 13159 bytes, 50 functions
+  alloc_free_32: 34 instructions, 2 calls: talc::base::Talc<S,B>::allocate, talc::base::Talc<S,B>::deallocate
+  churn: 124 instructions, 2 calls: talc::base::Talc<S,B>::deallocate, talc::base::Talc<S,B>::allocate
+  realloc_doubling: 66 instructions, 3 calls: talc::base::Talc<S,B>::allocate, talc::base::Talc<S,B>::deallocate, __rust_realloc
+  __rust_alloc$: no function matches
+  __rust_dealloc$: no function matches
+  __rust_realloc: 155 instructions, 6 calls: talc::base::Talc<S,B>::deregister_gap x2, talc::base::Talc<S,B>::register_gap x2, talc::base::Talc<S,B>::allocate, talc::base::Talc<S,B>::deallocate
+  no_alloc_shim: no function matches
+
+talc-release-z-nolto.wasm: 19044 bytes, 90 functions
+  alloc_free_32: 42 instructions, 3 calls: alloc[3ca501edff3f0c7c]::alloc::alloc, __rust_dealloc, roofline::workloads::oom
+  churn: 138 instructions, 3 calls: __rust_dealloc, alloc[3ca501edff3f0c7c]::alloc::alloc, roofline::workloads::oom
+  realloc_doubling: 74 instructions, 4 calls: alloc[3ca501edff3f0c7c]::alloc::alloc, __rust_dealloc, __rust_realloc, roofline::workloads::oom
+  __rust_alloc: 4 instructions, 1 calls: talc::base::Talc<S,B>::allocate
+  __rust_dealloc: 5 instructions, 1 calls: talc::base::Talc<S,B>::deallocate
+  __rust_realloc: 7 instructions, 1 calls: <talc::cell::TalcCell<S,B> as core::alloc::global::GlobalAlloc>::realloc
+  __rust_no_alloc_shim_is_unstable_v2: 1 instructions, 0 calls
+
+talc-release-z-nolto-wasmopt-names.wasm: 13245 bytes, 50 functions
+  alloc_free_32: 34 instructions, 2 calls: talc::base::Talc<S,B>::allocate, talc::base::Talc<S,B>::deallocate
+  churn: 124 instructions, 2 calls: talc::base::Talc<S,B>::deallocate, talc::base::Talc<S,B>::allocate
+  realloc_doubling: 66 instructions, 3 calls: talc::base::Talc<S,B>::allocate, talc::base::Talc<S,B>::deallocate, <talc::cell::TalcCell<S,B> as core::alloc::global::GlobalAlloc>::realloc
+  __rust_alloc$: no function matches
+  __rust_dealloc$: no function matches
+  __rust_realloc$: no function matches
+  no_alloc_shim: no function matches
+

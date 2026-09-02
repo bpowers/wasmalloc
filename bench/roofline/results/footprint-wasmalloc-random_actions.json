@@ -1,0 +1,35 @@
+{
+  "engine": "node",
+  "engineVersion": "node 22.22.2 / V8 12.4.254.21-node.39",
+  "flags": "--no-liftoff",
+  "note": null,
+  "wasm": "/home/bpowers/src/wasm-clalloc/.worktrees/roofline/bench/roofline/target/dist/wasmalloc-release.wasm",
+  "variant": "wasmalloc",
+  "memoryPagesAtStart": 20,
+  "reps": 3,
+  "scale": 1,
+  "tierHint": "any",
+  "callOverheadNs": {
+    "median": 1.359684999999999,
+    "min": 0.37169899999999956,
+    "tier": "turbofan"
+  },
+  "results": [
+    {
+      "workload": "random_actions",
+      "unit": "action (3/7 alloc, 3/7 free, 1/7 realloc)",
+      "n": 100000,
+      "opsPerCall": 100000,
+      "medianNsPerOp": 16.684926403149955,
+      "minNsPerOp": 16.679626403149978,
+      "warmupCalls": 4,
+      "liftoffWarmupCalls": 0,
+      "firstCallNsPerOp": 74.31384640315004,
+      "tier": "turbofan",
+      "tierStable": true,
+      "pagesBefore": 20,
+      "pagesAfter": 81,
+      "checksum": 1031975166
+    }
+  ]
+}

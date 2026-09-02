@@ -6,99 +6,154 @@
   "reps": 7,
   "scale": 1,
   "callOverheadNs": null,
+  "memoryPagesAtStart": 276,
   "results": [
     {
       "workload": "alloc_free_32",
       "unit": "alloc+free pair",
       "n": 2000000,
       "opsPerCall": 2000000,
-      "medianNsPerOp": 0.546,
-      "minNsPerOp": 0.539,
+      "medianNsPerOp": 0.713,
+      "minNsPerOp": 0.711,
       "warmupCalls": 3,
-      "tier": "n/a"
+      "tier": "n/a",
+      "pagesBefore": 276,
+      "pagesAfter": 276
+    },
+    {
+      "workload": "alloc_free_32_align16",
+      "unit": "alloc+free pair, align 16",
+      "n": 2000000,
+      "opsPerCall": 2000000,
+      "medianNsPerOp": 0.711,
+      "minNsPerOp": 0.711,
+      "warmupCalls": 3,
+      "tier": "n/a",
+      "pagesBefore": 276,
+      "pagesAfter": 276
     },
     {
       "workload": "batch_lifo_32",
       "unit": "alloc+free pair",
       "n": 2000,
       "opsPerCall": 2000000,
-      "medianNsPerOp": 1.043,
-      "minNsPerOp": 1.042,
+      "medianNsPerOp": 1.026,
+      "minNsPerOp": 1.025,
       "warmupCalls": 3,
-      "tier": "n/a"
+      "tier": "n/a",
+      "pagesBefore": 276,
+      "pagesAfter": 276
     },
     {
       "workload": "batch_fifo_32",
       "unit": "alloc+free pair",
       "n": 2000,
       "opsPerCall": 2000000,
-      "medianNsPerOp": 1.076,
-      "minNsPerOp": 1.075,
+      "medianNsPerOp": 1.056,
+      "minNsPerOp": 1.054,
       "warmupCalls": 3,
-      "tier": "n/a"
+      "tier": "n/a",
+      "pagesBefore": 276,
+      "pagesAfter": 276
     },
     {
       "workload": "churn",
       "unit": "free+alloc step",
       "n": 200000,
       "opsPerCall": 200000,
-      "medianNsPerOp": 3.181,
-      "minNsPerOp": 3.167,
+      "medianNsPerOp": 3.168,
+      "minNsPerOp": 3.153,
       "warmupCalls": 4,
-      "tier": "n/a"
+      "tier": "n/a",
+      "pagesBefore": 276,
+      "pagesAfter": 276
+    },
+    {
+      "workload": "random_actions",
+      "unit": "action (3/7 alloc, 3/7 free, 1/7 realloc)",
+      "n": 100000,
+      "opsPerCall": 100000,
+      "medianNsPerOp": 17.636,
+      "minNsPerOp": 17.462,
+      "warmupCalls": 5,
+      "tier": "n/a",
+      "pagesBefore": 276,
+      "pagesAfter": 2324
+    },
+    {
+      "workload": "random_actions_norealloc",
+      "unit": "action (1/2 alloc, 1/2 free)",
+      "n": 100000,
+      "opsPerCall": 100000,
+      "medianNsPerOp": 8.167,
+      "minNsPerOp": 8.137,
+      "warmupCalls": 4,
+      "tier": "n/a",
+      "pagesBefore": 2324,
+      "pagesAfter": 2324
     },
     {
       "workload": "vec_push_growth",
       "unit": "1 MiB Vec<u8> growth",
       "n": 20,
       "opsPerCall": 20,
-      "medianNsPerOp": 533160.3,
-      "minNsPerOp": 454321.55,
-      "warmupCalls": 6,
-      "tier": "n/a"
+      "medianNsPerOp": 519929.7,
+      "minNsPerOp": 498934.8,
+      "warmupCalls": 3,
+      "tier": "n/a",
+      "pagesBefore": 2324,
+      "pagesAfter": 2324
     },
     {
       "workload": "realloc_doubling",
       "unit": "16 B to 1 MiB realloc chain",
       "n": 100,
       "opsPerCall": 100,
-      "medianNsPerOp": 60143.81,
-      "minNsPerOp": 59223.31,
+      "medianNsPerOp": 36511.98,
+      "minNsPerOp": 36338.97,
       "warmupCalls": 4,
-      "tier": "n/a"
+      "tier": "n/a",
+      "pagesBefore": 2324,
+      "pagesAfter": 3348
     },
     {
       "workload": "large_alloc_free",
       "unit": "alloc+touch+free, 256K-4M",
       "n": 50,
       "opsPerCall": 50,
-      "medianNsPerOp": 2599.18,
-      "minNsPerOp": 2456.6,
-      "warmupCalls": 7,
-      "tier": "n/a"
+      "medianNsPerOp": 2538.78,
+      "minNsPerOp": 2490.98,
+      "warmupCalls": 4,
+      "tier": "n/a",
+      "pagesBefore": 3348,
+      "pagesAfter": 3348
     },
     {
       "workload": "memory_grow_only",
       "unit": "memory.grow 1 MiB, untouched",
       "n": 16,
       "opsPerCall": 16,
-      "medianNsPerOp": 275,
-      "minNsPerOp": 273.75,
+      "medianNsPerOp": 276.25,
+      "minNsPerOp": 275,
       "warmupCalls": 4,
-      "tier": "n/a"
+      "tier": "n/a",
+      "pagesBefore": 3348,
+      "pagesAfter": 6164
     },
     {
       "workload": "memory_grow_touch",
       "unit": "memory.grow 1 MiB + touch",
       "n": 16,
       "opsPerCall": 16,
-      "medianNsPerOp": 166859.438,
-      "minNsPerOp": 166113.25,
+      "medianNsPerOp": 130594.562,
+      "minNsPerOp": 129420.125,
       "warmupCalls": 3,
-      "tier": "n/a"
+      "tier": "n/a",
+      "pagesBefore": 6164,
+      "pagesAfter": 8724
     }
   ],
-  "checksum": 2727586193,
+  "checksum": 3211928562,
   "engineVersion": "wasmtime 48.0.1 (7bac2c277 2026-08-24)",
   "flags": "(default: cranelift)"
 }
