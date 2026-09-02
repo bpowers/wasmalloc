@@ -46,7 +46,7 @@ Entries are grouped by module. Page invariants 1 to 5 refer to the numbered list
   `used` cost about 2 ns per alloc+free pair). The header is 36 bytes on wasm32 and 48 on the
   host, still within `PAGE_HEADER_RESERVE` (const asserted); the write is otherwise the same.
   The four page Kani harnesses and Miri (both aliasing models) were re-run on the new layout.
-- Reviewer: pending adversarial review. Date: 2026-09-01.
+- Reviewer: adversarial-reviewer, 2026-09-02: accepted.
 
 ### PAGE-02: `page::pop`, the free-list pop
 
@@ -70,7 +70,7 @@ Entries are grouped by module. Page invariants 1 to 5 refer to the numbered list
 - Changes: 2026-09-01, `used` and `capacity` are `u32` (see PAGE-01); the increment is now a
   32-bit read-modify-write at offset `size_of::<usize>()`. The overflow argument is unchanged
   and holds a fortiori. Harnesses and Miri re-run.
-- Reviewer: pending adversarial review. Date: 2026-09-01.
+- Reviewer: adversarial-reviewer, 2026-09-02: accepted.
 
 ### PAGE-03: `page::push`, the free-list push
 
@@ -91,7 +91,7 @@ Entries are grouped by module. Page invariants 1 to 5 refer to the numbered list
 - Changes: 2026-09-01, `used` is `u32` (see PAGE-01); the decrement is a 32-bit
   read-modify-write and `free_is_zero` moved from offset 16 to 22 (both targets). The underflow
   argument is unchanged. Harnesses and Miri re-run.
-- Reviewer: pending adversarial review. Date: 2026-09-01.
+- Reviewer: adversarial-reviewer, 2026-09-02: accepted.
 
 ### PAGE-04: `page::extend`, lazy free-list extension
 
@@ -129,7 +129,10 @@ Entries are grouped by module. Page invariants 1 to 5 refer to the numbered list
   remaining panic call site in the release build can be removed without unsafe code by dividing
   by `block_size.max(1)` (identical for every reachable value, and LLVM drops the zero check);
   this is proposed in the verification report (2026-09-02) rather than applied here.
-- Reviewer: pending adversarial review. Date: 2026-09-01.
+- Reviewer: adversarial-reviewer, 2026-09-02: accepted. Caveat: the `block_size.max(1)` proposal
+  is sound (identical for every reachable header, since `init` stores at least `MIN_BLOCK_SIZE`,
+  and LLVM drops the zero test) and worth applying to remove the last release-build panic path;
+  update this entry when it lands.
 
 ### PAGE-05: header field reads in the predicates and helpers
 
@@ -153,7 +156,7 @@ Blocks in `is_full`, `all_free`, `has_free`, `is_expandable`, `in_full_queue`,
 - Changes: 2026-09-01, `is_full`, `is_expandable`, `block_area` and `block_index` now read
   `u32` counters (see PAGE-01); each read is still of a fully initialised field of its own
   type. Harnesses and Miri re-run.
-- Reviewer: pending adversarial review. Date: 2026-09-01.
+- Reviewer: adversarial-reviewer, 2026-09-02: accepted.
 
 ### PAGE-06: `page::validate` (test and proof infrastructure only)
 
@@ -165,7 +168,7 @@ Blocks in `is_full`, `all_free`, `has_free`, `is_expandable`, `in_full_queue`,
   is bounded by `capacity - used` so a cycle terminates.
 - Machine checks: `validate_rejects_corrupt_pages` drives every error path; it is the invariant
   oracle for the Kani operation-sequence harnesses and the randomised test. Miri as above.
-- Reviewer: pending adversarial review. Date: 2026-09-01.
+- Reviewer: adversarial-reviewer, 2026-09-02: accepted.
 
 ## heap
 
@@ -232,7 +235,7 @@ the returned block, the zeroing block in `alloc_zeroed`, and the calls into `all
   entries; sizes up to 1 KiB reach it only in tests), and `alloc_zeroed`'s `write_bytes` on a
   dirty page (the model stores one word per block); both rest on the arithmetic above and on
   the tests.
-- Reviewer: pending adversarial review. Date: 2026-09-02.
+- Reviewer: adversarial-reviewer, 2026-09-02: accepted.
 
 ### HEAP-02: `Heap::dealloc`, the small-page fast path, and `dealloc_generic`
 
@@ -280,7 +283,7 @@ Blocks: in `dealloc`, the `page::push` on the masked header, `needs_transition` 
   requests), the model tester and the fuzz targets. Miri as above.
 - Not machine-checked by Kani: medium pages and the run branch of `dealloc_generic` (the model
   has one small page); tests only.
-- Reviewer: pending adversarial review. Date: 2026-09-02.
+- Reviewer: adversarial-reviewer, 2026-09-02: accepted.
 
 ### HEAP-03: `Heap::realloc`
 
@@ -319,7 +322,7 @@ Blocks: `Layout::from_size_align_unchecked`, the `self.alloc(new_layout)` for a 
   (content checks across every move). Miri as above.
 - Not machine-checked by Kani: the copy on a move (the model has no block bodies); tests and
   the model tester check contents.
-- Reviewer: pending adversarial review. Date: 2026-09-02.
+- Reviewer: adversarial-reviewer, 2026-09-02: accepted.
 
 ### HEAP-04: `alloc_generic`, `alloc_huge` and `acquire_run`, the slow-path hand-out
 
@@ -356,7 +359,10 @@ zeroing block; in `alloc_huge`, the `write_bytes` and `NonNull::new_unchecked`; 
   the fuzz targets. Miri as above.
 - Not machine-checked by Kani: `alloc_huge` itself (no run fits the one-slice model alongside a
   page); tests only.
-- Reviewer: pending adversarial review. Date: 2026-09-02.
+- Reviewer: adversarial-reviewer, 2026-09-02: accepted. Caveat: the non-null argument for runs
+  rests on `__heap_base > 0` (slice 0 is handed out only when the heap base is 0), true for every
+  wasm-ld layout but unstated (R-4); and on wasi targets the exclusivity the `slices` contract
+  inherits from `Memory::heap_base` is broken by R-1 (see BACKEND-02).
 
 ### HEAP-05: the queue operations and `page_at`
 
@@ -388,7 +394,7 @@ Blocks in `push_front`, `push_back`, `remove`, `move_to_front`, `move_to_full`, 
   validator over all 64 queues and 129 direct entries;
   `page_exhaustion_adds_pages_and_full_queue_round_trips`,
   `a_forced_collection_reaches_a_retired_page_behind_a_page_in_use`. Miri as above.
-- Reviewer: pending adversarial review. Date: 2026-09-02.
+- Reviewer: adversarial-reviewer, 2026-09-02: accepted.
 
 ### HEAP-06: `find_page` and `fresh_page`, the page search and supply
 
@@ -430,7 +436,9 @@ comparison with `all_free`/`free_page`/`mostly_used`, the `extend` of the candid
   tester and the fuzz targets. Miri as above.
 - Not machine-checked by Kani: the candidate comparison with two or more members in one queue
   (including `free_page` of an empty earlier candidate); tests only.
-- Reviewer: pending adversarial review. Date: 2026-09-02.
+- Reviewer: adversarial-reviewer, 2026-09-02: accepted. Caveat: the `free_page(candidate, qi)`
+  branch the sketch treats as live is unreachable: a candidate that survives the walk has an empty
+  free list, so `used == capacity >= 1` and `all_free` is false (R-5).
 
 ### HEAP-07: retirement and release (`dealloc_transition`, `retire`, `collect_retired`, `free_page`)
 
@@ -462,7 +470,10 @@ comparison with `all_free`/`free_page`/`mostly_used`, the `extend` of the candid
   the end), the model tester and the fuzz targets. Miri as above.
 - Not machine-checked by Kani: `retire`'s immediate release (a queue of more than one page, or
   more than three), which needs a second page; tests only.
-- Reviewer: pending adversarial review. Date: 2026-09-02.
+- Reviewer: adversarial-reviewer, 2026-09-02: accepted. Caveat: the retired range and the
+  three-page window are not merely a hint for the documented promise that every retired page is
+  released before memory grows: R-2 shows an emptied page with `retire_expire != 0` behind three
+  pages in use that survives the forced collection (footprint, not memory safety).
 
 ### HEAP-08: header reads in `needs_transition` and `mostly_used`
 
@@ -471,7 +482,7 @@ comparison with `all_free`/`free_page`/`mostly_used`, the `extend` of the candid
 - Proof sketch: as PAGE-05, reads of fully initialised fields of their own types through the
   raw pointer; `mostly_used`'s products are of counts at most 8188, far below `usize::MAX`.
 - Machine checks: every structural heap harness and every heap test reaches both; Miri as above.
-- Reviewer: pending adversarial review. Date: 2026-09-02.
+- Reviewer: adversarial-reviewer, 2026-09-02: accepted.
 
 ### HEAP-09: `validate_queue_inner`, `validate_direct_entry` and the harness helpers (test and proof infrastructure only)
 
@@ -481,7 +492,7 @@ comparison with `all_free`/`free_page`/`mostly_used`, the `extend` of the candid
   (PAGE-06) guards every free-list read. The proof-only backends `HeapModel` and `QueueModel`
   assert that every address the heap touches is a header or a modelled block word, so a stray
   access fails the proof instead of reading outside the model.
-- Reviewer: pending adversarial review. Date: 2026-09-02.
+- Reviewer: adversarial-reviewer, 2026-09-02: accepted.
 
 ## global
 
@@ -494,7 +505,7 @@ comparison with `all_free`/`free_page`/`mostly_used`, the `extend` of the candid
   thread: there is no shared memory and no thread primitive. Every access to the heap goes
   through `heap()` (GLOBAL-02). The Miri and Kani runs do not reach this block (it exists only
   on wasm32); the wasm32 end-to-end test `tests/global_wasm.rs` runs the static under wasmtime.
-- Reviewer: pending adversarial review. Date: 2026-09-02.
+- Reviewer: adversarial-reviewer, 2026-09-02: accepted.
 
 ### GLOBAL-02: `WasmAlloc::heap` and the four `GlobalAlloc` methods
 
@@ -517,7 +528,11 @@ Blocks: `&mut *self.heap.get()`, and in each method the call into the heap, with
 - Machine checks: `tests/global_wasm.rs` under wasmtime (std collections, churn, zeroed and
   over-aligned allocations through the static). The heap methods themselves are HEAP-01 to
   HEAP-04.
-- Reviewer: pending adversarial review. Date: 2026-09-02.
+- Reviewer: adversarial-reviewer, 2026-09-02: accepted. Caveat: the no-unwind property follows
+  from the wasm32 targets' `panic-strategy = "abort"`, not from this crate's `[profile.release]`,
+  which consumers never inherit (R-6); as the entry anticipates, a failing `debug_assert!` with a
+  formatted message (`queue_index`) does allocate in the panic hook, so debug builds re-enter on a
+  broken invariant.
 
 ### GLOBAL-03: `unsafe impl GlobalAlloc for WasmAlloc`
 
@@ -531,7 +546,8 @@ Blocks: `&mut *self.heap.get()`, and in each method the call into the heap, with
   contract; the implementation still returns a distinct 8-byte block.
 - Machine checks: as GLOBAL-02; the model tester (`tests/model_heap.rs`, `tests/model_system.rs`
   against `System` for the tester's own soundness, `tests/model_mutants.rs` for its power).
-- Reviewer: pending adversarial review. Date: 2026-09-02.
+- Reviewer: adversarial-reviewer, 2026-09-02: accepted. Caveat: discharged among this allocator's
+  own blocks; on wasi targets wasi-libc's malloc hands out the same bytes (R-1).
 
 ## backend
 
@@ -545,7 +561,7 @@ relied on throughout `heap` and `page`) `ptr(addr).addr() == addr`. Every unsafe
 `heap` and `page` that dereferences a `Memory::ptr` result cites this contract; the entries
 below argue that the implementations meet it.
 
-- Reviewer: pending adversarial review. Date: 2026-09-02.
+- Reviewer: adversarial-reviewer, 2026-09-02: accepted.
 
 ### BACKEND-02: `unsafe impl Memory for WasmMemory`
 
@@ -567,7 +583,7 @@ below argue that the implementations meet it.
   non-contiguous).
 - Machine checks: `tests/global_wasm.rs` under wasmtime; the wasm32-wasip1 unit tests exercise
   the slice logic against `SimMemory`, not this backend.
-- Reviewer: pending adversarial review. Date: 2026-09-02.
+- Reviewer: adversarial-reviewer, 2026-09-02: REJECTED, see review findings R-1.
 
 ### BACKEND-03: `SimMemory::from_region`, `SimMemory::grow` and `unsafe impl Memory for SimMemory`
 
@@ -589,7 +605,7 @@ below argue that the implementations meet it.
   `sim_pointers_round_trip_addresses`; every heap, page and slices test and the model tester run
   over this backend under Miri with strict provenance (Stacked Borrows) and under Tree Borrows,
   which is the check that `with_addr` keeps the right provenance.
-- Reviewer: pending adversarial review. Date: 2026-09-02.
+- Reviewer: adversarial-reviewer, 2026-09-02: accepted.
 
 ### BACKEND-04: `testing::HostRegion` and `testing::Region` (test infrastructure only)
 
@@ -600,7 +616,8 @@ below argue that the implementations meet it.
   the caller promising exclusivity and that the memory dies first; `Region` enforces both by
   owning exactly one `SimMemory` and declaring it before the region so it drops first.
 - Machine checks: every test that uses `Region` or `SimHeap`, under Miri as above.
-- Reviewer: pending adversarial review. Date: 2026-09-02.
+- Reviewer: adversarial-reviewer, 2026-09-02: accepted. Caveat: `HostRegion::new(0)` would hand a
+  zero-size Layout to `alloc`; no caller does, but the constructor should refuse it (R-7).
 
 ## slices
 
@@ -611,3 +628,65 @@ and are covered by the twelve slices Kani harnesses.
 Not listed: the unsafe blocks inside `#[cfg(test)]` test code and the proof-only backends
 under `#[cfg(kani)]` (`page::verify::PageModel`, `heap::verify::HeapModel` and `QueueModel`),
 which never ship; their safety arguments are in their `SAFETY` comments and HEAP-09.
+
+## Review findings (adversarial review, 2026-09-02)
+
+Reviewer: adversarial-reviewer (did not write any of the code). Scope: the 22 entries above,
+the unsafe blocks they cover, and the machine checks they cite. Verdict: 21 accepted (8 of them
+with a caveat), 1 rejected (BACKEND-02). Ranked by severity.
+
+- R-1 (memory-safety bug, reproduced; wasm32-wasip1 and wasip2): `Heap::ensure_init` reclaims
+  every whole slice of the linker gap `[__heap_base, initial memory end)`. wasi-libc's dlmalloc
+  does the same: its `try_init_allocator` (present in the wasm32-wasip1 sysroot's `libc.a`,
+  referencing `__heap_base` and `__heap_end`) makes that gap its first segment the first time
+  any libc `malloc` runs, and std reaches libc malloc through `__wasilibc_populate_preopens`,
+  `__wasilibc_initialize_environ` and `opendir` (`std::fs`, `std::env`). With the default link
+  the gap is the tail of one slice and this heap uses none of it, so nothing collides by luck;
+  with `--initial-memory` widening it, both allocators hand out the same bytes.
+  `tests/wasi_libc_gap.rs` shows it: built with
+  `RUSTFLAGS="-C link-arg=--initial-memory=8388608" cargo test --target wasm32-wasip1 --test wasi_libc_gap`,
+  libc `malloc` returned `[0x114e90, 0x270010)`, which contains this heap's live run
+  `[0x260000, 0x270000)`, and a write inside the libc block changed the run. BACKEND-02's
+  exclusivity claim for the gap is false on wasi targets. A fix is not the reviewer's to make;
+  the obvious one is to start the heap at `max(__heap_base, __heap_end)` (or at the current end
+  of memory) on `target_os = "wasi"`, and to say in BACKEND-02 which targets may reclaim the gap.
+- R-2 (documented property violated, reproduced; footprint, not memory safety): the heap
+  documents that every retired page is released before linear memory grows, and `acquire_run`
+  relies on `collect_retired(true)` for it. The fast paths never touch `retire_expire`, the
+  collection visits only the first `RETIRE_MAX_PAGES` members of the queues in the retired
+  range, and `needs_transition` skips `retire` when `retire_expire != 0`. A page that is
+  retired, drained through the direct table, parked in the full queue by the next search,
+  brought back to the end of its bin queue by one free and then emptied behind three pages in
+  use keeps `retire_expire != 0` with `used == 0` and is never released: memory grows with a
+  whole empty slice in a queue. `tests/review_edge_cases.rs`,
+  `an_emptied_page_behind_three_others_is_released_before_memory_grows` (ignored; run with
+  `-- --ignored`) grows memory by two slices in that state.
+- R-3 (proof sketch incomplete, no reproducer): HEAP-04 and the `Memory` contract take the
+  linker gap as exclusively the allocator's; on wasi targets that is R-1. The heap's own
+  invariants are fine; the precondition is what fails.
+- R-4 (proof sketch incomplete): HEAP-04's non-null argument for runs ("positive on wasm")
+  depends on `__heap_base > 0`; a run at slice 0 would be address 0 and the
+  `NonNull::new_unchecked` would be undefined. Every wasm-ld layout places data or the stack
+  below `__heap_base`, so it holds, but it is an assumption the entry should state.
+- R-5 (documentation): HEAP-06 describes `find_page`'s `free_page(candidate, qi)` as a live
+  path. It is unreachable: a candidate that survives the walk has an empty free list (an
+  available page ends the walk), so `used == capacity`, and `capacity >= 1` for every queue
+  member (`fresh_page` extends before anything else sees the page), so `all_free` is false.
+- R-6 (documentation): GLOBAL-02 credits the release profile's `panic = "abort"` for the
+  absence of unwinding; consumers do not inherit a dependency's profile. The property holds
+  because both wasm32 targets are `panic-strategy = "abort"` (verified from the target specs).
+- R-7 (documentation, test infrastructure): `HostRegion::new(0)` would pass a zero-size Layout
+  to `std::alloc::alloc`; no caller does.
+
+Machine checks run for this review (all in the `review` worktree): host tests, wasm32-wasip1
+tests under wasmtime, `cargo fmt --check`, `cargo clippy --all-targets -D warnings`; every one
+of the 33 Kani harnesses (`scripts/kani`, at most four per invocation, `KANI_MEM=4G`), all
+successful, the heap structural harnesses peaking at 3.8 GB; Miri with `-Zmiri-strict-provenance`
+over the `page` (11 tests) and `heap` (18 tests) unit tests and with `-Zmiri-tree-borrows` over
+the `page` tests, all clean; a 3-minute `model_heap` fuzz run (474k executions), clean; and the
+new probes in `tests/review_edge_cases.rs` (every size within an alignment of each class
+boundary with every natural alignment and a realloc each way, realloc shrink-then-grow chains
+across bins and kinds with frees at the shrunk Layout, runs aligned to 2^16 through 2^30, a
+memory too small to serve with refusals interleaved with live blocks, a heap base in the last
+slice, and a page reused through the direct table), all passing. Kani harness names, test
+names and Miri claims cited by the entries were checked to exist and to cover what they say.
