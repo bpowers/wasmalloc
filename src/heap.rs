@@ -29,7 +29,9 @@
 //! its page; retired pages age at each collection (every [`GENERIC_COLLECT_PERIOD`] slow-path
 //! allocations and before a fresh page is taken) and are released when their count runs out.
 //! They are also all released before linear memory is grown, whatever their count: growth is
-//! permanent footprint on wasm, a released page is only a page initialisation away.
+//! permanent footprint on wasm, a released page is only a page initialisation away. That release
+//! walks every bin queue rather than the retired range and its window, so it does not depend on
+//! the countdown bookkeeping, which the fast paths do not maintain ([`Heap::release_empty_pages`]).
 //!
 //! # Fast paths
 //!
@@ -48,6 +50,7 @@
 //! 3. `direct[i]` is the first page of the queue for `bin(i * WORD)`, or the sentinel when that
 //!    queue is empty.
 //! 4. A page's slices are marked allocated in the slice map; freed pages' slices are free.
+//! 5. Bit `q` of `occupied` is set exactly when `queues[q]` holds a page.
 
 use core::alloc::Layout;
 use core::ptr::{self, NonNull};
@@ -142,9 +145,18 @@ pub struct Heap<M: Memory, const WORDS: usize = 1024> {
     /// Bins that may hold retired pages, inclusive; `retired_min > retired_max` means none.
     retired_min: usize,
     retired_max: usize,
+    /// Bit `q` set: `queues[q]` holds at least one page (heap invariant 5). Lets
+    /// [`release_empty_pages`](Self::release_empty_pages) visit only the queues that have pages:
+    /// a walk over all 64 queue heads would be cheap at run time but makes CBMC unroll the
+    /// queue walk 64 times over, which put the heap proofs past their memory cap.
+    occupied: u64,
     generic_count: u32,
     initialized: bool,
 }
+
+/// The bits of `Heap::occupied` that stand for bin queues (`1..=MAX_BIN`).
+const BIN_QUEUE_BITS: u64 = ((1u64 << BIN_COUNT) - 1) & !1;
+const _: () = assert!(QUEUE_COUNT <= u64::BITS as usize && BIN_QUEUE_BITS >> FULL_QUEUE == 0);
 
 impl<M: Memory, const WORDS: usize> Heap<M, WORDS> {
     /// A heap over `mem`. Touches no memory until the first allocation.
@@ -157,6 +169,7 @@ impl<M: Memory, const WORDS: usize> Heap<M, WORDS> {
             queues: [EMPTY_QUEUE; QUEUE_COUNT],
             retired_min: QUEUE_COUNT,
             retired_max: 0,
+            occupied: 0,
             generic_count: 0,
             initialized: false,
         }
@@ -371,7 +384,7 @@ impl<M: Memory, const WORDS: usize> Heap<M, WORDS> {
                 if self.generic_count >= GENERIC_COLLECT_PERIOD {
                     self.generic_count = 0;
                     // SAFETY: heap invariants hold between operations.
-                    unsafe { self.collect_retired(false) };
+                    unsafe { self.collect_retired() };
                 }
                 // SAFETY: heap invariants hold between operations.
                 let page = unsafe { self.find_page(bin) }?;
@@ -416,10 +429,11 @@ impl<M: Memory, const WORDS: usize> Heap<M, WORDS> {
 
     /// Slices for a page or a run: the lowest fit, or with `top` the bottom of the free tail
     /// first when it is long enough, so no memory is grown for a run a hole could hold. When
-    /// nothing fits, every retired page is released and the map searched again before memory
-    /// is grown: linear memory never shrinks, so a grow is footprint for good, while a released
-    /// page costs one page initialisation if its bin comes back. mimalloc only ages its retired
-    /// pages at this point; it has an OS to return memory to.
+    /// nothing fits, every empty page is released ([`release_empty_pages`](Self::release_empty_pages))
+    /// and the map searched again before memory is grown: linear memory never shrinks, so a grow
+    /// is footprint for good, while a released page costs one page initialisation if its bin
+    /// comes back. mimalloc only ages its retired pages at this point; it has an OS to return
+    /// memory to.
     fn acquire_run(&mut self, count: usize, align: usize, top: bool) -> Option<slices::Run> {
         if top {
             let end = self.mem.size_slices();
@@ -431,7 +445,7 @@ impl<M: Memory, const WORDS: usize> Heap<M, WORDS> {
             return Some(run);
         }
         // SAFETY: heap invariants hold between operations.
-        unsafe { self.collect_retired(true) };
+        unsafe { self.release_empty_pages() };
         slices::acquire(&mut self.slices, &mut self.mem, count, align, &self.policy)
     }
 
@@ -525,7 +539,16 @@ impl<M: Memory, const WORDS: usize> Heap<M, WORDS> {
             };
             if !available && !expandable {
                 // SAFETY: as above.
-                unsafe { self.move_to_full(qi, page) };
+                unsafe {
+                    // A page with every block out is not empty, whatever countdown a fast-path
+                    // drain left on it (the fast paths never touch `retire_expire`). Left in
+                    // place, the countdown would make the free that empties the page after it
+                    // comes back skip `retire` (see `needs_transition`) and strand an empty
+                    // page beyond the collection window with its bin outside the retired range
+                    // (review finding R-2).
+                    (*page).retire_expire = 0;
+                    self.move_to_full(qi, page);
+                }
             } else {
                 if candidate.is_null() {
                     candidate = page;
@@ -560,7 +583,7 @@ impl<M: Memory, const WORDS: usize> Heap<M, WORDS> {
         }
         if candidate.is_null() {
             // SAFETY: invariants hold.
-            unsafe { self.collect_retired(false) };
+            unsafe { self.collect_retired() };
             return self.fresh_page(bin);
         }
         // SAFETY: candidate is a live page of this heap in queue `qi`.
@@ -596,12 +619,21 @@ impl<M: Memory, const WORDS: usize> Heap<M, WORDS> {
 
     /// The page just became empty. Keep it for a while in case the size class is still active
     /// (mimalloc's `_mi_page_retire`), or release its slices.
+    ///
+    /// A page that already carries a countdown gets a fresh one and its bin re-enters the
+    /// retired range, so that whenever this function keeps a page, the range covers its bin.
+    /// mimalloc returns early instead ("already retired, just keep it retired"): its free path
+    /// calls `_mi_page_retire` on every free that empties a page, and re-arming there would
+    /// undo the aging of a page that oscillates around empty. Our free path makes that decision
+    /// one level up, in `needs_transition`, which skips the call for a page that carries a
+    /// countdown, so the two behave the same and this function only ever sees a countdown of
+    /// zero; refreshing rather than returning keeps the range right by construction should a
+    /// caller change.
     unsafe fn retire(&mut self, page: *mut Page) {
-        // SAFETY: caller passes a live page of this heap.
+        // SAFETY: caller passes a live, empty page of this heap that is a member of its bin
+        // queue.
         unsafe {
-            if (*page).retire_expire != 0 {
-                return;
-            }
+            debug_assert!(page::all_free(page));
             let qi = (*page).bin as usize;
             let bsize = (*page).block_size as usize;
             let count = self.queues[queue_index(qi)].count;
@@ -620,15 +652,21 @@ impl<M: Memory, const WORDS: usize> Heap<M, WORDS> {
     }
 
     /// Age the retired pages among the first [`RETIRE_MAX_PAGES`] of each queue in the retired
-    /// range and release the expired ones (`_mi_theap_collect_retired`). With `force`, release
-    /// every retired page seen. A page that was reused and is no longer empty is simply
-    /// un-retired.
+    /// range and release the expired ones (`_mi_theap_collect_retired`). A page that was reused
+    /// and is no longer empty is simply un-retired.
     ///
-    /// Unlike mimalloc, the scan does not stop at the first page that is not retired: a page
-    /// that came back into use and was moved to the front of its queue would otherwise hide the
-    /// retired pages behind it, and [`acquire_run`](Self::acquire_run) relies on a forced
-    /// collection to release those before memory is grown.
-    unsafe fn collect_retired(&mut self, force: bool) {
+    /// The range and the window are search hints for this aging walk, not the mechanism that
+    /// bounds footprint: a retired page they miss (see `needs_transition` for how a countdown
+    /// goes stale) stays a valid member of its queue and is freed by
+    /// [`release_empty_pages`](Self::release_empty_pages) before memory is grown, or picked up
+    /// once a search reaches it. Unlike mimalloc, the scan does not stop at the first page that
+    /// is not retired: the page at the front of a queue is usually the one in use, and stopping
+    /// there would never age the retired pages behind it.
+    ///
+    /// # Safety
+    ///
+    /// Heap invariants must hold.
+    unsafe fn collect_retired(&mut self) {
         let (lo, hi) = (self.retired_min, self.retired_max);
         let mut min = QUEUE_COUNT;
         let mut max = 0;
@@ -638,13 +676,14 @@ impl<M: Memory, const WORDS: usize> Heap<M, WORDS> {
                 let mut seen = 0;
                 while cur != 0 && seen < RETIRE_MAX_PAGES {
                     let page = self.page_at(cur);
-                    // SAFETY: queue members are live pages of this heap.
+                    // SAFETY: queue members are live pages of this heap; `next` is read before
+                    // the page can be freed.
                     unsafe {
                         let next = (*page).next;
                         if (*page).retire_expire != 0 {
                             if page::all_free(page) {
                                 (*page).retire_expire -= 1;
-                                if (*page).retire_expire == 0 || force {
+                                if (*page).retire_expire == 0 {
                                     self.free_page(page, qi);
                                 } else {
                                     min = min.min(qi);
@@ -662,6 +701,49 @@ impl<M: Memory, const WORDS: usize> Heap<M, WORDS> {
         }
         self.retired_min = min;
         self.retired_max = max;
+    }
+
+    /// Release every empty page of every bin queue and un-retire the pages in use, whatever the
+    /// retired range and the countdowns say. Runs before linear memory is grown: a grow is
+    /// footprint for good, a released page costs one page initialisation if its bin comes back,
+    /// and a walk over every page (one header read each) is cheap next to the tens of
+    /// microseconds a `memory.grow` costs in V8.
+    ///
+    /// Walking every queue that holds a page (heap invariant 5), rather than the retired range
+    /// and its three-page window as [`collect_retired`](Self::collect_retired) does, is what
+    /// makes the promise "every retired page is released before memory grows" hold without an
+    /// argument about where a retired page can sit: the fast paths never touch `retire_expire`,
+    /// so a page emptied by fast-path frees keeps whatever countdown it carried and
+    /// `needs_transition` skips `retire` for it; neither its position in the queue nor its bin's
+    /// presence in the range is maintained there (review finding R-2). Afterwards no page
+    /// carries a countdown, so the range is empty.
+    ///
+    /// # Safety
+    ///
+    /// Heap invariants must hold.
+    unsafe fn release_empty_pages(&mut self) {
+        let mut pending = self.occupied & BIN_QUEUE_BITS;
+        while pending != 0 {
+            let qi = pending.trailing_zeros() as usize;
+            pending &= pending - 1;
+            let mut cur = self.queues[queue_index(qi)].first;
+            while cur != 0 {
+                let page = self.page_at(cur);
+                // SAFETY: queue members are live pages of this heap; `next` is read before the
+                // page can be freed.
+                unsafe {
+                    let next = (*page).next;
+                    if page::all_free(page) {
+                        self.free_page(page, qi);
+                    } else if (*page).retire_expire != 0 {
+                        (*page).retire_expire = 0;
+                    }
+                    cur = next;
+                }
+            }
+        }
+        self.retired_min = QUEUE_COUNT;
+        self.retired_max = 0;
     }
 
     /// Unlink an empty page from queue `qi` and return its slices to the map.
@@ -727,6 +809,7 @@ impl<M: Memory, const WORDS: usize> Heap<M, WORDS> {
         }
         q.first = addr;
         q.count += 1;
+        self.occupied |= 1 << queue_index(qi);
         self.update_direct(qi);
     }
 
@@ -748,6 +831,7 @@ impl<M: Memory, const WORDS: usize> Heap<M, WORDS> {
         }
         q.last = addr;
         q.count += 1;
+        self.occupied |= 1 << queue_index(qi);
         if was_empty {
             self.update_direct(qi);
         }
@@ -774,6 +858,9 @@ impl<M: Memory, const WORDS: usize> Heap<M, WORDS> {
             }
             debug_assert!(q.count > 0);
             q.count -= 1;
+            if q.count == 0 {
+                self.occupied &= !(1 << queue_index(qi));
+            }
             (*page).next = 0;
             (*page).prev = 0;
             if was_first {
@@ -818,11 +905,13 @@ impl<M: Memory, const WORDS: usize> Heap<M, WORDS> {
 /// Whether a free that left `page` in its current state has queue work to do: the page sits in
 /// the full queue, or it just became empty and is not retired yet.
 ///
-/// An empty page that is already retired (`retire_expire != 0`) would make `retire` return at
-/// once, and a page whose single live block oscillates between live and free, the shape of the
-/// alloc-then-free microbenchmarks, hits exactly that case on every free. Testing the byte
-/// inline saves the cold call there: 1.4 ns per pair on V8's optimizing tier, 1.0 ns under
-/// Cranelift.
+/// An empty page that already carries a countdown (`retire_expire != 0`) stays retired with it,
+/// as mimalloc's `_mi_page_retire` keeps an already retired page, and a page whose single live
+/// block oscillates between live and free, the shape of the alloc-then-free microbenchmarks,
+/// hits exactly that case on every free. Testing the byte inline saves the cold call there:
+/// 1.4 ns per pair on V8's optimizing tier, 1.0 ns under Cranelift. The countdown such a page
+/// keeps may be stale (nothing on the fast paths maintains it), which is why the release before
+/// memory growth walks every queue instead of trusting it (`Heap::release_empty_pages`).
 ///
 /// # Safety
 ///
@@ -916,6 +1005,9 @@ impl<M: Memory, const WORDS: usize> Heap<M, WORDS> {
 
     fn validate_queue_inner(&self, qi: usize, slices: bool) -> Result<(), &'static str> {
         let q = self.queues[queue_index(qi)];
+        if ((self.occupied >> queue_index(qi)) & 1 == 1) != (q.count > 0) {
+            return Err("occupancy bit disagrees with the queue's count");
+        }
         let mut cur = q.first;
         let mut prev = 0;
         let mut n = 0;
@@ -1197,7 +1289,7 @@ mod tests {
         }
         validate(h);
         // Everything is free; retired pages linger until collected, then their slices return.
-        unsafe { h.collect_retired(true) };
+        unsafe { h.release_empty_pages() };
         validate(h);
         assert_eq!(h.queues[24].count, 0);
         assert_eq!(h.queues[FULL_QUEUE].count, 0);
@@ -1222,7 +1314,7 @@ mod tests {
             );
             h.dealloc(b, l);
             for _ in 0..RETIRE_CYCLES {
-                h.collect_retired(false);
+                h.collect_retired();
             }
             assert_eq!(
                 h.queues[2].count, 0,
@@ -1316,7 +1408,7 @@ mod tests {
             assert_ne!((*h.page_at(page_b)).retire_expire, 0);
             validate(h);
             // Two pages in use precede B; the forced collection still releases it.
-            h.collect_retired(true);
+            h.release_empty_pages();
             assert_eq!(h.queues[qi].count, 2);
             assert_eq!(h.queues[qi].first, page_c);
             assert_eq!(h.queues[qi].last, page_a);
@@ -1326,6 +1418,154 @@ mod tests {
             for p in &a[1..] {
                 h.dealloc(*p, l);
             }
+        }
+        validate(h);
+    }
+
+    /// A page drained through the direct table keeps the countdown its retirement left (the
+    /// fast paths never touch it). When the search finds it full and parks it, the countdown
+    /// goes: a page with every block out is not retired, and left in place the countdown would
+    /// make the free that empties the page after it comes back skip `retire` (review finding
+    /// R-2). Once back in its bin queue, its emptying retires it properly.
+    #[test]
+    fn parking_a_full_page_clears_its_countdown() {
+        let mut f = heap(64, 4, 0);
+        let h = &mut f.heap;
+        let l = layout(16, 8);
+        let per_page = bins::blocks_per_page(PageKind::Small, 16);
+        let qi = bins::bin(16) as usize;
+        unsafe {
+            // Fill the page so that every block has a link, then empty it: retired with every
+            // block on its list, so the refill below never leaves the fast path.
+            let blocks: Vec<_> = (0..per_page).map(|_| h.alloc(l).unwrap()).collect();
+            let page = h.page_at(page::header_of(
+                PageKind::Small,
+                blocks[0].as_ptr() as usize,
+            ));
+            for &b in &blocks {
+                h.dealloc(b, l);
+            }
+            assert_eq!((*page).retire_expire, RETIRE_CYCLES);
+            let again: Vec<_> = (0..per_page).map(|_| h.alloc(l).unwrap()).collect();
+            for p in &again {
+                assert_eq!(
+                    page::header_of(PageKind::Small, p.as_ptr() as usize),
+                    page as usize
+                );
+            }
+            assert!(page::is_full(page));
+            assert_eq!(
+                (*page).retire_expire,
+                RETIRE_CYCLES,
+                "the fast path leaves the countdown alone"
+            );
+            // The next request finds the page full and parks it.
+            let extra = h.alloc(l).unwrap();
+            assert!(page::in_full_queue(page));
+            assert_eq!(
+                (*page).retire_expire,
+                0,
+                "a parked page carries no countdown"
+            );
+            validate(h);
+            // One free brings it back behind the new page; emptying it now goes through
+            // `retire`: two pages in the queue, so it is retired and its bin is in the range.
+            h.dealloc(again[0], l);
+            assert!(!page::in_full_queue(page));
+            for &b in &again[1..] {
+                h.dealloc(b, l);
+            }
+            assert_eq!((*page).used, 0);
+            assert_eq!((*page).retire_expire, RETIRE_CYCLES);
+            assert!(h.retired_min <= qi && qi <= h.retired_max);
+            validate(h);
+            h.dealloc(extra, l);
+        }
+        validate(h);
+    }
+
+    /// The release that precedes a `memory.grow` walks every bin queue, so it frees an empty
+    /// page wherever it sits and whatever its countdown or the retired range say. White-box:
+    /// two pages are emptied through `page::push` directly, bypassing `dealloc`'s transition,
+    /// so the heap never registered them as retired; one of them sits beyond the aging walk's
+    /// three-page window.
+    #[test]
+    fn the_release_before_growth_frees_every_empty_page_whatever_its_position() {
+        let mut f = heap(64, 8, 0);
+        let h = &mut f.heap;
+        let l = layout(1024, 8);
+        let per_page = bins::blocks_per_page(PageKind::Small, 1024);
+        let qi = bins::bin(1024) as usize;
+        unsafe {
+            // Pages A, B and C fill up and are parked; D holds one block. One free each brings
+            // A, B and C back behind D: the queue is [D, A, B, C].
+            let mut pages: Vec<Vec<NonNull<u8>>> = (0..3)
+                .map(|_| (0..per_page).map(|_| h.alloc(l).unwrap()).collect())
+                .collect();
+            let d = h.alloc(l).unwrap();
+            assert_eq!(h.queues[FULL_QUEUE].count, 3);
+            for blocks in pages.iter_mut() {
+                h.dealloc(blocks.pop().unwrap(), l);
+            }
+            assert_eq!(h.queues[qi].count, 4);
+            assert_eq!(h.queues[FULL_QUEUE].count, 0);
+            let header = |p: NonNull<u8>| page::header_of(PageKind::Small, p.as_ptr() as usize);
+            let (b, c) = (header(pages[1][0]), header(pages[2][0]));
+            assert_eq!((*h.page_at(h.queues[qi].first)).next, header(pages[0][0]));
+            assert_eq!(h.queues[qi].last, c);
+            // Empty B (third in the queue) and C (fourth, beyond the window) behind the heap's
+            // back, and give C a countdown; no `retire` ran, so the range is empty.
+            for blocks in &pages[1..] {
+                let page = h.page_at(header(blocks[0]));
+                for &block in blocks {
+                    page::push(page, &h.mem, block.as_ptr() as usize);
+                }
+                assert!(page::all_free(page));
+            }
+            (*h.page_at(c)).retire_expire = 5;
+            assert!(h.retired_min > h.retired_max);
+            validate(h);
+            let free_before = h.free_slices();
+            h.release_empty_pages();
+            assert_eq!(h.free_slices(), free_before + 2);
+            assert!(h.slices.is_free(b / SLICE_SIZE));
+            assert!(h.slices.is_free(c / SLICE_SIZE));
+            assert_eq!(h.queues[qi].count, 2);
+            assert!(h.retired_min > h.retired_max);
+            validate(h);
+            // The pages in use are untouched and free normally.
+            for &block in &pages[0] {
+                h.dealloc(block, l);
+            }
+            h.dealloc(d, l);
+        }
+        validate(h);
+    }
+
+    /// `retire` on a page that already carries a countdown re-arms it and puts its bin back
+    /// into the retired range (mimalloc returns early instead; the function's documentation
+    /// says why the two agree in effect).
+    #[test]
+    fn retire_refreshes_the_countdown_and_the_range_of_a_retired_page() {
+        let mut f = heap(64, 4, 0);
+        let h = &mut f.heap;
+        let l = layout(16, 8);
+        let qi = bins::bin(16) as usize;
+        unsafe {
+            let a = h.alloc(l).unwrap();
+            let page = h.page_at(page::header_of(PageKind::Small, a.as_ptr() as usize));
+            h.dealloc(a, l);
+            assert_eq!((*page).retire_expire, RETIRE_CYCLES);
+            h.collect_retired();
+            h.collect_retired();
+            assert_eq!((*page).retire_expire, RETIRE_CYCLES - 2);
+            assert_eq!((h.retired_min, h.retired_max), (qi, qi));
+            // Lose the range, then retire the page again: countdown and range come back.
+            h.retired_min = QUEUE_COUNT;
+            h.retired_max = 0;
+            h.retire(page);
+            assert_eq!((*page).retire_expire, RETIRE_CYCLES);
+            assert_eq!((h.retired_min, h.retired_max), (qi, qi));
         }
         validate(h);
     }
@@ -1691,7 +1931,7 @@ mod tests {
             }
         }
         validate(h);
-        unsafe { h.collect_retired(true) };
+        unsafe { h.release_empty_pages() };
         validate(h);
     }
 
@@ -2032,6 +2272,7 @@ mod verify {
         let other: usize = kani::any();
         kani::assume(other < QUEUE_COUNT && other != BIN as usize && other != FULL_QUEUE);
         assert!(h.queues[other].first == 0 && h.queues[other].count == 0);
+        assert!((h.occupied >> other) & 1 == 0);
     }
 
     fn check_rest(h: &ProofHeap, live: usize) {
@@ -2041,6 +2282,7 @@ mod verify {
         let other: usize = kani::any();
         kani::assume(other < QUEUE_COUNT && other != BIN as usize && other != FULL_QUEUE);
         assert!(h.queues[other].first == 0 && h.queues[other].count == 0);
+        assert!((h.occupied >> other) & 1 == 0);
         assert!(used_in(h, BIN as usize) + used_in(h, FULL_QUEUE) == live);
     }
 
@@ -2203,7 +2445,7 @@ mod verify {
         proof_heap!(h, false);
         let page = retired_page(&mut h);
         // SAFETY: invariants hold between operations.
-        unsafe { h.collect_retired(false) };
+        unsafe { h.collect_retired() };
         // SAFETY: the page is still live.
         unsafe { assert!((*page).retire_expire == RETIRE_CYCLES - 1 && (*page).used == 0) };
         let q = h.queues[BIN as usize];
@@ -2216,7 +2458,7 @@ mod verify {
         check_shape(&h, page, 0);
     }
 
-    /// A forced collection releases a retired page: the slice is free, the queue and the
+    /// The release before growth frees a retired page: the slice is free, the queue and the
     /// retired range are empty, and the direct table is back to the sentinel.
     #[kani::proof]
     #[kani::unwind(2)]
@@ -2224,7 +2466,7 @@ mod verify {
         proof_heap!(h, false);
         retired_page(&mut h);
         // SAFETY: invariants hold between operations.
-        unsafe { h.collect_retired(true) };
+        unsafe { h.release_empty_pages() };
         let q = h.queues[BIN as usize];
         assert!(q.first == 0 && q.last == 0 && q.count == 0);
         assert!(h.slices.is_free(h.mem.page_addr() / SLICE_SIZE));
@@ -2424,6 +2666,7 @@ mod verify {
         let other: usize = kani::any();
         kani::assume(other < QUEUE_COUNT && other != QBIN as usize && other != FULL_QUEUE);
         assert!(h.queues[other].first == 0 && h.queues[other].count == 0);
+        assert!((h.occupied >> other) & 1 == 0);
         let mut in_bin = 0;
         let mut in_full = 0;
         for &p in place {

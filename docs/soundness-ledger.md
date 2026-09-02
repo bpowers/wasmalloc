@@ -172,7 +172,7 @@ Blocks in `is_full`, `all_free`, `has_free`, `is_expandable`, `in_full_queue`,
 
 ## heap
 
-Heap invariants 1 to 4 refer to the numbered list at the top of `src/heap.rs`; page invariants
+Heap invariants 1 to 5 refer to the numbered list at the top of `src/heap.rs`; page invariants
 1 to 5 to `src/page.rs`. "Kani" names harnesses in `heap::verify` unless another module is
 given. The structural heap harnesses run the real heap over a proof-only memory of one small
 page of bin 36 (`HeapModel`) or of three bare page headers of bin 16 (`QueueModel`); the model
@@ -261,10 +261,12 @@ Blocks: in `dealloc`, the `page::push` on the masked header, `needs_transition` 
   `page::every_block_of_every_bin_lies_inside_its_page_and_is_aligned`). `push`'s precondition
   (PAGE-03) is the dealloc precondition: the block is live on that page. `needs_transition`
   reads `used`, `retire_expire` and `flags` of that header (HEAP-08). Skipping the transition
-  when `used == 0 && retire_expire != 0` skips exactly a call whose first action would have been
-  `retire`'s early return: such a page cannot be in the full queue (a full-queue page has
-  `used == reserved >= 6` before the free, so `used >= 5` after), so the `flags != 0` test is
-  independent of it and the behaviour equals the earlier unconditional call.
+  when `used == 0 && retire_expire != 0` leaves a page that already carries a countdown retired
+  with that countdown, which is what mimalloc's early return in `_mi_page_retire` does; since
+  2026-09-02 this test is the only place that decision is taken (`retire` itself refreshes,
+  HEAP-07), and the release before memory growth does not depend on the countdown (HEAP-07).
+  Such a page cannot be in the full queue (a full-queue page has `used == reserved >= 6` before
+  the free, so `used >= 5` after), so the `flags != 0` test is independent of it.
   `dealloc_transition`: `in_full_queue` is set exactly for full-queue members (only
   `move_to_full` sets it, only `unfull` clears it, both on the corresponding queue move), so
   `unfull`'s precondition holds; after it the page is in its bin queue, so `retire`'s does.
@@ -389,7 +391,10 @@ Blocks in `push_front`, `push_back`, `remove`, `move_to_front`, `move_to_full`, 
 - Proof sketch: each operation writes only the `next` and `prev` fields of `page` and of its
   neighbours, which are members and hence live, and the queue's `first`, `last` and `count`;
   `count` cannot underflow because `remove` requires membership. The list stays consistent by
-  the usual doubly-linked-list argument (checked exhaustively by the harnesses below). Whenever
+  the usual doubly-linked-list argument (checked exhaustively by the harnesses below). The
+  pushes set bit `queue_index(qi)` of `occupied` and `remove` clears it when `count` reaches
+  zero, so heap invariant 5 holds after every operation (safe code; the shift amount is masked
+  below 64). Whenever
   the head of a bin queue may have changed (`push_front` always; `push_back` and `remove` when
   the queue was empty or the page was first; the moves through those), `update_direct` rewrites
   `direct[lo..=hi]` for that bin, with `hi < DIRECT_ENTRIES` by construction (Kani
@@ -401,25 +406,35 @@ Blocks in `push_front`, `push_back`, `remove`, `move_to_front`, `move_to_full`, 
   pages of bin 16, each drawn from the operations whose precondition the state satisfies, with
   pages switching between "has room" and "all blocks out" as a seventh operation; after each,
   the links, flags and counts of both queues, every other queue's emptiness, one symbolic direct
-  entry and one symbolic page's membership are checked. Tests: every heap test ends with the
-  validator over all 64 queues and 129 direct entries;
+  entry and one symbolic page's membership are checked, and (2026-09-02) the occupancy bit of
+  both queues and of a symbolic other queue. Tests: every heap test ends with the validator over
+  all 64 queues and 129 direct entries, which now includes the occupancy bit of every queue;
   `page_exhaustion_adds_pages_and_full_queue_round_trips`,
   `a_forced_collection_reaches_a_retired_page_behind_a_page_in_use`. Miri as above.
-- Reviewer: adversarial-reviewer, 2026-09-02: accepted.
+- Changes: 2026-09-02, the pushes and `remove` maintain `occupied` (heap invariant 5) for
+  `release_empty_pages` (HEAP-07); the unsafe blocks themselves are unchanged, the new lines are
+  safe integer operations after them. Queue harnesses re-run.
+- Reviewer: adversarial-reviewer, 2026-09-02: accepted; the 2026-09-02 addition awaits a fresh
+  look.
 
 ### HEAP-06: `find_page` and `fresh_page`, the page search and supply
 
-Blocks: in `find_page`, the header reads of the current member, `move_to_full`, the candidate
-comparison with `all_free`/`free_page`/`mostly_used`, the `extend` of the candidate, the
-`collect_retired(false)`, and `move_to_front` with the `retire_expire` store; in `fresh_page`,
-`page::init` and the `push_front` and `extend` of the new page.
+Blocks: in `find_page`, the header reads of the current member, the `retire_expire` store and
+`move_to_full` for a full member, the candidate comparison with `all_free`/`free_page`/`mostly_used`,
+the `extend` of the candidate, the `collect_retired()`, and `move_to_front` with the
+`retire_expire` store; in `fresh_page`, `page::init` and the `push_front` and `extend` of the
+new page.
 
 - Preconditions: heap invariants hold; `bin` in `1..=MAX_BIN` (it comes from `classify`).
 - Invariants relied on: heap invariant 1 for the walk; page invariants of every member; the
   `slices` contract for the run of a fresh page; slice `MAX_SLICE_INDEX` is never handed out.
 - Proof sketch. The walk starts at `queues[bin].first` and follows `next`, all members; `next`
   is read before the member is touched. `move_to_full` is applied to the current member, just
-  read to have neither a free nor an unextended block (HEAP-05). `free_page(candidate, qi)` is
+  read to have neither a free nor an unextended block (HEAP-05), after its `retire_expire`, a
+  heap-owned byte of a live header, is cleared: a page with every block out is not retired, and
+  the countdown a direct-table drain leaves behind would otherwise survive the round trip
+  through the full queue and make the free that empties the page skip `retire` (HEAP-07, R-2).
+  `free_page(candidate, qi)` is
   applied to an earlier member, just read to be empty, still a member because nothing has
   removed it since it was chosen; it may be the current member's predecessor, in which case
   `remove` rewrites the current member's `prev`, which the loop does not use. After the walk the
@@ -451,40 +466,75 @@ comparison with `all_free`/`free_page`/`mostly_used`, the `extend` of the candid
   branch the sketch treats as live is unreachable: a candidate that survives the walk has an empty
   free list, so `used == capacity >= 1` and `all_free` is false (R-5).
 
-### HEAP-07: retirement and release (`dealloc_transition`, `retire`, `collect_retired`, `free_page`)
+### HEAP-07: retirement and release (`dealloc_transition`, `retire`, `collect_retired`, `release_empty_pages`, `free_page`)
 
-- Preconditions: `page` is a live page of this heap; for `retire`, a member of its bin queue;
-  for `free_page`, empty and a member of queue `qi`; for `collect_retired`, heap invariants hold.
+- Preconditions: `page` is a live page of this heap; for `retire`, an empty member of its bin
+  queue; for `free_page`, empty and a member of queue `qi`; for `collect_retired` and
+  `release_empty_pages`, heap invariants hold.
 - Invariants relied on: heap invariant 1; a page's slices are exactly `page_size / SLICE_SIZE`
   slices from its address, claimed since `fresh_page` (heap invariant 4).
 - Proof sketch. `dealloc_transition` orders `unfull` before `retire`, so `retire` sees a member
-  of its bin queue (HEAP-02). `retire` returns at once for a page already retired; otherwise it
-  writes `retire_expire` and the retired range, or calls `free_page(page, bin)`. `free_page`
-  removes the page from its queue (HEAP-05, which also fixes the direct table) and returns its
-  slices with `slices.free`, which requires them to be handed out and inside the map, true since
+  of its bin queue (HEAP-02). `retire` writes `retire_expire` and widens the retired range to
+  the page's bin, or calls `free_page(page, bin)`. It no longer returns early for a page that
+  already carries a countdown: mimalloc's `_mi_page_retire` does, because mimalloc's free path
+  calls it on every free that empties a page and re-arming would undo the aging of a page that
+  oscillates around empty; our free path takes that decision in `needs_transition` (HEAP-02),
+  so the early return was unreachable, and refreshing instead keeps the range an
+  over-approximation of the bins with retired pages by construction. `free_page` removes the
+  page from its queue (HEAP-05, which also fixes the direct table) and returns its slices with
+  `slices.free`, which requires them to be handed out and inside the map, true since
   `fresh_page`; afterwards nothing in the heap refers to the page: it is in no queue, no direct
-  entry (updated by `remove`), and not the full queue's (an empty page is never there, HEAP-02),
-  and the caller holds no other pointer to it (`retire` and `dealloc_transition` return;
-  `collect_retired` read `next` first; `find_page` moves on). `collect_retired` walks at most
-  `RETIRE_MAX_PAGES` members of each bin queue in the retired range, all live, reads `next`
-  before any change, decrements `retire_expire` only when non-zero, and frees only empty pages;
-  the range is clipped to `MAX_BIN`. The retired range is a search hint, not a safety property:
-  a retired page outside it stays a valid member of its queue and is collected once its bin is
-  retired again or used by a search.
+  entry (updated by `remove`), and not the full queue's (an empty page is never there,
+  HEAP-02), and the caller holds no other pointer to it (`retire` and `dealloc_transition`
+  return; both walks read `next` first; `find_page` moves on). `collect_retired`, the aging
+  walk, visits at most `RETIRE_MAX_PAGES` members of each bin queue in the retired range, all
+  live, reads `next` before any change, decrements `retire_expire` only when non-zero, and
+  frees only empty pages; the range is clipped to `MAX_BIN`. `release_empty_pages`, which
+  `acquire_run` runs before memory is grown, walks every member of every bin queue that holds a
+  page (the set bits of `occupied & BIN_QUEUE_BITS`, heap invariant 5, so the walk costs the
+  pages that exist; `queue_index` keeps the queue index in bounds), reads `next` first, frees
+  every empty page and clears the countdown of every other member, then empties the range,
+  which is exact because no page carries a countdown afterwards. The retired range and the three-page window
+  are therefore hints for the aging walk only; the promise that every retired page is released
+  before memory grows rests on the full walk and needs no argument about where a retired page
+  can sit. Where a stale countdown comes from: the fast paths never touch `retire_expire`, so
+  a retired page drained through the direct table keeps its countdown; `find_page` clears it on
+  the candidate it returns and, since 2026-09-02, on a page it parks in the full queue, so a
+  page that comes back from the full queue and empties goes through `retire` (R-2); a page
+  emptied by fast-path frees while it still carries a countdown stays retired with it and is
+  reached by the full walk.
 - Machine checks: Kani `freeing_the_last_block_retires_the_page`,
   `an_unforced_collection_ages_a_retired_page`, `a_forced_collection_frees_a_retired_page`
-  (release: slice free, queue and range empty, direct entries back to the sentinel),
-  `freeing_any_live_block_preserves_invariants`. Tests `retired_page_is_kept_then_released`
-  (release when the count runs out), `retired_pages_are_released_before_memory_grows`,
+  (`release_empty_pages` over the 60 bin queues: slice free, queue and range empty, direct
+  entries back to the sentinel), `freeing_any_live_block_preserves_invariants`,
+  `first_allocation_builds_a_valid_heap` and `the_search_parks_a_full_page_in_the_full_queue`
+  (both reach `release_empty_pages` through `acquire_run` with every queue empty or holding one
+  page). Tests `retired_page_is_kept_then_released` (release when the count runs out),
+  `retired_pages_are_released_before_memory_grows`,
   `a_forced_collection_reaches_a_retired_page_behind_a_page_in_use`,
-  `page_exhaustion_adds_pages_and_full_queue_round_trips`, the churn test (a forced collection at
-  the end), the model tester and the fuzz targets. Miri as above.
+  `parking_a_full_page_clears_its_countdown` (the countdown survives a direct-table drain and
+  goes when the page is parked; the page is retired properly after it comes back),
+  `the_release_before_growth_frees_every_empty_page_whatever_its_position` (an empty page
+  beyond the window with a countdown and an empty range, and one with no countdown at all, both
+  freed), `retire_refreshes_the_countdown_and_the_range_of_a_retired_page`,
+  `page_exhaustion_adds_pages_and_full_queue_round_trips`, the churn test (a full release at
+  the end), `tests/review_edge_cases.rs` (`an_emptied_page_behind_three_others_is_released_before_memory_grows`,
+  the R-2 reproducer, no longer ignored, and `a_page_reused_through_the_direct_table_is_still_released`),
+  the model tester and the fuzz targets. Miri as above.
 - Not machine-checked by Kani: `retire`'s immediate release (a queue of more than one page, or
-  more than three), which needs a second page; tests only.
-- Reviewer: adversarial-reviewer, 2026-09-02: accepted. Caveat: the retired range and the
-  three-page window are not merely a hint for the documented promise that every retired page is
-  released before memory grows: R-2 shows an emptied page with `retire_expire != 0` behind three
-  pages in use that survives the forced collection (footprint, not memory safety).
+  more than three), which needs a second page, and the full walk over a queue of several pages;
+  tests only.
+- Changes: 2026-09-02, review finding R-2: `collect_retired(force)` split into the aging walk
+  `collect_retired()` and `release_empty_pages()`, which walks every bin queue; `retire`
+  refreshes instead of returning early; `find_page` clears the countdown of a page it parks
+  (HEAP-06). The roofline's alloc_free_32 and batch_lifo_32 are unchanged within noise (numbers
+  in the commit message). The Kani harnesses named above were re-run. A first version walked
+  all 60 queue heads in a plain loop; CBMC unrolled the inner queue walk once per queue and the
+  three harnesses that reach the walk ran past the 4 GiB cap, which is why the walk iterates the
+  occupancy bits (one iteration per queue with pages) and the harnesses keep their unwind bound
+  of 2.
+- Reviewer: adversarial-reviewer, 2026-09-02: accepted with a caveat (R-2), addressed by the
+  change above; fresh review of the changed blocks pending.
 
 ### HEAP-08: header reads in `needs_transition` and `mostly_used`
 
@@ -500,7 +550,8 @@ comparison with `all_free`/`free_page`/`mostly_used`, the `extend` of the candid
 - Compiled only under `cfg(test)` and `cfg(kani)`; never part of the allocator.
 - Proof sketch: the walk follows queue links, relying on the invariant it checks, and stops
   after `count + 1` members so a cycle is reported rather than looped on; `page::validate`
-  (PAGE-06) guards every free-list read. The proof-only backends `HeapModel` and `QueueModel`
+  (PAGE-06) guards every free-list read; the occupancy bit is compared with the count before
+  the walk (heap invariant 5, 2026-09-02). The proof-only backends `HeapModel` and `QueueModel`
   assert that every address the heap touches is a header or a modelled block word, so a stray
   access fails the proof instead of reading outside the model.
 - Reviewer: adversarial-reviewer, 2026-09-02: accepted.

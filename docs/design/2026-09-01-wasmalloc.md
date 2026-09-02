@@ -367,3 +367,22 @@ Next: the per-bin page cost (random_actions at 2.1x dlmalloc), the `page::extend
 (with a PAGE-04 review), a zero-initialised heap static (roadmap 8), heap Kani harnesses and
 ledger entries (roadmap 9), and `alloc_zeroed` for runs extended through `memory.grow`, whose
 fresh slices are known zero but are not yet reported as such to a zeroing realloc.
+
+### 2026-09-02, review fixes (the adversarial ledger review, `docs/soundness-ledger.md`)
+
+1. **Every empty page is released before memory grows, whatever its countdown** (review
+   finding R-2). A page retired, drained through the direct table (the fast paths never touch
+   `retire_expire`), parked in the full queue, brought back by a free and emptied behind three
+   pages in use kept a stale countdown and was never reached by the collection, so memory grew
+   with an empty slice in a queue. Now the search clears the countdown of a page it parks, so
+   the page's last free goes through `retire`; `retire` refreshes the countdown and the retired
+   range instead of returning early; and the release that precedes a `memory.grow`
+   (`Heap::release_empty_pages`) walks every bin queue that holds a page, found through an
+   occupancy bitmask the queue operations maintain, rather than the retired range's three-page
+   window. A first version scanned all 60 queue heads in a plain loop, which was fine at run
+   time but made CBMC unroll the queue walk once per queue and pushed three heap proofs past
+   their 4 GiB cap; the bitmask keeps the proofs at an unwind bound of 2. Hot paths untouched;
+   measured anyway, three interleaved runs each of the `wasmalloc` variant (median ns per
+   pair): alloc_free_32 2.50 to 2.52 -> 2.49 to 2.51 on node 22 `--no-liftoff`, 1.122 to 1.124
+   -> 1.122 to 1.123 on d8 (V8 15.2) `--no-liftoff`; batch_lifo_32 2.98 to 3.00 -> 2.96 to 2.98
+   on node (one run read 2.54), 1.87 to 1.88 -> 1.83 to 1.88 on d8. Kept.
