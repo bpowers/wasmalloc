@@ -66,8 +66,10 @@ pub struct SliceMap<const WORDS: usize = 1024> {
     zero: [u64; WORDS],
     /// Absolute index of the slice that bit 0 stands for; a multiple of 64.
     base: usize,
-    /// Every word below this index has no free bit, so searches start here. `WORDS` when nothing
-    /// is free.
+    /// Every word below this index has no free bit, so searches start here. Any value from 0
+    /// (claims nothing, always valid) to `WORDS` (nothing is free) satisfies the invariant;
+    /// [`new`](Self::new) leaves it at 0 so that the map's zero value is its initial state, and
+    /// [`init`](Self::init) tightens it to `WORDS`.
     hint: usize,
 }
 
@@ -82,6 +84,11 @@ impl<const WORDS: usize> SliceMap<WORDS> {
     pub const CAPACITY: usize = WORDS * BITS;
 
     /// An empty map: nothing free, base 0. Call [`init`](Self::init) before anything else.
+    ///
+    /// Every field is zero, so a map embedded in a static needs no initialiser data: the 16 KiB
+    /// of bitmaps of the global allocator's map would otherwise be emitted as a data segment
+    /// that the module carries and copies at instantiation (`docs/research/roofline.md` 12.6).
+    /// `hint == 0` is a valid, merely loose, hint (see the field); `init` sets the tight one.
     pub const fn new() -> Self {
         const {
             assert!(
@@ -93,7 +100,7 @@ impl<const WORDS: usize> SliceMap<WORDS> {
             free: [0; WORDS],
             zero: [0; WORDS],
             base: 0,
-            hint: WORDS,
+            hint: 0,
         }
     }
 
@@ -682,7 +689,15 @@ mod tests {
     #[test]
     fn empty_map_serves_nothing() {
         let mut m = SliceMap::<W>::new();
+        // The zero value is the initial state (a static map then needs no data segment), and
+        // it already serves nothing: the loose hint makes the search scan every word once.
+        assert_eq!((m.base, m.hint), (0, 0));
+        assert!(m.free.iter().chain(m.zero.iter()).all(|&w| w == 0));
+        assert_eq!(m.alloc(1, 1), None);
+        assert_eq!(m.hint, W, "the search moved the hint past the empty words");
+        check_invariants(&m);
         m.init(0);
+        assert_eq!(m.hint, W);
         assert_eq!(m.alloc(1, 1), None);
         assert_eq!(m.alloc(8, 8), None);
         assert_eq!(m.alloc(64, 64), None);
