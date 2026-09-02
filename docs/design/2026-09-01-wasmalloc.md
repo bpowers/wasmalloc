@@ -206,13 +206,18 @@ wasm32 share one geometry; large (4 MiB) pages are enabled; the block counters i
 header are `u32`, not `u16`, because a 16-bit store followed by a 16-bit load of `used` is a
 slow store-to-load forward on current x86 cores (`docs/research/roofline.md` section 12.1).
 
-First measurements (node 22, V8 optimizing tier, median ns per operation) against the roofline
-harness's size-class floor and the incumbents: alloc+free of 32 bytes 3.73 (floor 1.78, talc
-11.8, dlmalloc 8.0); random churn with 10k live objects 7.1 (floor 3.5, talc 31.9, dlmalloc
-61.4). Where we lose: a 16 B to 1 MiB realloc chain costs 12.3 us against 0.08 us for talc,
-because size-class pages cannot grow in place while boundary-tag allocators extend the top chunk;
-and 256 KiB to 4 MiB alloc+touch+free is 25 percent slower than dlmalloc. The full matrix
-(engines, tiers, footprint) is being measured; see `docs/research/roofline.md` when it lands.
+Measurements (median ns per operation; full matrix in `docs/research/roofline.md`, tuning
+deltas in the tuning-a commits). After the first tuning pass (u32 counters, inline retire test,
+aligned frees on the fast path, `inline(always)`), the 32-byte alloc+free pair costs 1.13 ns on
+V8 15.2 (floor 0.55, dlmalloc 4.11, talc 8.92), 1.10 on wasmtime (floor 0.71), 2.50 on node 22
+(floor 1.80, dlmalloc 7.99, talc 12.35); the aligned-16 pair costs the same as the unaligned one;
+random churn over 10k live objects is 6.4 on V8 15.2 (floor 3.2, talc 26, dlmalloc 56);
+talc-style random actions 14.6 (talc 20.1, dlmalloc 40.6). Where we still lose: a 16 B to 1 MiB
+realloc chain costs 12 us against under 0.1 us for the boundary-tag allocators, because
+size-class pages cannot grow in place; and footprint in pages is 2 to 8x dlmalloc's (one page
+per touched bin, 512 KiB medium and 4 MiB large pages, a half-heap growth step). Note that our
+pages are extended 8 KiB at a time, so `memory.size` overstates our resident memory relative to
+dlmalloc, which touches everything it hands out.
 
 ## Roadmap and research directions
 
@@ -242,6 +247,12 @@ to try, each behind a benchmark and a proof, roughly in order of expected payoff
    from `alloc_zeroed` pages that were never written could be. Probably not worth it; note it.
 7. **Per-chunk kind binning in the slice map** (mimalloc's `mi_bbitmap_t`) if singleton churn
    is shown to fragment the aligned runs medium and large pages need.
-8. **Verification depth.** Kani harnesses for the heap's queue and direct-table invariants over
+8. **Zero-initialised heap static.** The static heap is a 17.7 KB data segment because the
+   direct table holds sentinel pointers and a few fields are non-zero. A fully zero initial
+   state (null direct entries with a null test in `alloc`) measured free on the optimizing tiers
+   and +0.3 ns in Liftoff and cuts the raw module from 46 KB to 29 KB; wasm-opt already
+   removes the zeros. Alternative without the extra test: keep the 16 KiB slice map in its own
+   zero static. Decide once the fast path has settled.
+9. **Verification depth.** Kani harnesses for the heap's queue and direct-table invariants over
    a tiny simulated memory, ledger entries for every unsafe block in `heap.rs` and `global.rs`,
    and an adversarial review of all entries.

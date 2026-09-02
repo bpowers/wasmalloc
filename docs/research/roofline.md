@@ -590,6 +590,17 @@ cache misses over 10,000 objects) and so is Liftoff. Folding `free_is_zero` into
 the flags byte, roadmap item 2 in the design document, buys no speed; it can stay a
 cleanliness item.
 
+**Correction after tuning (2026-09-02).** The mimic floors above were not faithful in one
+respect: LLVM deleted `mimic`'s empty `transition()` and with it the `used == 0` test, so
+`mimic_u32` never paid the out-of-line call that `Heap::dealloc` made on every free in
+`alloc_free_32` (the page's single live block empties on each iteration, `dealloc_transition`
+is called, and `retire` returns at once because the page is already retired). Measured on the
+real allocator: widening `used` alone took d8 from 2.92 to 2.4 ns; testing `retire_expire`
+inline and skipping the call took it to 1.13 ns, and an ablation without the call reached
+0.85 ns. So the u16 counter was about half of the gap and the cold call the other half. Both
+fixes are on main (commits da65f8e and e38d647); the remaining gap on node 22 (2.50 against the
+1.80 floor) is the std `__rust_no_alloc_shim_is_unstable_v2` call that V8 12.4 does not inline.
+
 ### 12.2 Alignment 16 takes the slow path on free
 
 `Heap::dealloc` takes its inlined small-page path only when `layout.align() <= WORD`
