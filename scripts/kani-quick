@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# The Kani subset that runs in the merge gate: harnesses that finish in a few seconds each
+# (about 25 s total). Everything else stays in the full set (`scripts/kani`, about 4 minutes),
+# which runs on demand and before a release.
+#
+# Add a harness here when it verifies in under 5 s at KANI_MEM=4G; move it out when it grows.
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+quick=(
+  bin_covers_and_bounds_waste
+  bin_is_monotone
+  bins_are_tight
+  classify_aligns_by_construction
+  header_of_recovers_the_page_from_any_address_inside_it
+  every_block_of_every_bin_lies_inside_its_page_and_is_aligned
+  slices_alloc_small_page
+  slices_alloc_medium_page
+  slices_alloc_large_page
+)
+args=()
+for h in "${quick[@]}"; do args+=(--harness "$h"); done
+exec "$here/kani" "${args[@]}" "$@"

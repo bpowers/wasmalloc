@@ -29,9 +29,11 @@ Research reports: `docs/research/`. mimalloc v3.5.1 reference source: `~/src/mim
 All from the repo root (or a worktree root). `wasmtime` lives in `~/.wasmtime/bin`; put it on
 PATH first: `export PATH="$HOME/.wasmtime/bin:$PATH"`.
 
-- Gate (must pass before asking for a merge):
-  `cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test && cargo test --target wasm32-wasip1 && cargo build --release --target wasm32-unknown-unknown && scripts/kani`
-- One Kani harness: `scripts/kani --harness <name>` (never bare `cargo kani`).
+- Gate (must pass before asking for a merge; about a minute):
+  `cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test && cargo test --target wasm32-wasip1 && cargo build --release --target wasm32-unknown-unknown && scripts/kani-quick`
+- Full Kani set (about 4 minutes, on demand and before a release): `scripts/kani`.
+  One harness: `scripts/kani --harness <name>` (never bare `cargo kani`). Harnesses that verify
+  in under 5 s belong in the quick list inside `scripts/kani-quick`.
 - Worktree for a task: `git worktree add .worktrees/<task> -b <task> main`, work and commit
   there, then tell the lead the branch name. The lead merges into `main` and removes the worktree.
 - Roofline/benchmarks: see `bench/roofline/README.md`.
