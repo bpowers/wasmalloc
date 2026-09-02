@@ -20,7 +20,9 @@ Research reports: `docs/research/`. mimalloc v3.5.1 reference source: `~/src/mim
   Run Kani ONLY through `scripts/kani` (never bare `cargo kani`): it caps memory with a cgroup
   (default 6 GiB, `KANI_MEM`) and time (default 30 min, `KANI_TIMEOUT`). An uncapped CBMC run
   once took the whole machine down. Wrap any other memory-hungry tool (fuzzers, wasm-opt on
-  huge inputs) in `scripts/memlimit -m SIZE -t TIME -- cmd`.
+  huge inputs) in `scripts/memlimit -m SIZE -t TIME -- cmd`. The wrapper prints the run's true
+  peak memory from the systemd journal when it exits; `/usr/bin/time` around it measures only
+  the systemd client, so report the wrapper's line.
 
 ## Commands
 

@@ -42,10 +42,27 @@ if command -v systemd-run >/dev/null 2>&1 \
    && systemd-run --user --scope -q -p MemoryMax=64M -- true >/dev/null 2>&1; then
   # A transient scope puts the command and every child in one cgroup; MemoryMax is a hard
   # cap enforced by the kernel OOM killer inside that cgroup, and MemorySwapMax=0 stops it
-  # from spilling into swap first.
-  exec systemd-run --user --scope -q \
+  # from spilling into swap first. The scope gets a known name so its accounting line
+  # ("Consumed ... memory peak") can be read back from the journal: /usr/bin/time around this
+  # script would only measure the systemd client, not the command.
+  unit="memlimit-$$-$(date +%s%N)"
+  set +e
+  systemd-run --user --scope -q --unit="$unit" \
     -p MemoryMax="$MEM" -p MemorySwapMax=0 \
     -- timeout --signal=TERM --kill-after=30s "$TIMEOUT" "$@"
+  status=$?
+  set -e
+  if [ -z "${MEMLIMIT_QUIET:-}" ]; then
+    # Give journald a moment to record the scope's exit accounting.
+    for _ in 1 2 3 4 5; do
+      line=$(journalctl --user -q --no-pager -o cat -u "$unit.scope" 2>/dev/null \
+             | grep -E 'memory peak|oom-kill' | tail -2 | tr '\n' ' ')
+      [ -n "$line" ] && break
+      sleep 0.2
+    done
+    echo "memlimit: cap=$MEM exit=$status ${line:-(no accounting line in journal)}" >&2
+  fi
+  exit "$status"
 else
   echo "memlimit: systemd-run unavailable; falling back to prlimit --as (weaker)" >&2
   exec prlimit --as="$(to_bytes "$MEM")" -- timeout --signal=TERM --kill-after=30s "$TIMEOUT" "$@"
