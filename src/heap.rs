@@ -308,12 +308,7 @@ impl<M: Memory, const WORDS: usize> Heap<M, WORDS> {
             // Same block if it fits. Shrinking in place is only allowed within the same page
             // kind (the next dealloc recomputes the kind from the new Layout) and, as in
             // mimalloc, only while the block stays at least half used.
-            (Class::Bin(old), Class::Bin(new))
-                if new == old
-                    || (new < old
-                        && bins::kind_of_bin(new) == bins::kind_of_bin(old)
-                        && new_size >= bins::bin_size(old) / 2) =>
-            {
+            (Class::Bin(old), Class::Bin(new)) if fits_in_place(old, new, new_size) => {
                 return Some(ptr);
             }
             (Class::Huge, Class::Huge) => {
@@ -834,6 +829,20 @@ impl<M: Memory, const WORDS: usize> Heap<M, WORDS> {
 unsafe fn needs_transition(page: *const Page) -> bool {
     // SAFETY: the header is valid for reads by the precondition.
     unsafe { ((*page).used == 0 && (*page).retire_expire == 0) || (*page).flags != 0 }
+}
+
+/// Whether a block of bin `old` keeps serving a request of `new_size` bytes that classifies as
+/// bin `new` (the in-place decision of [`Heap::realloc`], kept pure so a proof can quantify over
+/// every pair of Layouts). Growing never fits: bins are tight, so `new > old` means the request
+/// exceeds the block. Shrinking stays in place only within the page kind, because the next
+/// `dealloc` recomputes the kind from the new Layout and masks the address with it, and, as in
+/// mimalloc, only while the block stays at least half used.
+#[inline]
+fn fits_in_place(old: u8, new: u8, new_size: usize) -> bool {
+    new == old
+        || (new < old
+            && bins::kind_of_bin(new) == bins::kind_of_bin(old)
+            && new_size >= bins::bin_size(old) / 2)
 }
 
 /// Number of slices a header-less run for `layout` occupies.
