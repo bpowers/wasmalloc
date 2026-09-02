@@ -891,6 +891,118 @@ const _: () = {
     assert!(bins::bin(DIRECT_MAX_SIZE) == b - 1);
 };
 
+/// The heap invariants listed in the module documentation, as checks that return an error
+/// naming the first violation. Test and proof infrastructure: never part of the allocator.
+#[cfg(any(test, kani))]
+impl<M: Memory, const WORDS: usize> Heap<M, WORDS> {
+    /// Invariants 1, 2 and 4 for queue `qi`: every member is a valid page of the right bin (or
+    /// a flagged, roomless page in the full queue), the links and the count agree, and the
+    /// page's slices are not free in the map.
+    ///
+    /// The walk follows `next` links, so it relies on the invariant it checks (queue members are
+    /// live pages); it stops after `count + 1` members, so a cycle is reported, not looped on.
+    pub(crate) fn validate_queue(&self, qi: usize) -> Result<(), &'static str> {
+        self.validate_queue_inner(qi, true)
+    }
+
+    /// [`validate_queue`](Self::validate_queue) without the slice-map check, for proofs whose
+    /// pages are host objects outside any slice map.
+    #[cfg(kani)]
+    pub(crate) fn validate_queue_links(&self, qi: usize) -> Result<(), &'static str> {
+        self.validate_queue_inner(qi, false)
+    }
+
+    fn validate_queue_inner(&self, qi: usize, slices: bool) -> Result<(), &'static str> {
+        let q = self.queues[queue_index(qi)];
+        let mut cur = q.first;
+        let mut prev = 0;
+        let mut n = 0;
+        while cur != 0 {
+            if n > q.count {
+                return Err("queue longer than its count (cycle or lost page)");
+            }
+            let page = self.page_at(cur);
+            // SAFETY: queue members are live pages of this heap (invariant 1, under test).
+            unsafe {
+                if (*page).prev != prev {
+                    return Err("prev link does not point at the previous member");
+                }
+                let kind = page::kind(page);
+                if cur % kind.page_size() != 0 {
+                    return Err("page address is not aligned to its kind");
+                }
+                page::validate(page, &self.mem)?;
+                if qi == FULL_QUEUE {
+                    if !page::in_full_queue(page) {
+                        return Err("full-queue member is not flagged full");
+                    }
+                    if page::has_free(page) || page::is_expandable(page) {
+                        return Err("full-queue member still has room");
+                    }
+                } else {
+                    if (*page).bin as usize != qi {
+                        return Err("page sits in the queue of another bin");
+                    }
+                    if page::in_full_queue(page) {
+                        return Err("bin-queue member is flagged full");
+                    }
+                }
+                if slices {
+                    let first_slice = cur / SLICE_SIZE;
+                    let mut s = 0;
+                    while s < kind.page_size() / SLICE_SIZE {
+                        if self.slices.is_free(first_slice + s) {
+                            return Err("a slice of a live page is free in the map");
+                        }
+                        s += 1;
+                    }
+                }
+                prev = cur;
+                cur = (*page).next;
+            }
+            n += 1;
+        }
+        if q.last != prev {
+            return Err("last does not point at the final member");
+        }
+        if q.count != n {
+            return Err("count does not match the members");
+        }
+        Ok(())
+    }
+
+    /// Invariant 3 for direct entry `i`: it is the first page of the queue of `bin(i * WORD)`,
+    /// or the sentinel when that queue is empty.
+    pub(crate) fn validate_direct_entry(&self, i: usize) -> Result<(), &'static str> {
+        let b = bins::bin(i * WORD) as usize;
+        let first = self.queues[queue_index(b)].first;
+        let expect = if first == 0 {
+            sentinel()
+        } else {
+            self.page_at(first)
+        };
+        if self.direct[i] != expect {
+            return Err("direct entry does not point at its queue's first page");
+        }
+        Ok(())
+    }
+
+    /// Every invariant, every queue and every direct entry.
+    pub(crate) fn validate(&self) -> Result<(), &'static str> {
+        let mut qi = 0;
+        while qi < QUEUE_COUNT {
+            self.validate_queue(qi)?;
+            qi += 1;
+        }
+        let mut i = 0;
+        while i < DIRECT_ENTRIES {
+            self.validate_direct_entry(i)?;
+            i += 1;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::undocumented_unsafe_blocks)]
 mod tests {
@@ -900,6 +1012,7 @@ mod tests {
         LARGE_MAX_OBJ_SIZE, LARGE_PAGE_SIZE, MAX_BINNED_BIN, MAX_BINNED_OBJ_SIZE,
         MEDIUM_MAX_OBJ_SIZE, bin_size,
     };
+    use core::mem::size_of;
     use std::alloc::{alloc, dealloc};
     use std::vec::Vec;
 
@@ -943,52 +1056,18 @@ mod tests {
         }
     }
 
-    /// Check every heap invariant listed in the module documentation.
+    /// Check every heap invariant listed in the module documentation, naming the queue or
+    /// entry that fails.
     fn validate(h: &TestHeap) {
         for qi in 0..QUEUE_COUNT {
-            let q = h.queues[qi];
-            let mut cur = q.first;
-            let mut prev = 0;
-            let mut n = 0;
-            while cur != 0 {
-                let page = h.page_at(cur);
-                // SAFETY: queue members are live pages.
-                unsafe {
-                    assert_eq!((*page).prev, prev, "prev link broken in queue {qi}");
-                    let kind = page::kind(page);
-                    assert_eq!(cur % kind.page_size(), 0, "page {cur:#x} misaligned");
-                    page::validate(page, &h.mem).unwrap_or_else(|e| panic!("queue {qi}: {e}"));
-                    if qi == FULL_QUEUE {
-                        assert!(page::in_full_queue(page));
-                        assert!(!page::has_free(page) && !page::is_expandable(page));
-                    } else {
-                        assert_eq!((*page).bin as usize, qi);
-                        assert!(!page::in_full_queue(page));
-                    }
-                    for s in 0..kind.page_size() / SLICE_SIZE {
-                        assert!(
-                            !h.slices.is_free(cur / SLICE_SIZE + s),
-                            "page slice marked free"
-                        );
-                    }
-                    prev = cur;
-                    cur = (*page).next;
-                }
-                n += 1;
-            }
-            assert_eq!(q.last, prev, "last link broken in queue {qi}");
-            assert_eq!(q.count, n, "count wrong in queue {qi}");
+            h.validate_queue(qi)
+                .unwrap_or_else(|e| panic!("queue {qi}: {e}"));
         }
         for i in 0..DIRECT_ENTRIES {
-            let b = bins::bin(i * WORD) as usize;
-            let first = h.queues[b].first;
-            let expect = if first == 0 {
-                sentinel()
-            } else {
-                h.page_at(first)
-            };
-            assert_eq!(h.direct[i], expect, "direct entry {i} (bin {b})");
+            h.validate_direct_entry(i)
+                .unwrap_or_else(|e| panic!("direct entry {i}: {e}"));
         }
+        h.validate().unwrap();
     }
 
     fn layout(size: usize, align: usize) -> Layout {
@@ -999,9 +1078,21 @@ mod tests {
         unsafe { p.as_ptr().write_bytes(byte, size) };
     }
 
+    /// Every byte of the block is `byte`. Whole words where the block allows it: under Miri
+    /// each read is an interpreted operation, and the tests check megabytes.
     unsafe fn check(p: NonNull<u8>, size: usize, byte: u8) {
-        for i in 0..size {
+        let word = usize::from_ne_bytes([byte; size_of::<usize>()]);
+        let mut i = 0;
+        while i + size_of::<usize>() <= size {
+            // SAFETY: inside the block, which the caller owns; blocks are word aligned.
+            let w = unsafe { p.as_ptr().add(i).cast::<usize>().read_unaligned() };
+            assert_eq!(w, word, "word at {i} corrupted");
+            i += size_of::<usize>();
+        }
+        while i < size {
+            // SAFETY: inside the block.
             assert_eq!(unsafe { *p.as_ptr().add(i) }, byte, "byte {i} corrupted");
+            i += 1;
         }
     }
 
@@ -1537,7 +1628,9 @@ mod tests {
             state
         };
         let mut live: Vec<(NonNull<u8>, Layout, u8)> = Vec::new();
-        for step in 0..20_000 {
+        // Miri interprets every access, so it gets a shorter run over the same distribution.
+        let steps = if cfg!(miri) { 1_500 } else { 20_000 };
+        for step in 0..steps {
             let r = next();
             let op = r % 100;
             if op < 45 || live.is_empty() {
