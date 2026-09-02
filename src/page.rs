@@ -75,6 +75,13 @@ const KIND_LARGE: u8 = 2;
 /// `reserved`, `block_start`, `block_size`, `bin` and `kind` are constant after [`init`].
 ///
 /// The hot fields come first so that [`pop`] and [`push`] touch only the first 32 bytes.
+///
+/// The block counters are 32 bits wide although no page holds more than 8188 blocks: `used` is
+/// stored by every free and loaded by the next allocation, and a 16-bit store followed by a
+/// 16-bit load of the same word is a slow store-to-load forward on current x86 cores (about
+/// 2 ns per alloc+free pair on Zen 5, see `docs/research/roofline.md` section 12.1), while
+/// 32-bit accesses forward at no cost. `capacity` and `reserved` follow so that the three
+/// counts compare and subtract without conversions; the header still fits in 36 bytes.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct Page {
@@ -82,15 +89,15 @@ pub struct Page {
     /// address of the next one in its first `usize`.
     pub free: usize,
     /// Blocks handed out and not yet freed.
-    pub used: u16,
+    pub used: u32,
     /// Blocks whose free-list links have been initialised (mimalloc's `capacity`).
-    pub capacity: u16,
+    pub capacity: u32,
     /// Blocks the page holds in total: `bins::blocks_per_page`.
-    pub reserved: u16,
-    /// Offset of block 0 from the page start: `bins::block_start`.
-    pub block_start: u16,
+    pub reserved: u32,
     /// Block size in bytes: `bins::bin_size(bin)`.
     pub block_size: u32,
+    /// Offset of block 0 from the page start: `bins::block_start`.
+    pub block_start: u16,
     /// Every free-list block is zero except its first word and every block at or above
     /// `capacity` is entirely zero. Set from the slice bitmap at `init`, cleared by `push`.
     pub free_is_zero: bool,
@@ -112,14 +119,19 @@ const _: () = {
     assert!(size_of::<Page>() <= PAGE_HEADER_RESERVE);
     // Pages are 64 KiB aligned, so any alignment up to a word is satisfied trivially.
     assert!(align_of::<Page>() <= WORD);
-    // The two fast paths must stay within the first 32 bytes on every target.
+    // The two fast paths must stay within the first 32 bytes on every target. On wasm32 the
+    // offsets are: free 0, used 4, capacity 8, reserved 12, block_size 16, block_start 20,
+    // free_is_zero 22, bin 23, kind 24, flags 25, retire_expire 26, next 28, prev 32.
     assert!(offset_of!(Page, free) + size_of::<usize>() <= 32);
-    assert!(offset_of!(Page, used) + 2 <= 32);
-    assert!(offset_of!(Page, capacity) + 2 <= 32);
-    assert!(offset_of!(Page, reserved) + 2 <= 32);
-    assert!(offset_of!(Page, block_start) + 2 <= 32);
+    assert!(offset_of!(Page, used) + 4 <= 32);
+    assert!(offset_of!(Page, capacity) + 4 <= 32);
+    assert!(offset_of!(Page, reserved) + 4 <= 32);
     assert!(offset_of!(Page, block_size) + 4 <= 32);
+    assert!(offset_of!(Page, block_start) + 2 <= 32);
     assert!(offset_of!(Page, free_is_zero) < 32);
+    assert!(offset_of!(Page, flags) < 32);
+    // A misaligned counter would defeat the point of widening it.
+    assert!(offset_of!(Page, used) % 4 == 0);
 };
 
 /// The page header address for a block address: the mask trick. Pure; only the kind of the
@@ -178,15 +190,16 @@ pub unsafe fn init<M: Memory>(
     let block_size = bins::bin_size(bin);
     let block_start = bins::block_start(block_size);
     let reserved = bins::blocks_per_page(kind, block_size);
-    debug_assert!(reserved <= u16::MAX as usize);
+    debug_assert!(reserved <= u32::MAX as usize);
+    debug_assert!(block_start <= u16::MAX as usize);
     let page = mem.ptr(page_addr).cast::<Page>();
     let header = Page {
         free: 0,
         used: 0,
         capacity: 0,
-        reserved: reserved as u16,
-        block_start: block_start as u16,
+        reserved: reserved as u32,
         block_size: block_size as u32,
+        block_start: block_start as u16,
         free_is_zero: zeroed,
         bin,
         kind: kind_to_u8(kind),
@@ -220,7 +233,7 @@ pub unsafe fn pop<M: Memory>(page: *mut Page, mem: &M) -> Option<usize> {
     // the page (invariant 2), so `mem.ptr(block)` is valid for a `usize` read (invariant 1),
     // and it is `WORD`-aligned because `block_start` and every block size are multiples of
     // `WORD`. `used < capacity` when the list is non-empty (invariant 4), so the increment
-    // cannot overflow `u16`.
+    // cannot overflow `u32`.
     unsafe {
         let block = (*page).free;
         if block == 0 {
@@ -280,7 +293,7 @@ pub unsafe fn extend<M: Memory>(page: *mut Page, mem: &M) -> bool {
     // `capacity .. capacity + extend <= reserved`, so each first word lies inside the page's
     // block area (invariant 2), is `WORD`-aligned, and is memory `mem.ptr` may write to
     // (invariant 1). Those blocks are untouched by anyone (invariant 4), so overwriting their
-    // first words clobbers nothing live. `capacity + extend <= reserved <= u16::MAX`.
+    // first words clobbers nothing live. `capacity + extend <= reserved <= u32::MAX`.
     unsafe {
         let capacity = (*page).capacity as usize;
         let reserved = (*page).reserved as usize;
@@ -301,7 +314,7 @@ pub unsafe fn extend<M: Memory>(page: *mut Page, mem: &M) -> bool {
         }
         mem.ptr(last).cast::<usize>().write((*page).free);
         (*page).free = first;
-        (*page).capacity = (capacity + extend) as u16;
+        (*page).capacity = (capacity + extend) as u32;
         true
     }
 }
@@ -698,9 +711,11 @@ mod tests {
         #[cfg(target_pointer_width = "64")]
         assert_eq!(size_of::<Page>(), 48);
         #[cfg(target_pointer_width = "32")]
-        assert_eq!(size_of::<Page>(), 32);
+        assert_eq!(size_of::<Page>(), 36);
         assert_eq!(offset_of!(Page, free), 0);
+        assert_eq!(offset_of!(Page, used), size_of::<usize>());
         assert!(offset_of!(Page, free_is_zero) < 32);
+        assert!(offset_of!(Page, flags) < 32);
         assert!(offset_of!(Page, block_size) + 4 <= 32);
         for bin in 1..=MAX_BIN {
             assert!(bins::block_start(bin_size(bin)) >= size_of::<Page>());
@@ -1200,7 +1215,8 @@ mod verify {
 
     /// Geometry for every bin: every byte of every block lies inside the page (so `header_of`
     /// recovers the page from it and `extend`'s writes stay in bounds), block starts carry the
-    /// natural alignment the size class promises, and the counts fit the header's `u16`s.
+    /// natural alignment the size class promises, and the counts fit the header's fields
+    /// (`u32` for the block counts, `u16` for `block_start`).
     #[kani::proof]
     fn every_block_of_every_bin_lies_inside_its_page_and_is_aligned() {
         let bin: u8 = kani::any();
@@ -1209,7 +1225,7 @@ mod verify {
         let bs = bin_size(bin);
         let start = bins::block_start(bs);
         let reserved = blocks_per_page(kind, bs);
-        assert!(reserved >= 1 && reserved <= u16::MAX as usize);
+        assert!(reserved >= 1 && reserved <= u32::MAX as usize);
         assert!(start >= PAGE_HEADER_RESERVE && start <= u16::MAX as usize);
         assert!(bs <= u32::MAX as usize);
         assert!(start + reserved * bs <= kind.page_size());

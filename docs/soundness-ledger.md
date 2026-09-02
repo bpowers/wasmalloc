@@ -33,13 +33,19 @@ Entries are grouped by module. Page invariants 1 to 5 refer to the numbered list
   them. The write creates no reference and reads nothing, so dirty memory cannot produce an
   invalid value. Afterwards the header satisfies invariants 2 to 5 with `capacity == used == 0`
   and an empty list: `reserved`, `block_start` and `block_size` are computed by the `bins`
-  functions the invariants name, `reserved` fits `u16` (Kani `every_block_of_every_bin...`),
-  and `free_is_zero == zeroed` is exactly invariant 5 for a page with no linked blocks.
+  functions the invariants name, `reserved` fits `u32` and `block_start` fits `u16` (Kani
+  `every_block_of_every_bin...`), and `free_is_zero == zeroed` is exactly invariant 5 for a page
+  with no linked blocks.
 - Machine checks: Kani `four_operations_on_a_page_of_eight_kib_blocks_preserve_invariants`,
   `two_operations_on_a_page_of_four_kib_blocks_preserve_invariants` (concrete bins, proof-only
   backend), `every_block_of_every_bin_lies_inside_its_page_and_is_aligned` (geometry for every
   bin). Tests `init_writes_every_field_on_zeroed_and_dirty_pages`, `kind_bytes_round_trip`.
   Miri (Stacked Borrows with strict provenance, Tree Borrows) over the page tests.
+- Changes: 2026-09-01, `used`, `capacity` and `reserved` widened from `u16` to `u32` and
+  `block_size` moved ahead of `block_start` (roofline 12.1: a 16-bit store-to-load forward of
+  `used` cost about 2 ns per alloc+free pair). The header is 36 bytes on wasm32 and 48 on the
+  host, still within `PAGE_HEADER_RESERVE` (const asserted); the write is otherwise the same.
+  The four page Kani harnesses and Miri (both aliasing models) were re-run on the new layout.
 - Reviewer: pending adversarial review. Date: 2026-09-01.
 
 ### PAGE-02: `page::pop`, the free-list pop
@@ -48,7 +54,7 @@ Entries are grouped by module. Page invariants 1 to 5 refer to the numbered list
 - Invariants relied on: 4 (a non-zero `free` is a block of this page with index below
   `capacity`), 2 (block `i` starts at `page + block_start + i * block_size`, inside the page,
   and `block_start` and `block_size` are multiples of `WORD`), 1 (`mem.ptr` valid in the page),
-  4 again for `used < capacity <= u16::MAX` whenever the list is non-empty.
+  4 again for `used < capacity <= u32::MAX` whenever the list is non-empty.
 - Proof sketch: the header reads and writes are in-bounds and aligned (PAGE-01). If `free == 0`
   nothing else happens. Otherwise `free` is a free block `b` (invariant 4): its first `usize`
   lies inside the block, hence inside the page, and is `WORD`-aligned, so the read is valid.
@@ -61,6 +67,9 @@ Entries are grouped by module. Page invariants 1 to 5 refer to the numbered list
   (every bin, every block distinct, aligned, inside the area),
   `random_operation_sequences_preserve_the_invariants`, `push_is_lifo_in_sequential_and_random_order`.
   Miri as above.
+- Changes: 2026-09-01, `used` and `capacity` are `u32` (see PAGE-01); the increment is now a
+  32-bit read-modify-write at offset `size_of::<usize>()`. The overflow argument is unchanged
+  and holds a fortiori. Harnesses and Miri re-run.
 - Reviewer: pending adversarial review. Date: 2026-09-01.
 
 ### PAGE-03: `page::push`, the free-list push
@@ -79,6 +88,9 @@ Entries are grouped by module. Page invariants 1 to 5 refer to the numbered list
   live blocks); tests `push_is_lifo_in_sequential_and_random_order`,
   `random_operation_sequences_preserve_the_invariants`, `free_is_zero_holds_until_the_first_push`.
   Miri as above.
+- Changes: 2026-09-01, `used` is `u32` (see PAGE-01); the decrement is a 32-bit
+  read-modify-write and `free_is_zero` moved from offset 16 to 22 (both targets). The underflow
+  argument is unchanged. Harnesses and Miri re-run.
 - Reviewer: pending adversarial review. Date: 2026-09-01.
 
 ### PAGE-04: `page::extend`, lazy free-list extension
@@ -96,12 +108,14 @@ Entries are grouped by module. Page invariants 1 to 5 refer to the numbered list
   so `used + |list| == capacity + extend`, the new `capacity`, and every listed block has index
   below it: invariants 3 and 4. Only link words are written, so the payload of every listed block
   and every block at or above the new `capacity` is as before: invariant 5. `capacity + extend
-  <= reserved <= u16::MAX`.
+  <= reserved <= u32::MAX`, so the `as u32` store of the new `capacity` is exact.
 - Machine checks: the two Kani operation-sequence harnesses (the 15-block page links two blocks
   per call, so the loop body runs); tests `extend_links_at_most_max_extend_size_and_at_least_one_block`
   (every bin), `pop_with_lazy_extension_hands_out_every_block_exactly_once` (extension step
   sizes for every bin), `free_is_zero_holds_until_the_first_push` (only link words written).
   Miri as above.
+- Changes: 2026-09-01, `capacity` and `reserved` are `u32` (see PAGE-01); the bound above was
+  `u16::MAX`. Harnesses and Miri re-run.
 - Reviewer: pending adversarial review. Date: 2026-09-01.
 
 ### PAGE-05: header field reads in the predicates and helpers
@@ -123,6 +137,9 @@ Blocks in `is_full`, `all_free`, `has_free`, `is_expandable`, `in_full_queue`,
   `random_operation_sequences_preserve_the_invariants`, `full_queue_flag_toggles_without_touching_other_fields`,
   `kind_bytes_round_trip`, `pop_with_lazy_extension_hands_out_every_block_exactly_once`
   (`block_area`). Miri as above.
+- Changes: 2026-09-01, `is_full`, `is_expandable`, `block_area` and `block_index` now read
+  `u32` counters (see PAGE-01); each read is still of a fully initialised field of its own
+  type. Harnesses and Miri re-run.
 - Reviewer: pending adversarial review. Date: 2026-09-01.
 
 ### PAGE-06: `page::validate` (test and proof infrastructure only)

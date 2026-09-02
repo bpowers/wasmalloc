@@ -195,14 +195,16 @@ Everything in the architecture above is implemented on `main` and verified as fo
 | `bins` | mimalloc's 60 bins with an 8-byte word, `classify(Layout)`, `block_start` alignment rule | exhaustive tests over every size; 4 Kani harnesses (tightness, monotonicity, waste bound, alignment by construction) |
 | `backend` | `Memory` trait in slices; `WasmMemory`; `SimMemory` with non-contiguous growth and a 4 MiB-aligned host `Region` | tests; used by every other module's tests, Miri and Kani |
 | `slices` | free and known-zero bitmaps, lowest-first aligned run search with dedicated 1/8/64-slice scans, `acquire` with geometric growth sized from the current end, last slice of a 4 GiB memory never used | 18 tests incl. a model check; 9 Kani harnesses (3 in the quick gate) |
-| `page` | 32-byte in-band header (48 on the host), `pop`/`push`/`extend`, `header_of` mask | 20 tests; Miri clean under Stacked and Tree Borrows; 4 Kani harnesses over a proof-only memory; ledger PAGE-01..06 |
+| `page` | 36-byte in-band header (48 on the host), `pop`/`push`/`extend`, `header_of` mask | 20 tests; Miri clean under Stacked and Tree Borrows; 4 Kani harnesses over a proof-only memory; ledger PAGE-01..06 |
 | `heap` | bin queues, direct table with a read-only sentinel page, candidate search, full queue, retirement and collection, header-less runs, in-place realloc within a kind or a run, OOM collect-and-retry | 14 tests incl. randomised churn with content checks and a full invariant validator; no Kani harnesses yet; no ledger entries yet |
 | `global` | `WasmAlloc`: `GlobalAlloc` over a static heap; refuses the `atomics` feature | end-to-end wasm32 test under wasmtime with std collections |
 | `testing` | model-based differential tester with six profiles, mutant tests, cargo-fuzz targets for System and the heap | all profiles pass against the heap; 208k fuzz runs clean |
 
 Deviations from the draft: the free list is a single LIFO list (mimalloc's `local_free` was
 dropped as planned); the first block of a page starts at 64 bytes, not 32, so the host and
-wasm32 share one geometry; large (4 MiB) pages are enabled.
+wasm32 share one geometry; large (4 MiB) pages are enabled; the block counters in the page
+header are `u32`, not `u16`, because a 16-bit store followed by a 16-bit load of `used` is a
+slow store-to-load forward on current x86 cores (`docs/research/roofline.md` section 12.1).
 
 First measurements (node 22, V8 optimizing tier, median ns per operation) against the roofline
 harness's size-class floor and the incumbents: alloc+free of 32 bytes 3.73 (floor 1.78, talc
