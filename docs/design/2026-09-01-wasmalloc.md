@@ -267,9 +267,10 @@ random churn over 10k live objects is 6.4 on V8 15.2 (floor 3.2, talc 26, dlmall
 talc-style random actions 14.6 (talc 20.1, dlmalloc 40.6). After the second tuning pass
 (tuning log, 2026-09-02) the 16 B to 1 MiB realloc chain costs 0.63 us on V8 15.2 and 0.64 on
 node 22 (was 12 us; dlmalloc 0.04 and 0.07, talc 0.05 and 0.09), the rest being the copies
-below the 40 KiB medium limit, and footprint is 1.0x dlmalloc's on the 1 MiB Vec growth (68
-pages against 54, was 288), 1.27x on churn (132 against 104, was 181) and 2.1x on random
-actions (68 against 32, was 81), the last being one 64 KiB page per touched bin, which needs a
+below the 40 KiB medium limit, and after the footprint pass (tuning log, 2026-09-02) footprint
+is 0.74x dlmalloc's on the 1 MiB Vec growth (40 pages against 54, was 288), 1.23x on churn (128
+against 104, was 181), 1.05x on the trivial pair (22 against 21, was 36) and 2.0x on random
+actions (64 against 32, was 81), the last being one 64 KiB page per touched bin, which needs a
 design change to go below. Note that our pages are extended 8 KiB at a time, so `memory.size`
 overstates our resident memory relative to dlmalloc, which touches everything it hands out.
 
@@ -287,12 +288,14 @@ to try, each behind a benchmark and a proof, roughly in order of expected payoff
    every free; the flags byte is already loaded, so the clear can move to the slow path and run
    once per page.
 3. **Shrink the fixed footprint of small heaps.** Mostly done (tuning log, 2026-09-02): the
-   256 KiB medium page, the eighth-heap growth step and releasing retired pages before growth
-   took the batch profiles from 18 to 29x peak live bytes to 3.7 to 4.6x. What remains is one
-   64 KiB page per touched bin (37 pages before any object is counted in random_actions);
-   carving the first page of several bins from one slice would need the page header address to
-   stay derivable from the Layout, a design change. Reclaiming the partial slice below the
-   first page for metadata is still open.
+   256 KiB medium page, the eighth-heap growth step from the first grow (floor two slices, was
+   1 MiB) and releasing retired pages before growth took the batch profiles from 18 to 29x peak
+   live bytes to 3.7 to 4.6x and the trivial workloads to dlmalloc's footprint plus one page.
+   What remains is one 64 KiB page per touched bin (37 pages before any object is counted in
+   random_actions, 2.3 MiB of the fishbanks heap's 3.9); the footprint entry of the tuning log,
+   item 4, lays out the sub-slice ("tiny") page design that would halve it, its expected
+   saving and its cost. A 128 KiB medium page was measured and rejected there. Reclaiming the
+   partial slice below the first page for metadata is still open.
 4. **Bump allocation in fresh pages.** mimalloc found no gain natively (page.c:627); under V8
    the tradeoff between a free-list pop and a bump-and-compare may differ. Measure.
 5. **Liftoff-tier and `opt-level = "z"` behaviour.** Consumers like simlin build at `-Oz`; V8
@@ -576,3 +579,162 @@ the inlined alloc); a version that decides the common word-aligned growth from
 called out of line at 82 percent of simlin's allocation sites; a `#[inline(always)]` shim is
 not something this crate controls, so the remaining lever is V8's inlining budget, which
 favours exactly the smaller shims this pass produced.
+
+### 2026-09-02, footprint (small heaps)
+
+Roadmap item 3, second pass: the footprint of a small heap against the default allocator's.
+Baseline is `main` at 799081a (tuning-c merged). Roofline footprint is the `footprint` step of
+`bench/roofline/run-all.sh` (one workload per process, node 24 `--no-liftoff`, `memory.size`
+pages after the workload; `memory.grow` calls from the `wasmalloc_count` variant); roofline
+speed is node 24 `--no-liftoff` and wasmtime, five alternating runs per variant, median of the
+per-run medians, pinned to CPUs 12-15 with nothing on their SMT siblings (a run on the sibling
+of a busy core read 1.52 ns instead of 1.25 for alloc_free_32). simlin is the bundle built as
+`build.sh` does (`-Oz`, fat LTO, `wasm-opt -O3`) against this branch through a `[patch.crates-io]`
+in a scratch worktree of the simlin clone (`third_party/footprint/simlin`, branch
+`footprint-bench`, never pushed), run with `clearn-alloc.mjs --count-grows` on node 24 pinned
+to CPUs 4-7: the fishbanks model (`default_projects/fishbanks/model.xmile`, opened as XMILE by a
+local extension of the script) with LTM on and off, five iterations after one warm-up, and
+C-LEARN with LTM, ten iterations after two warm-ups in two runs with the bundle order swapped,
+paired per-iteration differences reported. Two more local extensions of the script read the
+allocator's state out of linear memory: `--log-grows` records every `memory.grow` request, and
+`--census` finds every page header at a 64 KiB boundary (the geometry fields are functions of
+the bin byte, so a candidate is a page exactly when all of them agree) and tabulates pages,
+slices and live blocks per bin.
+
+What a small heap holds, from the census (base, fishbanks with LTM, after the compile stage):
+`memory.size` 88 pages, of which 23 are the module's stack and data; 45 pages in 40 bins
+covering 54 slices, 37 of them small pages holding between one and 1643 blocks each and three
+medium pages (20, 28 and 32 KiB blocks) covering 12 slices for four blocks; 719 KB of live data,
+which would pack into 11 slices; 11 slices free or in runs. dlmalloc holds the same program in
+36 pages. C-LEARN after its compile: 2911 pages in 45 bins covering 2944 slices for 184.7 MB of
+live data (2818 slices packed, 96 percent), 1704 slices in runs or free, 931 of them the Vm::new
+buffer. So the small heap is one page per touched bin plus the growth step, and the large heap
+is packed; the section 12.5 diagnosis stands.
+
+1. **Growth floor 16 -> 2 slices** (`GrowPolicy::DEFAULT.min_grow`). The first grow was 1 MiB
+   and every small heap grew in 1 MiB steps until 8 MiB. The heap is counted from slice 0, so
+   on wasm it is at least the shadow stack's 16 slices and the eighth-of-heap step governs from
+   the first grow; a floor of 4 was measured as well (alloc_free_32 24 pages, churn 137 with
+   16 grows, random_actions 63 with 9, the Vec workloads 40 with 4) and gains nothing over 2 but
+   the step-landing luck. Kept.
+
+   Roofline footprint, pages after the workload (grows in the first call), main -> this branch,
+   dlmalloc for scale:
+
+   | workload | main | branch | dlmalloc |
+   |---|---:|---:|---:|
+   | alloc_free_32, align16, batch_lifo_32, batch_fifo_32 | 36 (1) | 22 (1) | 21 |
+   | churn | 132 (7) | 128 (17) | 104 |
+   | random_actions | 68 (3) | 64 (11) | 32 |
+   | random_actions_norealloc | 84 (4) | 72 (12) | 38 |
+   | vec_push_growth, realloc_doubling | 68 (3) | 40 (4) | 54 |
+   | large_alloc_free | 132 (3) | 144 (5) | 149 |
+
+   large_alloc_free grows because with near-exact steps every doubling of the run outgrows the
+   free tail by a little and grows memory by the whole request, where the 16-slice steps happened
+   to leave enough room. Speed, node 24 TurboFan / wasmtime, ns per op: alloc_free_32
+   1.249/1.121 -> 1.249/1.123, batch_lifo_32 1.596/1.864 -> 1.591/1.866, churn 6.647/6.238 ->
+   6.628/6.257, random_actions 14.44/13.81 -> 14.46/13.82, realloc_doubling 625/617 -> 627/614:
+   flat, as it must be (the policy runs only in the cold grow path). simlin: fishbanks with LTM
+   88 pages and 5 grows -> 83 and 13 (dlmalloc 36 and 14), without LTM 88 and 5 -> 74 and 12
+   (dlmalloc 29 and 7), compile 2.95 -> 2.91 ms and 0.78 -> 0.78 ms; C-LEARN compile 1875 -> 1878
+   and 1875 -> 1877 ms in the two runs, paired difference +2.7 ms (IQR 1.1 to 8.6, n = 20), grows
+   37 -> 42, peak `memory.size` 4671 -> 5005 pages (dlmalloc 4456 with 2844 grows). The extra
+   grows cost about 0.5 ms per C-LEARN compile at 100 us each on V8 13.6 and nothing on V8 15.2,
+   JSC or wasmtime. The C-LEARN peak is the phase of the eighth-steps, not the floor: the grow
+   log shows both sequences end with the same 931-slice request (the Vm::new buffer) on top of an
+   eighth-step sequence that landed at 3740 slices before and lands at 4074 now, for a need
+   between 3622 and 3740; the census after the compile is identical (2944 slices in 2911 pages)
+   and the 334-slice difference is free slices from that last step. An eighth-step policy lands
+   anywhere up to 12.5 percent above the need (6 percent on average, 18 MiB at this heap's size),
+   and which side a given workload falls on changes with any change to the sequence. Halving the
+   fraction above some heap size would halve that expectation at the price of twice the grows
+   in the large regime, about 40 more calls per C-LEARN compile, each 100 us of `memory.grow`
+   plus a walk over every page in `release_empty_pages` (3000 headers there); not done here. Also
+   visible in the log: one 1-page grow per run that is not ours, dlmalloc-rs's `System` growing
+   for something in the bundle that bypasses the global allocator (the sixth `memory.grow` site
+   in the bundle is `Dlmalloc::malloc`); harmless, its pages are fresh and never ours.
+
+2. **Faster release of retired pages: no effect, by construction.** The footprint is decided at
+   the moments memory grows, and `acquire_run` releases every empty page of every bin queue
+   before it asks for memory (R-2), so a page's countdown only decides which slice the next page
+   lands on. The new test `a_small_heap_holds_no_empty_page_when_it_grows` runs a
+   random_actions-shaped workload on a heap that starts like a wasm module and asserts, at each
+   of its 14 grows, that no bin queue holds an empty page; its census at the last grow: 64 pages
+   in 37 bins, four with one block, 9 free slices (the step just taken), 646 live blocks, 1.6 MB
+   that would pack into 25 slices. Releasing an empty page at once when a sibling has room was
+   already rejected in tuning-b item 4 for the same reason. No code changed on the hot paths;
+   nothing to measure.
+
+3. **128 KiB medium pages: measured and rejected**, in two forms. (a) As specified, with the
+   limit at the bin at or below (128 KiB - 4 KiB) / 6, so 24 to 40 KiB blocks become one-slice
+   runs, and a pair scan in the slice map. Roofline footprint: vec_push_growth 40 -> 50,
+   realloc_doubling 40 -> 48 (the run now starts at 32 KiB and the first round's placement
+   sequence lands elsewhere; both settle with no grows in later calls, so this is the transient),
+   every other workload unchanged (none has medium blocks); speed: realloc_doubling 626 -> 245
+   ns on node 24 and 615 -> 237 on wasmtime (the 32 KiB copy is gone: from 32 KiB up the run
+   grows in place), everything else flat. simlin: fishbanks with LTM 83 -> 74 pages (dlmalloc
+   36), without 74 -> 66 (29), grows 13 -> 12 and 12 -> 11; C-LEARN peak 5005 -> 5005, grows 42
+   -> 42, compile 1878 -> 1880 and 1873 -> 1882, paired +7.2 ms (IQR 2.0 to 11.5, n = 20). A
+   wasmtime microbenchmark of 1024 allocations then 1024 frees per round (FIFO / LIFO, ns per
+   pair, then `memory.size` pages): 12 KiB 14.0-14.5 / 13.6 -> 15.9-16.1 / 15.5-15.9 (230 ->
+   229; a page initialisation every 10 blocks instead of 20), 16 and 20 KiB flat, 24 KiB
+   16.2-16.8 / 15.7-16.2 -> 9.8 / 10.2 but 462 -> 1045 pages, 32 KiB 16.8-17.0 / 16.3-16.4 -> 9.8
+   / 10.2 and 655 -> 1045, 40 KiB 16.6-16.9 / 17.1-17.2 -> 9.8 / 10.3 and 736 -> 1045. Runs are
+   faster than page blocks (no header traffic, no extension) but a 24 KiB block costs a whole
+   slice: 2.7x the footprint for a heap of them, 2x at 32 KiB, 1.6x at 40 KiB. That cliff is not
+   acceptable in a default allocator, and the C-LEARN compile pays for the mid-size requests
+   that now go through the slice map's first-fit scan and fragment it with one-slice holes.
+   (b) 128 KiB pages with the 40 KiB limit kept, three to five blocks per page for 24 to 40 KiB:
+   roofline flat (realloc_doubling 627 -> 635 on node 24, 615 -> 615 on wasmtime; the Vec
+   workloads 52 and 50 pages), microbenchmark 12 KiB 14.0 / 13.6 -> 15.7-15.9 / 15.7-15.8, 16 to
+   24 KiB flat, 32 KiB 16.9-17.0 / 16.3-16.4 -> 19.7-20.5 / 18.7-19.3 with 655 -> 735 pages
+   (three blocks per page leave 28 KiB of tail), 40 KiB 16.7 / 17.1 -> 20.3-21.1 / 20.1-20.4. An
+   18 to 21 percent slower pair on 32 to 40 KiB churn for six slices on fishbanks. Neither form
+   passes "footprint improves with no speed loss"; the medium page stays at 256 KiB. Kept from
+   the experiment: two edge-case tests whose bounds assumed the constants (commit 6df9efc).
+
+4. **The remaining fixed cost, one 64 KiB page per touched small bin: what sub-slice pages
+   would take.** The invariant to keep is that the page kind, hence the mask that finds the
+   header, is a function of the Layout. A fourth kind, "tiny" pages of 16 KiB for the bins whose
+   blocks are at most 2 KiB (bins 1 to 28: the largest block that still gives six blocks per
+   page after a 2 KiB `block_start`), keeps it: `dealloc` tests `size <= 2048 & -align` before
+   the small limit and masks with 16 KiB, one more compare and a second mask constant on the
+   free fast path (the alloc fast path is untouched, the direct table does not care what kind a
+   page is; Liftoff would execute the extra instructions, TurboFan about 0.05 ns). The slice map
+   would carry a quarter map, four bits per slice (32 KiB of zero static for the whole address
+   space, 64 KiB with a matching known-zero map; a static that is all zero costs nothing in the
+   module, roadmap item 9): a tiny page is a quarter of a carrier slice, a carrier with no
+   quarters left is a full slice to the main map, and a carrier whose four quarters are free
+   goes back to it. `fresh_page` and `free_page` grow a tiny branch; `page::init`, `extend`,
+   `pop` and `push` are unchanged (`MAX_EXTEND_SIZE` is 8 KiB, half a tiny page). Expected on
+   the fishbanks heap, from the census: bins 1 to 24 hold 1 to 44 KB each and would take 32 tiny
+   pages (8 slices) instead of 24 slices, bins 25 to 28 one tiny page each instead of a slice
+   (one more slice instead of five), so `memory.size` about 83 -> 61 pages against dlmalloc's 36,
+   and random_actions about 64 -> 45 against 32; the rest is growth overshoot and one tiny page
+   per bin. Costs: a tiny page fills four times sooner, so bins that fill pages take four times
+   the page supply calls (C-LEARN's 8-byte bin holds 347k blocks in 43 pages; about 6000 page
+   supplies per compile become 15 to 20k at some 250 ns each, 2 to 3 ms of a 1875 ms compile),
+   the header reserve is 0.4 percent of the page instead of 0.1, and the change touches `bins`
+   (kind and limits), `page` (a kind byte), `heap` (supply and release), `slices` (the quarter
+   map), ledger entries PAGE-01, HEAP-02, HEAP-04, HEAP-06 and HEAP-07 and their harnesses, plus
+   `dealloc_fast_path_agrees_with_classify` for the new kind test. Recommendation: worth a
+   prototype behind a constant like `LARGE_PAGES`, judged on the dealloc fast path under node 24
+   Liftoff and TurboFan and on the C-LEARN compile before anything else; it is the only lever
+   left that moves a small heap by more than a few pages.
+
+Final state against main, roofline (n24 TurboFan / wasmtime): alloc_free_32 1.249/1.121 ->
+1.249/1.123, batch_lifo_32 1.596/1.864 -> 1.591/1.866, churn 6.647/6.238 -> 6.628/6.257,
+random_actions 14.44/13.81 -> 14.46/13.82, realloc_doubling 625/617 -> 627/614; footprint per
+the table in item 1 (alloc_free_32 36 -> 22 against dlmalloc's 21, random_actions 68 -> 64
+against 32, the Vec workloads 68 -> 40 against 54). simlin: fishbanks 88 -> 83 pages (LTM) and
+88 -> 74 (no LTM) against dlmalloc's 36 and 29; C-LEARN 4671 -> 5005 against 4456 (phase, item
+1), compile +2.7 ms paired. Proofs: the quick set (13 harnesses, 16 s), the slices harnesses
+`slices_acquire_stays_inside_memory_and_the_map` (42 s, 1.6 GB) and
+`slices_extend_with_growth_extends_only_a_top_run` (46 s, 1.3 GB), the retirement harnesses
+`freeing_the_last_block_retires_the_page`, `an_unforced_collection_ages_a_retired_page` and
+`a_forced_collection_frees_a_retired_page` (18 to 23 s, up to 3.8 GB); `model_heap` and 243,307
+`model_heap` fuzz runs in 60 s, clean. No `unsafe` block changed; no ledger entry moved.
+
+Next for footprint: the tiny-page prototype (item 4), and the growth fraction above a few tens
+of MiB (item 1) if 6 percent of a large heap is worth twice the grows there.

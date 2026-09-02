@@ -70,8 +70,8 @@ Things to know:
   allocations. wasmalloc leaves the initial linear memory to it and grows its own.
 - It trades some linear memory for speed on small heaps: each size class in use holds at least
   one page (64 KiB, or 256 KiB for blocks over 10 KiB). On the benchmark workloads peak
-  `memory.size` is between 0.9x and 2.2x the default allocator's; `docs/research/roofline.md`
-  has the table.
+  `memory.size` is between 0.7x and 2.0x the default allocator's; `docs/research/roofline.md`
+  has the table and the design document's tuning log the latest numbers.
 
 Problems and questions: <https://github.com/bpowers/wasmalloc/issues>.
 
