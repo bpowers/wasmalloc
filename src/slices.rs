@@ -557,11 +557,13 @@ fn add_region<const WORDS: usize>(map: &mut SliceMap<WORDS>, start: usize, count
 }
 
 /// Highest end of memory `acquire` may grow to: what the map can describe, and on a 32-bit
-/// target also what the address space can hold (a full 4 GiB memory ends at slice 65536). The
-/// 64-bit test host has no such cap because simulated memories live at arbitrary host addresses.
+/// target also what the address space can hold. The last slice (index `MAX_SLICE_INDEX`) is
+/// deliberately never handed out: a page or run ending there would have an end address of 2^32,
+/// which overflows `usize` and which Rust forbids for any allocated object. The 64-bit test host
+/// has no such cap because simulated memories live at arbitrary host addresses.
 #[cfg(target_pointer_width = "32")]
 fn end_limit<const WORDS: usize>(map: &SliceMap<WORDS>) -> usize {
-    map.limit().min(MAX_SLICE_INDEX + 1)
+    map.limit().min(MAX_SLICE_INDEX)
 }
 
 /// See the 32-bit version.
