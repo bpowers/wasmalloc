@@ -88,7 +88,7 @@ PATH first: `export PATH="$HOME/.wasmtime/bin:$PATH"`.
   bin it, and start blocks at an offset aligned to the largest power of two dividing the bin
   size). No interior pointers.
 - One thread: no atomics, no TLS, no locks, no thread-free lists, no page abandonment.
-- Fast paths are tiny and `#[inline]`; slow paths are `#[cold] #[inline(never)]`.
+- Fast paths are tiny and `#[inline(always)]`; slow paths are `#[cold] #[inline(never)]`.
 
 ## Boundaries
 

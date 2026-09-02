@@ -68,26 +68,26 @@ fn to_raw(p: Option<NonNull<u8>>) -> *mut u8 {
 // Layout, never overlap while live, dealloc and realloc recompute the block's page from the
 // Layout the caller passes back, and the heap never unwinds.
 unsafe impl GlobalAlloc for WasmAlloc {
-    #[inline]
+    #[inline(always)]
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         // SAFETY: GlobalAlloc guarantees a non-zero size; single-threaded access (see `heap`).
         unsafe { to_raw(self.heap().alloc(layout)) }
     }
 
-    #[inline]
+    #[inline(always)]
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         // SAFETY: as for `alloc`.
         unsafe { to_raw(self.heap().alloc_zeroed(layout)) }
     }
 
-    #[inline]
+    #[inline(always)]
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         // SAFETY: GlobalAlloc guarantees `ptr` was returned by this allocator for `layout`, hence
         // non-null; single-threaded access.
         unsafe { self.heap().dealloc(NonNull::new_unchecked(ptr), layout) }
     }
 
-    #[inline]
+    #[inline(always)]
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         // SAFETY: GlobalAlloc guarantees `ptr` is live for `layout` and that `new_size` rounded
         // up to the alignment does not overflow isize; single-threaded access.

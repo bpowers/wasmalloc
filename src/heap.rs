@@ -24,9 +24,12 @@
 //!
 //! # Fast paths
 //!
-//! [`Heap::alloc`] and [`Heap::dealloc`] are the only `#[inline]` entry points; everything they
-//! call on a miss is `#[cold] #[inline(never)]` so the inlined code stays small enough for V8's
-//! baseline tier and for consumers building at `opt-level = "z"`.
+//! [`Heap::alloc`], [`Heap::alloc_zeroed`] and [`Heap::dealloc`] are the only inlined entry
+//! points, and they are `#[inline(always)]` rather than `#[inline]`: at `opt-level = "z"` LLVM
+//! declines the hint and turns every allocation into three calls (the std shim, `__rust_alloc`,
+//! `Heap::alloc`), 2.5x slower on V8. Everything they call on a miss is `#[cold]
+//! #[inline(never)]` so the inlined code stays small enough for V8's baseline tier and for
+//! consumers building at `opt-level = "z"`.
 //!
 //! # Invariants (checked by `validate` in tests)
 //!
@@ -160,7 +163,7 @@ impl<M: Memory, const WORDS: usize> Heap<M, WORDS> {
     /// # Safety
     ///
     /// `layout.size()` must be non-zero (the `GlobalAlloc` contract).
-    #[inline]
+    #[inline(always)]
     pub unsafe fn alloc(&mut self, layout: Layout) -> Option<NonNull<u8>> {
         let mut size = layout.size();
         let align = layout.align();
@@ -191,7 +194,7 @@ impl<M: Memory, const WORDS: usize> Heap<M, WORDS> {
     /// # Safety
     ///
     /// As for [`alloc`](Self::alloc).
-    #[inline]
+    #[inline(always)]
     pub unsafe fn alloc_zeroed(&mut self, layout: Layout) -> Option<NonNull<u8>> {
         let mut size = layout.size();
         let align = layout.align();
@@ -229,7 +232,7 @@ impl<M: Memory, const WORDS: usize> Heap<M, WORDS> {
     ///
     /// `ptr` must have been returned by this heap for exactly `layout` (or by `realloc` with a
     /// Layout of this size and alignment) and not freed since.
-    #[inline]
+    #[inline(always)]
     pub unsafe fn dealloc(&mut self, ptr: NonNull<u8>, layout: Layout) {
         let addr = ptr.addr().get();
         let mut size = layout.size();
