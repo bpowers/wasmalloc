@@ -87,9 +87,11 @@ unsafe impl Memory for WasmMemory {
 /// A simulated linear memory inside a caller-provided region, for the host.
 ///
 /// Addresses are real host addresses, so the page-mask lookups behave exactly as on wasm
-/// provided the region is aligned to the largest page size (4 MiB); `from_region` checks this.
-/// `grow` zero-fills the new slices to match wasm semantics, and `skip_slices` lets tests model
-/// another party growing memory so the allocator sees a non-contiguous region.
+/// provided the region is aligned to the largest page size it will hold: `from_region` only
+/// requires slice (64 KiB) alignment so that small Kani harnesses can use a 64 KiB buffer, and
+/// `testing::Region` provides 4 MiB alignment for everything else. `grow` zero-fills the new
+/// slices to match wasm semantics, and `skip_slices` lets tests model another party growing
+/// memory so the allocator sees a non-contiguous region.
 #[derive(Debug)]
 pub struct SimMemory {
     base: *mut u8,
@@ -106,9 +108,9 @@ impl SimMemory {
     /// Wrap `len` bytes at `base` as a linear memory whose initial size covers `initial_slices`
     /// slices and whose heap starts `heap_base_offset` bytes into the region.
     ///
-    /// The region must be aligned to `crate::bins::LARGE_PAGE_SIZE`, `len` must be a multiple of
-    /// `SLICE_SIZE`, `initial_slices * SLICE_SIZE <= len`, and `heap_base_offset` must be below
-    /// the initial size. Panics otherwise (this is test infrastructure).
+    /// The region must be aligned to `SLICE_SIZE`, `len` must be a multiple of `SLICE_SIZE`,
+    /// `initial_slices * SLICE_SIZE <= len`, and `heap_base_offset` must be below the initial
+    /// size. Panics otherwise (this is test infrastructure).
     ///
     /// # Safety
     ///
@@ -121,10 +123,7 @@ impl SimMemory {
         heap_base_offset: usize,
     ) -> Self {
         let addr = base as usize;
-        assert!(
-            addr % crate::bins::LARGE_PAGE_SIZE == 0,
-            "region must be 4 MiB aligned"
-        );
+        assert!(addr % SLICE_SIZE == 0, "region must be slice aligned");
         assert!(len % SLICE_SIZE == 0, "region length must be whole slices");
         assert!(
             initial_slices * SLICE_SIZE <= len,
