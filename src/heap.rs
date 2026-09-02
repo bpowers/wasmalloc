@@ -987,7 +987,9 @@ impl<M: Memory, const WORDS: usize> Heap<M, WORDS> {
         Ok(())
     }
 
-    /// Every invariant, every queue and every direct entry.
+    /// Every invariant, every queue and every direct entry. The proofs check one symbolic
+    /// queue or entry at a time instead, so this is for tests.
+    #[cfg(test)]
     pub(crate) fn validate(&self) -> Result<(), &'static str> {
         let mut qi = 0;
         while qi < QUEUE_COUNT {
@@ -2009,6 +2011,27 @@ mod verify {
         check_rest(h, live);
     }
 
+    /// The cheap part of [`check`] for a heap whose only page, if any, is `page`: the full
+    /// queue is empty, every other queue is empty, the page (when present) is in no queue link
+    /// but its own queue's head, and the live count matches. Used where a queue walk with
+    /// `page::validate` would cost more memory than the operation under proof. The direct
+    /// table is not checked here: [`BIN`] has no direct entries, so nothing in these harnesses
+    /// can change it, and the queue harnesses over [`QBIN`] cover its maintenance.
+    fn check_shape(h: &ProofHeap, page: *mut Page, live: usize) {
+        assert!(h.queues[FULL_QUEUE].first == 0 && h.queues[FULL_QUEUE].count == 0);
+        if !page.is_null() {
+            // SAFETY: the page is live.
+            unsafe {
+                assert!((*page).next == 0 && (*page).prev == 0 && (*page).flags == 0);
+                assert!((*page).used as usize == live);
+            }
+        }
+        assert!(used_in(h, BIN as usize) == live);
+        let other: usize = kani::any();
+        kani::assume(other < QUEUE_COUNT && other != BIN as usize && other != FULL_QUEUE);
+        assert!(h.queues[other].first == 0 && h.queues[other].count == 0);
+    }
+
     fn check_rest(h: &ProofHeap, live: usize) {
         let i: usize = kani::any();
         kani::assume(i < DIRECT_ENTRIES);
@@ -2057,10 +2080,14 @@ mod verify {
         let s = h.mem.grow(1).unwrap();
         h.slices.add_free(s, 1, true);
         let run = h.slices.alloc(1, 1).unwrap();
-        assert!(run.start * SLICE_SIZE == h.mem.page_addr() && run.zeroed);
+        let addr = h.mem.page_addr();
+        assert!(run.start * SLICE_SIZE == addr && run.zeroed);
+        // The page address is passed as the model's own value rather than as the run's
+        // arithmetic: the two are equal (asserted), but CBMC cannot simplify the run's
+        // multiplication and division back to the object's address, and a symbolic page
+        // address makes every header field symbolic.
         // SAFETY: the run is the model's one slice, owned by nothing else.
-        let page =
-            unsafe { page::init(&h.mem, run.start * SLICE_SIZE, PageKind::Small, BIN, true) };
+        let page = unsafe { page::init(&h.mem, addr, PageKind::Small, BIN, true) };
         // SAFETY: a fresh page is in no queue and has unextended blocks.
         unsafe {
             h.push_front(BIN as usize, page);
@@ -2150,13 +2177,20 @@ mod verify {
         check_no_full(&h, 0);
     }
 
-    /// Retire a page: prepare it, hand out one block and free it.
+    /// Retire a page: prepare it, hand out one block and put it back as `dealloc` does on a
+    /// page that just emptied (`page::push`, then `retire`; `dealloc` itself, with the
+    /// transition test in between, is proved in `freeing_the_last_block_retires_the_page` and
+    /// costs too much solver memory to repeat in the collection harnesses).
     fn retired_page(h: &mut ProofHeap) -> *mut Page {
         let page = prepared_page(h);
-        let layout = Layout::from_size_align(BS, WORD).unwrap();
         let addr = take(h, page);
-        // SAFETY: `addr` is the live block for `layout`.
-        unsafe { h.dealloc(block_ptr(addr), layout) };
+        // SAFETY: `addr` is a live block of `page`, a live member of its bin queue.
+        unsafe {
+            page::push(page, &h.mem, addr);
+            h.retire(page);
+            assert!((*page).retire_expire == RETIRE_CYCLES && (*page).used == 0);
+        }
+        assert!(h.retired_min == BIN as usize && h.retired_max == BIN as usize);
         page
     }
 
@@ -2170,10 +2204,14 @@ mod verify {
         unsafe { h.collect_retired(false) };
         // SAFETY: the page is still live.
         unsafe { assert!((*page).retire_expire == RETIRE_CYCLES - 1 && (*page).used == 0) };
-        assert!(h.queues[BIN as usize].count == 1 && h.queues[BIN as usize].first == page.addr());
+        let q = h.queues[BIN as usize];
+        assert!(q.first == page.addr() && q.last == page.addr() && q.count == 1);
         assert!(!h.slices.is_free(h.mem.page_addr() / SLICE_SIZE));
         assert!(h.retired_min == BIN as usize && h.retired_max == BIN as usize);
-        check_no_full(&h, 0);
+        // The collection touched nothing but `retire_expire`, so the page's own validity is
+        // the retire harness's; the queue shape and the direct table are asserted directly,
+        // which keeps this harness a gigabyte under the memory cap.
+        check_shape(&h, page, 0);
     }
 
     /// A forced collection releases a retired page: the slice is free, the queue and the
@@ -2185,10 +2223,11 @@ mod verify {
         retired_page(&mut h);
         // SAFETY: invariants hold between operations.
         unsafe { h.collect_retired(true) };
-        assert!(h.queues[BIN as usize].count == 0 && h.queues[BIN as usize].first == 0);
+        let q = h.queues[BIN as usize];
+        assert!(q.first == 0 && q.last == 0 && q.count == 0);
         assert!(h.slices.is_free(h.mem.page_addr() / SLICE_SIZE));
         assert!(h.retired_min > h.retired_max);
-        check_no_full(&h, 0);
+        check_shape(&h, ptr::null_mut(), 0);
     }
 
     /// On a page with one to three live blocks, freeing any one of them keeps the invariants:
@@ -2256,9 +2295,11 @@ mod verify {
         // SAFETY: the page is live.
         unsafe { assert!(page::in_full_queue(page)) };
         assert!(h.queues[BIN as usize].count == 0 && h.queues[BIN as usize].first == 0);
-        assert!(h.queues[FULL_QUEUE].first == page.addr());
+        let f = h.queues[FULL_QUEUE];
+        assert!(f.first == page.addr() && f.last == page.addr() && f.count == 1);
         assert!(!h.slices.is_free(h.mem.page_addr() / SLICE_SIZE));
-        check(&h, BLOCKS);
+        assert!(h.validate_queue(FULL_QUEUE).is_ok());
+        assert!(used_in(&h, FULL_QUEUE) == BLOCKS);
     }
 
     /// Freeing any block of a page in the full queue brings the page back to its bin queue
@@ -2289,14 +2330,11 @@ mod verify {
         }
         // With one page the queue shape is fully determined; the walk that `check` would do
         // adds nothing here and its list walk over a symbolic block is what breaks the memory
-        // budget, so the queue and direct entries are asserted directly.
+        // budget, so the queues are asserted directly.
         let q = h.queues[BIN as usize];
         assert!(q.first == page.addr() && q.last == page.addr() && q.count == 1);
         let f = h.queues[FULL_QUEUE];
         assert!(f.first == 0 && f.last == 0 && f.count == 0);
-        let i: usize = kani::any();
-        kani::assume(i < DIRECT_ENTRIES);
-        assert!(h.validate_direct_entry(i).is_ok());
         // The next allocation pops the freed block: the page is the queue's first, so the
         // search's candidate, and its list holds exactly that block.
         assert!(take(&h, page) == block(&h, j));
