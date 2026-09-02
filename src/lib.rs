@@ -8,6 +8,7 @@
 //! Module map (each module's doc comment explains its contract):
 //! - [`bins`]: size classes and page geometry, pure arithmetic.
 //! - [`backend`]: the [`backend::Memory`] trait over linear memory (wasm or simulated).
+//! - [`slices`]: the free-slice bitmap and the `memory.grow` policy.
 
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
@@ -18,3 +19,4 @@ extern crate std;
 
 pub mod backend;
 pub mod bins;
+pub mod slices;
