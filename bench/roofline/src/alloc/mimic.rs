@@ -12,12 +12,20 @@
 //! extension batches, and no medium or large pages; anything above 1024 bytes
 //! goes to the bump and leaks.
 //!
-//! Three knobs split the cost of that bookkeeping. With `LEAN` the header holds
+//! Four knobs split the cost of that bookkeeping. With `LEAN` the header holds
 //! only the free list head: the `used`, `free_is_zero` and `flags` traffic
 //! disappears while the direct-table indirection stays. With `WIDE_USED` the
-//! `used` counter is read and written as a 32-bit word (wasmalloc uses a u16,
-//! which on wasm32 costs 16-bit loads and stores). With `NO_ZERO` the
-//! `free_is_zero` byte is not cleared on free.
+//! `used` counter is read and written as a 32-bit word (wasmalloc originally
+//! used a u16, which on wasm32 costs 16-bit loads and stores). With `NO_ZERO`
+//! the `free_is_zero` byte is not cleared on free. With `NO_TEST` the
+//! `used == 0 || flags != 0` test and the cold call behind it are dropped.
+//!
+//! The transition counts its calls in the allocator's state so that LLVM cannot
+//! prove it has no effect: an empty cold function is deleted together with the
+//! test that guards it, which is what the first version of this floor did, and
+//! the loop then lacked one load, one branch and one call per free that
+//! wasmalloc pays whenever a free empties its page (as every free in
+//! `alloc_free_32` does).
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::cell::Cell;
@@ -69,24 +77,29 @@ const fn sentinel() -> *mut Hdr {
     (&raw const EMPTY).cast_mut()
 }
 
-pub struct Mimic<const LEAN: bool, const WIDE_USED: bool, const NO_ZERO: bool> {
+pub struct Mimic<const LEAN: bool, const WIDE_USED: bool, const NO_ZERO: bool, const NO_TEST: bool>
+{
     direct: [Cell<*mut Hdr>; NCLASS],
+    transitions: Cell<u32>,
     cur: [Cell<usize>; NCLASS],
     end: [Cell<usize>; NCLASS],
     bump: Bump,
 }
 
-unsafe impl<const LEAN: bool, const WIDE_USED: bool, const NO_ZERO: bool> Sync
-    for Mimic<LEAN, WIDE_USED, NO_ZERO>
+unsafe impl<const LEAN: bool, const WIDE_USED: bool, const NO_ZERO: bool, const NO_TEST: bool> Sync
+    for Mimic<LEAN, WIDE_USED, NO_ZERO, NO_TEST>
 {
 }
 
-impl<const LEAN: bool, const WIDE_USED: bool, const NO_ZERO: bool> Mimic<LEAN, WIDE_USED, NO_ZERO> {
+impl<const LEAN: bool, const WIDE_USED: bool, const NO_ZERO: bool, const NO_TEST: bool>
+    Mimic<LEAN, WIDE_USED, NO_ZERO, NO_TEST>
+{
     pub const fn new() -> Self {
         const SENTINEL: Cell<*mut Hdr> = Cell::new(sentinel());
         const ZERO: Cell<usize> = Cell::new(0);
         Mimic {
             direct: [SENTINEL; NCLASS],
+            transitions: Cell::new(0),
             cur: [ZERO; NCLASS],
             end: [ZERO; NCLASS],
             bump: Bump::new(),
@@ -102,12 +115,16 @@ impl<const LEAN: bool, const WIDE_USED: bool, const NO_ZERO: bool> Mimic<LEAN, W
         self.bump.reset();
     }
 
-    /// `used`, read as wasmalloc does (u16) or as a whole 32-bit word covering
-    /// `used` and the unused `capacity` field, at the same offset.
+    /// `used`, read as wasmalloc originally did (u16) or as a whole 32-bit word
+    /// covering `used` and the unused `capacity` field, at the same offset. The
+    /// offset comes from the struct: it is 4 on wasm32 and 8 on the 64-bit host.
     #[inline(always)]
     unsafe fn used(page: *mut Hdr) -> u32 {
         if WIDE_USED {
-            page.cast::<u8>().add(4).cast::<u32>().read()
+            page.cast::<u8>()
+                .add(core::mem::offset_of!(Hdr, used))
+                .cast::<u32>()
+                .read()
         } else {
             (*page).used as u32
         }
@@ -116,7 +133,10 @@ impl<const LEAN: bool, const WIDE_USED: bool, const NO_ZERO: bool> Mimic<LEAN, W
     #[inline(always)]
     unsafe fn set_used(page: *mut Hdr, v: u32) {
         if WIDE_USED {
-            page.cast::<u8>().add(4).cast::<u32>().write(v);
+            page.cast::<u8>()
+                .add(core::mem::offset_of!(Hdr, used))
+                .cast::<u32>()
+                .write(v);
         } else {
             (*page).used = v as u16;
         }
@@ -166,15 +186,17 @@ impl<const LEAN: bool, const WIDE_USED: bool, const NO_ZERO: bool> Mimic<LEAN, W
     }
 
     /// The page became empty or is flagged: wasmalloc would retire it or move
-    /// it between queues. The floor does nothing, but the call must exist so
-    /// the fast path carries the same test and the same cold edge.
+    /// it between queues. The floor only counts the event, which is enough of a
+    /// side effect to keep the call, and the test in front of it, alive.
     #[cold]
     #[inline(never)]
-    fn transition(&self, _page: *mut Hdr) {}
+    fn transition(&self, _page: *mut Hdr) {
+        self.transitions.set(self.transitions.get().wrapping_add(1));
+    }
 }
 
-unsafe impl<const LEAN: bool, const WIDE_USED: bool, const NO_ZERO: bool> GlobalAlloc
-    for Mimic<LEAN, WIDE_USED, NO_ZERO>
+unsafe impl<const LEAN: bool, const WIDE_USED: bool, const NO_ZERO: bool, const NO_TEST: bool>
+    GlobalAlloc for Mimic<LEAN, WIDE_USED, NO_ZERO, NO_TEST>
 {
     #[inline(always)]
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
@@ -211,7 +233,7 @@ unsafe impl<const LEAN: bool, const WIDE_USED: bool, const NO_ZERO: bool> Global
             if !NO_ZERO {
                 (*page).free_is_zero = false;
             }
-            if used == 0 || (*page).flags != 0 {
+            if !NO_TEST && (used == 0 || (*page).flags != 0) {
                 self.transition(page);
             }
         }

@@ -41,7 +41,7 @@ MEM="${ROOFLINE_MEM:-4G}"
 TIMEOUT="${ROOFLINE_TIMEOUT:-20m}"
 REPS="${ROOFLINE_REPS:-7}"
 
-ALL_VARIANTS=(bump freelist sizeclass pages mimic mimic_lean mimic_u32 mimic_nozero dlmalloc talc lol_alloc wasmalloc)
+ALL_VARIANTS=(bump freelist sizeclass pages mimic mimic_lean mimic_u32 mimic_nozero mimic_notest mimic_u32_notest dlmalloc talc lol_alloc wasmalloc)
 # ROOFLINE_VARIANTS="sizeclass dlmalloc" restricts every step to a subset.
 read -r -a VARIANTS <<< "${ROOFLINE_VARIANTS:-${ALL_VARIANTS[*]}}"
 # talc, lol_alloc and wasmalloc only build for wasm; the host default is libc malloc.

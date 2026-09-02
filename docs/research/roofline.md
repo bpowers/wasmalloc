@@ -1,7 +1,11 @@
 # Allocation-cost roofline for single-threaded wasm32
 
 Measured 2026-09-01 on the reference machine with the harness in `bench/roofline`
-(commit on branch `roofline`). Every number below is the median of 7 timed calls
+(commit e69117b). The allocator measured is the one at that commit; the tuning
+commits that followed on main (da65f8e widening the page counters, e38d647
+skipping the retire call, abef068 freeing aligned small blocks on the fast path,
+9244a47 marking the fast paths `inline(always)`) change the fast-path figures, and
+section 12.1 quotes their effect, but the full matrix has not been rerun for them. Every number below is the median of 7 timed calls
 after warm-up, in nanoseconds per operation, with the cost of one empty JS-to-wasm
 call subtracted; the full tables, including minimums, are regenerated into
 `bench/roofline/results/REPORT.md` from the JSON in `bench/roofline/results/`.
@@ -36,10 +40,13 @@ Contents
   random churn over 10,000 live objects, and 1.3x faster than talc and 2.6x faster
   than dlmalloc on the talc-style random-actions loop the field compares on.
 - The gap to the floor is 2.0x on churn on every engine and 2.0x (node) to 5.3x (d8,
-  JSC, wasmtime) on the cache-hot pair. Two harness allocators that reproduce
-  wasmalloc's exact fast-path memory traffic pin the whole 5.3x on one detail: the
-  16-bit `used` counter in the page header. Read and written as a 32-bit word, the
-  same traffic runs at 0.84 ns (section 12.1).
+  JSC, wasmtime) on the cache-hot pair. Six harness allocators that reproduce
+  wasmalloc's fast-path memory traffic one detail at a time split the 5.3x in two:
+  the 16-bit `used` counter in the page header (about 2 ns) and the cold transition
+  call taken whenever a free empties its page, which this workload does on every
+  free (about 1 ns once the counter is widened). With a 32-bit counter and no
+  transition the same traffic runs at 0.84 ns; the tuning branch's measurements of
+  the real allocator agree (2.92, then 2.4, then 1.13 ns; section 12.1).
 - wasmalloc loses on three things. A 16 B to 1 MiB realloc chain costs 12 us against
   65 ns for dlmalloc and 86 ns for talc, because every doubling changes size class
   and is a copy while boundary-tag allocators extend the top chunk (12.3). Its
@@ -526,51 +533,72 @@ best figure measured, against talc 20.10 and dlmalloc 40.61.
 
 Relative to the free-list floor wasmalloc's fast path is 2.0x on node 22 and 5.3x on
 d8, JSC and wasmtime; relative to the size-class floor its churn is 2.0x
-everywhere. Section 12.1 shows the fast-path gap is one field wide.
+everywhere. Section 12.1 shows the fast-path gap is two details wide: a 16-bit
+counter and a cold call on every free that empties a page.
 
 ## 12. Where wasmalloc loses and why
 
-### 12.1 The fast path: a 16-bit counter
+### 12.1 The fast path: a 16-bit counter and a cold call on every emptying free
 
-Four harness allocators reproduce the memory traffic of `Heap::alloc` and
-`Heap::dealloc` (src/heap.rs lines 164 to 254, src/page.rs `pop`/`push`) with
-nothing else around it: a direct table indexed by size points at the class's
-current 64 KiB page or at a read-only sentinel; the page header has the same
-field layout as `page::Page` (free list head at offset 0, `used: u16` at 4,
-`free_is_zero` at 16, `flags` at 19); alloc pops the list and increments `used`;
-dealloc masks the pointer to the header, pushes, decrements `used`, clears
-`free_is_zero` and calls a cold no-op when `used == 0 || flags != 0`. No queues, no
-retirement, one page per class. The variants:
+Six harness allocators reproduce the memory traffic of `Heap::alloc` and
+`Heap::dealloc` (src/heap.rs lines 164 to 254 at e69117b, src/page.rs
+`pop`/`push`) with nothing else around it: a direct table indexed by size points
+at the class's current 64 KiB page or at a read-only sentinel; the page header
+has the same field layout as `page::Page` (free list head at offset 0,
+`used: u16` at 4, `free_is_zero` at 16, `flags` at 19); alloc pops the list and
+increments `used`; dealloc masks the pointer to the header, pushes, decrements
+`used`, clears `free_is_zero` and, when `used == 0 || flags != 0`, calls a cold
+out-of-line transition that only counts the event. No queues, no retirement, one
+page per class. The counter in the transition matters: the first version of this
+floor had an empty transition, LLVM deleted it together with the test that
+guarded it, and the floor then lacked one load, one branch and one call per free
+that wasmalloc pays whenever a free empties its page, which in `alloc_free_32` is
+every free. The tuning engineer caught this from the text format. The variants:
 
-- `mimic`: exactly that.
-- `mimic_lean`: the free list head only; no `used`, no `free_is_zero`, no flags.
+- `mimic`: exactly the traffic above.
+- `mimic_lean`: the free list head only; no `used`, no `free_is_zero`, no test.
 - `mimic_u32`: `used` read and written as a 32-bit word at the same offset.
 - `mimic_nozero`: no `free_is_zero` store on free.
+- `mimic_notest`: no `used == 0 || flags != 0` test and no transition call.
+- `mimic_u32_notest`: the 32-bit counter and no test.
 
-| engine, tier | freelist | pages | mimic_lean | mimic_u32 | mimic_nozero | mimic | wasmalloc |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| d8 15.2 opt, alloc_free_32 | 0.55 | 0.58 | 0.55 | 0.84 | 2.82 | 2.82 | 2.93 |
-| d8 15.2 opt, batch_lifo_32 | 0.91 | 1.10 | 1.00 | 1.29 | 2.83 | 2.83 | 2.86 |
-| wasmtime, alloc_free_32 | 0.71 | 0.89 | 0.72 | 0.91 | 2.82 | 2.82 | 2.97 |
-| JSC, alloc_free_32 | 0.55 | 0.55 | 0.55 | 0.90 | 1.60 | 1.60 | 2.80 |
-| JSC, batch_lifo_32 | 0.92 | 1.07 | 0.99 | 1.24 | 2.13 | 2.13 | 2.18 |
-| node 22 opt, alloc_free_32 | 1.80 | 1.74 | 1.77 | 2.27 | 2.88 | 2.90 | 3.61 |
-| node 22 opt, batch_lifo_32 | 2.09 | 2.21 | 2.21 | 2.67 | 3.57 | 3.57 | 3.55 |
-| native x86_64, alloc_free_32 | 0.36 | 0.71 | 0.53 | - | - | 1.65 | - |
-| d8 15.2 Liftoff, alloc_free_32 | 4.05 | 4.10 | 4.12 | 4.08 | 4.29 | 4.12 | 6.27 |
+| engine, tier | freelist | mimic_lean | mimic_u32_notest | mimic_u32 | mimic_notest | mimic_nozero | mimic | wasmalloc |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| d8 15.2 opt, alloc_free_32 | 0.55 | 0.56 | 0.84 | 1.87 | 2.83 | 2.83 | 2.90 | 2.93 |
+| d8 15.2 opt, batch_lifo_32 | 0.91 | 1.00 | 1.28 | 1.49 | 2.83 | 2.84 | 2.85 | 2.86 |
+| wasmtime, alloc_free_32 | 0.71 | 0.72 | 0.91 | 1.55 | 2.82 | 2.86 | 2.85 | 2.97 |
+| wasmtime, batch_lifo_32 | 1.04 | 1.18 | 1.42 | 1.58 | 2.83 | 2.85 | 2.85 | 2.86 |
+| node 22 opt, alloc_free_32 | 1.80 | 1.77 | 2.27 | 3.24 | 2.92 | 3.29 | 3.47 | 3.61 |
+| node 22 opt, batch_lifo_32 | 2.09 | 2.22 | 2.67 | 3.08 | 3.58 | 3.71 | 3.77 | 3.55 |
+| native x86_64, alloc_free_32 | 0.36 | 0.54 | 0.71 | 1.09 | 1.66 | 1.68 | 1.61 | - |
 
 Reading across: the direct-table indirection is free (`mimic_lean` equals the
-floors on every engine); the `free_is_zero` byte store and the `flags` test are
-free (`mimic_nozero` equals `mimic` everywhere); the difference between the floor
-and `mimic`, 2.3 ns on d8 and wasmtime, 1.1 ns on node and JSC, is the 16-bit
-`used` counter (`mimic_u32` is within 0.35 ns of the floor on d8, wasmtime and JSC,
-and recovers half the gap on node). `mimic` reproduces wasmalloc itself to within
-0.15 ns on d8 and wasmtime and on the batch workloads everywhere, so on those
-engines nothing else in the fast path costs anything measurable. On node the loop
-is another 0.7 ns slower than `mimic`, and on JSC another 1.2 ns on the immediate
-pair (but not on the batch); the mimic carries the same empty std shim call, so
-this remainder is something in how those two engines compile wasmalloc's slightly
-larger loop (109 against 88 wasm instructions), not a memory-traffic difference.
+floor on every engine); the `free_is_zero` byte store is free (`mimic_nozero`
+equals `mimic`); `mimic` reproduces wasmalloc to within 0.15 ns on d8 and
+wasmtime and on the batch workloads, so on those engines the remaining two
+details are the whole gap:
+
+- The 16-bit `used` counter. With the transition test in place, widening it
+  takes d8 from 2.90 to 1.87 ns and wasmtime from 2.85 to 1.55; without the test
+  it takes d8 from 2.83 to 0.84 and wasmtime from 2.82 to 0.91.
+- The transition. On the pair every free empties the page, so every free takes
+  the `used == 0` branch into a cold call (in wasmalloc, `dealloc_transition` then
+  `retire`, which returns at once because the page is already retired). With a
+  32-bit counter the test and call cost 1.0 ns on d8 (0.84 to 1.87), 0.6 on
+  wasmtime and 1.0 on node; with the 16-bit counter they cost almost nothing
+  (2.83 to 2.90 on d8), because the counter's forwarding chain hides the call.
+  On the batch workloads the page empties once per 1000 frees, so only the
+  flags load and the branch remain (0.2 ns on d8, 0.4 on node).
+
+The two effects are not additive, which is why fixing either alone looks
+disappointing and fixing both is not: on d8 the counter alone gains 1.0 ns, the
+call alone gains 0.07, both together gain 2.06.
+
+Applied to wasmalloc itself on branch `tuning-a` (now on main): widening the
+counters (da65f8e) took the d8 pair from 2.92 to 2.4 ns, and skipping the retire
+call when the emptied page is already retired (e38d647) took it to 1.13. Those two
+numbers bracket the mimics (1.87 and 0.84) with a few tenths of a nanosecond of
+real-allocator work left on top, as expected.
 
 Why a u16 costs 2 ns: the loop-carried dependency of the pair runs through the
 header, store `used` in dealloc, load it in the next alloc, store, load in the next
@@ -579,16 +607,17 @@ chain is nearly free for 32-bit and 64-bit accesses (Zen 5 forwards or renames s
 pairs at zero latency; the floors run at 2.7 cycles per pair), but not for the
 16-bit `movw`/`movzwl` pair Cranelift, LLVM and V8 all emit for a `u16` field.
 Each 16-bit forward costs the ordinary 4 to 5 cycles and there are two per pair.
-The effect is microarchitectural and may be smaller on other cores, but the fix is
-free on all of them: make `used` (and, since they share the word, `capacity`) 32
-bits wide. The hot fields still fit the first 32 bytes on wasm32.
+The effect is microarchitectural and may be smaller on other cores; the fix is
+free on all of them and is on main.
 
-Expected result: alloc_free_32 from 2.93 to about 0.9 ns on V8 15.2, JSC and
-wasmtime, and from 3.61 to about 2.3 ns on node 22; batch_lifo/fifo from 2.86 to
-about 1.3 ns. Churn is unaffected (`mimic_u32` equals `mimic` there, both bound by
-cache misses over 10,000 objects) and so is Liftoff. Folding `free_is_zero` into
-the flags byte, roadmap item 2 in the design document, buys no speed; it can stay a
-cleanliness item.
+On node the loop is another 0.15 to 0.7 ns slower than `mimic` and on JSC (2.80
+against a `mimic` of 1.60 measured before the transition was made observable) the
+remainder is larger; that part is in how those engines compile the slightly larger
+loop (109 against 104 wasm instructions), not in the memory traffic. Churn is
+unaffected by any of this (every mimic is slower than wasmalloc there because the
+mimics have no page queues and leak whole pages, so they miss the cache) and so is
+Liftoff, where `mimic_u32` and `mimic` are equal. Folding `free_is_zero` into the
+flags byte, roadmap item 2 in the design document, buys no speed.
 
 **Correction after tuning (2026-09-02).** The mimic floors above were not faithful in one
 respect: LLVM deleted `mimic`'s empty `transition()` and with it the `used == 0` test, so
@@ -755,10 +784,12 @@ non-zero divisor removes the strings and the formatting code they pull in.
 
 In order of expected payoff per line changed:
 
-1. Widen `Page::used` (and `capacity`) to 32 bits. Expected: the 32-byte pair from
-   2.93 to about 0.9 ns on V8 15.2, JSC and wasmtime, from 3.61 to about 2.3 on
-   node 22; batch LIFO and FIFO from 2.9 to about 1.3. Measure with alloc_free_32,
-   batch_lifo_32, batch_fifo_32; churn and Liftoff should not move.
+1. Widen `Page::used` (and `capacity`) to 32 bits and keep a free that empties an
+   already retired page off the cold path. Both are on main (da65f8e, e38d647):
+   the 32-byte pair went from 2.92 to 1.13 ns on d8 in the tuning engineer's
+   measurement, against a floor of 0.55; the full matrix has not been rerun yet.
+   Measure with alloc_free_32, batch_lifo_32, batch_fifo_32; churn and Liftoff
+   should not move.
 2. Replace 4 MiB large pages with header-less runs that grow in place (at the end
    of memory by growing memory), roadmap item 1. Expected: realloc_doubling from
    12 us to under 1 us; vec_push_growth footprint from 288 to about 100 pages;
