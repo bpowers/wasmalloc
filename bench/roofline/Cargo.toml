@@ -30,6 +30,8 @@ mimic = []       # wasmalloc's fast-path memory traffic (direct table, header bo
 mimic_lean = []  # mimic without the used/free_is_zero/flags bookkeeping
 mimic_u32 = []   # mimic with a 32-bit used counter
 mimic_nozero = [] # mimic without the free_is_zero store
+mimic_notest = [] # mimic without the used == 0 || flags test and its cold call
+mimic_u32_notest = [] # mimic with a 32-bit used counter and without the test
 # Incumbents:
 dlmalloc = []    # marker only: std's default #[global_allocator] (dlmalloc port)
 talc = ["dep:talc"]

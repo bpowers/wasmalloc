@@ -10,7 +10,8 @@ tables are regenerated into `results/REPORT.md`.
 
 - `Cargo.toml`: a standalone crate (its own profiles and lockfile). The
   allocator is a cargo feature: `bump`, `freelist`, `sizeclass`, `pages` (floors,
-  in `src/alloc/`), `mimic`, `mimic_lean`, `mimic_u32`, `mimic_nozero` (floors that
+  in `src/alloc/`), `mimic`, `mimic_lean`, `mimic_u32`, `mimic_nozero`, `mimic_notest`,
+  `mimic_u32_notest` (floors that
   reproduce wasmalloc's fast-path memory traffic with one detail changed each,
   see `src/alloc/mimic.rs`), `talc`, `lol_alloc`, `wasmalloc`, or none for std's
   default (`dlmalloc-rs` on wasm32-unknown-unknown, wasi-libc's C dlmalloc on

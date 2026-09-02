@@ -12,7 +12,7 @@ import path from 'node:path';
 
 const dir = process.argv[2] || path.join(path.dirname(new URL(import.meta.url).pathname), 'results');
 
-const VARIANTS = ['bump', 'freelist', 'sizeclass', 'pages', 'mimic', 'mimic_lean', 'mimic_u32', 'mimic_nozero', 'dlmalloc', 'talc', 'lol_alloc', 'wasmalloc'];
+const VARIANTS = ['bump', 'freelist', 'sizeclass', 'pages', 'mimic', 'mimic_lean', 'mimic_u32', 'mimic_nozero', 'mimic_notest', 'mimic_u32_notest', 'dlmalloc', 'talc', 'lol_alloc', 'wasmalloc'];
 const CONFIGS = [
   ['node-default', 'node 22 (V8 12.4), default tiering'],
   ['node-liftoff', 'node 22 (V8 12.4), --liftoff-only'],
@@ -184,7 +184,7 @@ for (const [cfg, title] of CONFIGS) {
   const rows = [];
   for (const [cfg, title] of CONFIGS) {
     for (const wl of ['alloc_free_32', 'alloc_free_32_align16', 'batch_lifo_32', 'batch_fifo_32', 'churn']) {
-      const cells = ['bump', 'freelist', 'sizeclass', 'pages', 'mimic_lean', 'mimic_u32', 'mimic_nozero', 'mimic', 'wasmalloc'].map((v) => resultOf(cfg, v, wl));
+      const cells = ['bump', 'freelist', 'sizeclass', 'pages', 'mimic_lean', 'mimic_u32_notest', 'mimic_notest', 'mimic_u32', 'mimic_nozero', 'mimic', 'wasmalloc'].map((v) => resultOf(cfg, v, wl));
       if (cells.every((c) => !c)) continue;
       rows.push([shortTitle(cfg, title), wl, ...cells.map((c) => (c ? fmt(c.medianNsPerOp) + tierMark(c) : '-'))]);
     }
@@ -192,9 +192,9 @@ for (const [cfg, title] of CONFIGS) {
   if (rows.length) {
     console.log('## The floors, and the two mimics of wasmalloc\'s fast path\n');
     console.log(
-      'Median ns/op of the harness allocators: bump (no free), one LIFO free list, 64 size-class lists keyed by the Layout, size classes recovered from a 64 KiB page header on free, then the mimics of wasmalloc\'s fast path: mimic_lean (a direct table pointing at a page header that holds only the free list head), mimic_u32 (plus a 32-bit used count, the free_is_zero byte and the flags test), mimic_nozero (a 16-bit used count and the flags test, no free_is_zero store) and mimic (wasmalloc\'s exact header traffic: 16-bit used count, free_is_zero store, flags test), against wasmalloc itself.\n'
+      'Median ns/op of the harness allocators: bump (no free), one LIFO free list, 64 size-class lists keyed by the Layout, size classes recovered from a 64 KiB page header on free, then the mimics of wasmalloc\'s fast path: mimic_lean (a direct table pointing at a page header that holds only the free list head), mimic_u32_notest (plus a 32-bit used count and the free_is_zero store, no transition test), mimic_notest (a 16-bit used count and the free_is_zero store, no transition test), mimic_u32 (32-bit count, free_is_zero store, and the used == 0 || flags test with its cold call), mimic_nozero (16-bit count and the test, no free_is_zero store) and mimic (the header traffic of wasmalloc as first measured: 16-bit count, free_is_zero store, test and cold call), against wasmalloc itself.\n'
     );
-    console.log(table(['engine/tier', 'workload', 'bump', 'freelist', 'sizeclass', 'pages', 'mimic_lean', 'mimic_u32', 'mimic_nozero', 'mimic', 'wasmalloc'], rows));
+    console.log(table(['engine/tier', 'workload', 'bump', 'freelist', 'sizeclass', 'pages', 'mimic_lean', 'mimic_u32_notest', 'mimic_notest', 'mimic_u32', 'mimic_nozero', 'mimic', 'wasmalloc'], rows));
     console.log('');
   }
 }

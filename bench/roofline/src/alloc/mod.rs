@@ -89,6 +89,8 @@ const ENABLED: usize = count_enabled!(
     "mimic_lean",
     "mimic_u32",
     "mimic_nozero",
+    "mimic_notest",
+    "mimic_u32_notest",
     "dlmalloc",
     "talc",
     "lol_alloc",
@@ -98,7 +100,7 @@ const ENABLED: usize = count_enabled!(
 #[allow(dead_code)]
 const _: () = assert!(
     ENABLED <= 1,
-    "enable at most one allocator feature (bump, freelist, sizeclass, pages, mimic, mimic_lean, mimic_u32, mimic_nozero, dlmalloc, talc, lol_alloc, wasmalloc)"
+    "enable at most one allocator feature (bump, freelist, sizeclass, pages, mimic, mimic_lean, mimic_u32, mimic_nozero, mimic_notest, mimic_u32_notest, dlmalloc, talc, lol_alloc, wasmalloc)"
 );
 
 // The floor allocators are always compiled so that they can share code
@@ -158,7 +160,7 @@ mod selected {
     pub const NAME: &str = "mimic";
     pub const DETAIL: &str = "wasmalloc's fast-path memory traffic (direct table, page header with used/free_is_zero/flags) and nothing else";
     #[global_allocator]
-    static GLOBAL: super::mimic::Mimic<false, false, false> = super::mimic::Mimic::new();
+    static GLOBAL: super::mimic::Mimic<false, false, false, false> = super::mimic::Mimic::new();
     pub fn reset() {
         GLOBAL.reset();
     }
@@ -169,7 +171,7 @@ mod selected {
     pub const NAME: &str = "mimic_lean";
     pub const DETAIL: &str = "mimic without the used/free_is_zero/flags bookkeeping: direct table and page-header free list only";
     #[global_allocator]
-    static GLOBAL: super::mimic::Mimic<true, false, false> = super::mimic::Mimic::new();
+    static GLOBAL: super::mimic::Mimic<true, false, false, false> = super::mimic::Mimic::new();
     pub fn reset() {
         GLOBAL.reset();
     }
@@ -180,7 +182,7 @@ mod selected {
     pub const NAME: &str = "mimic_u32";
     pub const DETAIL: &str = "mimic with the used counter read and written as a 32-bit word";
     #[global_allocator]
-    static GLOBAL: super::mimic::Mimic<false, true, false> = super::mimic::Mimic::new();
+    static GLOBAL: super::mimic::Mimic<false, true, false, false> = super::mimic::Mimic::new();
     pub fn reset() {
         GLOBAL.reset();
     }
@@ -191,7 +193,29 @@ mod selected {
     pub const NAME: &str = "mimic_nozero";
     pub const DETAIL: &str = "mimic without the free_is_zero store on free";
     #[global_allocator]
-    static GLOBAL: super::mimic::Mimic<false, false, true> = super::mimic::Mimic::new();
+    static GLOBAL: super::mimic::Mimic<false, false, true, false> = super::mimic::Mimic::new();
+    pub fn reset() {
+        GLOBAL.reset();
+    }
+}
+
+#[cfg(feature = "mimic_notest")]
+mod selected {
+    pub const NAME: &str = "mimic_notest";
+    pub const DETAIL: &str = "mimic without the used == 0 || flags test and its cold call";
+    #[global_allocator]
+    static GLOBAL: super::mimic::Mimic<false, false, false, true> = super::mimic::Mimic::new();
+    pub fn reset() {
+        GLOBAL.reset();
+    }
+}
+
+#[cfg(feature = "mimic_u32_notest")]
+mod selected {
+    pub const NAME: &str = "mimic_u32_notest";
+    pub const DETAIL: &str = "mimic with a 32-bit used counter and without the transition test";
+    #[global_allocator]
+    static GLOBAL: super::mimic::Mimic<false, true, false, true> = super::mimic::Mimic::new();
     pub fn reset() {
         GLOBAL.reset();
     }
@@ -248,6 +272,8 @@ mod selected {
     feature = "mimic_lean",
     feature = "mimic_u32",
     feature = "mimic_nozero",
+    feature = "mimic_notest",
+    feature = "mimic_u32_notest",
     feature = "talc",
     feature = "lol_alloc",
     feature = "wasmalloc"
