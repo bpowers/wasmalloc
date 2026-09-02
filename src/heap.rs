@@ -22,6 +22,15 @@
 //! load, one `free` load, a compare, and a pop, with no bin arithmetic and no initialisation
 //! check (mimalloc's `pages_free_direct` and `_mi_theap_empty`).
 //!
+//! # Page release
+//!
+//! An empty page is retired rather than freed (mimalloc's `MI_RETIRE_CYCLES` scheme, see
+//! [`RETIRE_CYCLES`]) so that a size class that oscillates between empty and one block keeps
+//! its page; retired pages age at each collection (every [`GENERIC_COLLECT_PERIOD`] slow-path
+//! allocations and before a fresh page is taken) and are released when their count runs out.
+//! They are also all released before linear memory is grown, whatever their count: growth is
+//! permanent footprint on wasm, a released page is only a page initialisation away.
+//!
 //! # Fast paths
 //!
 //! [`Heap::alloc`], [`Heap::alloc_zeroed`] and [`Heap::dealloc`] are the only inlined entry
@@ -356,17 +365,7 @@ impl<M: Memory, const WORDS: usize> Heap<M, WORDS> {
                     unsafe { self.collect_retired(false) };
                 }
                 // SAFETY: heap invariants hold between operations.
-                let mut found = unsafe { self.find_page(bin) };
-                if found.is_none() {
-                    // Out of memory: release every retired page and try once more, as mimalloc
-                    // does, before reporting failure.
-                    // SAFETY: as above.
-                    unsafe {
-                        self.collect_retired(true);
-                        found = self.find_page(bin);
-                    }
-                }
-                let page = found?;
+                let page = unsafe { self.find_page(bin) }?;
                 // SAFETY: find_page returns a page of this heap with a non-empty free list.
                 let block = unsafe { page::pop(page, &self.mem) };
                 debug_assert!(block.is_some());
@@ -395,13 +394,7 @@ impl<M: Memory, const WORDS: usize> Heap<M, WORDS> {
         let count = huge_slices(layout);
         // Alignments up to a slice are satisfied by slice alignment; larger ones align the run.
         let align = layout.align().div_ceil(SLICE_SIZE).max(1);
-        let mut run = self.acquire_run(count, align, top);
-        if run.is_none() {
-            // SAFETY: heap invariants hold between operations.
-            unsafe { self.collect_retired(true) };
-            run = self.acquire_run(count, align, false);
-        }
-        let run = run?;
+        let run = self.acquire_run(count, align, top)?;
         let addr = run.start * SLICE_SIZE;
         let p = self.mem.ptr(addr);
         if zero && !run.zeroed {
@@ -412,8 +405,12 @@ impl<M: Memory, const WORDS: usize> Heap<M, WORDS> {
         Some(unsafe { NonNull::new_unchecked(p) })
     }
 
-    /// The lowest fit, growing memory if nothing fits; with `top`, the bottom of the free tail
-    /// first, when it is long enough, so no memory is grown for a run a hole could hold.
+    /// Slices for a page or a run: the lowest fit, or with `top` the bottom of the free tail
+    /// first when it is long enough, so no memory is grown for a run a hole could hold. When
+    /// nothing fits, every retired page is released and the map searched again before memory
+    /// is grown: linear memory never shrinks, so a grow is footprint for good, while a released
+    /// page costs one page initialisation if its bin comes back. mimalloc only ages its retired
+    /// pages at this point; it has an OS to return memory to.
     fn acquire_run(&mut self, count: usize, align: usize, top: bool) -> Option<slices::Run> {
         if top {
             let end = self.mem.size_slices();
@@ -421,6 +418,11 @@ impl<M: Memory, const WORDS: usize> Heap<M, WORDS> {
                 return Some(run);
             }
         }
+        if let Some(run) = self.slices.alloc(count, align) {
+            return Some(run);
+        }
+        // SAFETY: heap invariants hold between operations.
+        unsafe { self.collect_retired(true) };
         slices::acquire(&mut self.slices, &mut self.mem, count, align, &self.policy)
     }
 
@@ -563,7 +565,7 @@ impl<M: Memory, const WORDS: usize> Heap<M, WORDS> {
     fn fresh_page(&mut self, bin: u8) -> Option<*mut Page> {
         let kind = bins::kind_of_bin(bin);
         let n = kind.page_size() / SLICE_SIZE;
-        let run = slices::acquire(&mut self.slices, &mut self.mem, n, n, &self.policy)?;
+        let run = self.acquire_run(n, n, false)?;
         let addr = run.start * SLICE_SIZE;
         // SAFETY: the run is `n` fresh slices aligned to the page size (acquire honours `align`),
         // owned by nothing else; `kind` is the kind of `bin`.
@@ -606,8 +608,15 @@ impl<M: Memory, const WORDS: usize> Heap<M, WORDS> {
         }
     }
 
-    /// Age retired pages at the heads of their queues and release the expired ones
-    /// (`_mi_theap_collect_retired`). With `force`, release every retired page now.
+    /// Age the retired pages among the first [`RETIRE_MAX_PAGES`] of each queue in the retired
+    /// range and release the expired ones (`_mi_theap_collect_retired`). With `force`, release
+    /// every retired page seen. A page that was reused and is no longer empty is simply
+    /// un-retired.
+    ///
+    /// Unlike mimalloc, the scan does not stop at the first page that is not retired: a page
+    /// that came back into use and was moved to the front of its queue would otherwise hide the
+    /// retired pages behind it, and [`acquire_run`](Self::acquire_run) relies on a forced
+    /// collection to release those before memory is grown.
     unsafe fn collect_retired(&mut self, force: bool) {
         let (lo, hi) = (self.retired_min, self.retired_max);
         let mut min = QUEUE_COUNT;
@@ -620,20 +629,19 @@ impl<M: Memory, const WORDS: usize> Heap<M, WORDS> {
                     let page = self.page_at(cur);
                     // SAFETY: queue members are live pages of this heap.
                     unsafe {
-                        if (*page).retire_expire == 0 {
-                            break;
-                        }
                         let next = (*page).next;
-                        if page::all_free(page) {
-                            (*page).retire_expire -= 1;
-                            if (*page).retire_expire == 0 || force {
-                                self.free_page(page, qi);
+                        if (*page).retire_expire != 0 {
+                            if page::all_free(page) {
+                                (*page).retire_expire -= 1;
+                                if (*page).retire_expire == 0 || force {
+                                    self.free_page(page, qi);
+                                } else {
+                                    min = min.min(qi);
+                                    max = max.max(qi);
+                                }
                             } else {
-                                min = min.min(qi);
-                                max = max.max(qi);
+                                (*page).retire_expire = 0;
                             }
-                        } else {
-                            (*page).retire_expire = 0;
                         }
                         cur = next;
                     }
@@ -1099,6 +1107,103 @@ mod tests {
                 "retired page released after RETIRE_CYCLES"
             );
             assert!(h.slices.is_free(page_addr / SLICE_SIZE));
+        }
+        validate(h);
+    }
+
+    #[test]
+    fn retired_pages_are_released_before_memory_grows() {
+        // Four initial slices, one page each for four bins, then all four blocks freed: four
+        // retired pages and an empty map.
+        let mut f = heap(64, 4, 0);
+        let h = &mut f.heap;
+        let sizes = [16usize, 24, 32, 40];
+        unsafe {
+            let blocks: Vec<_> = sizes
+                .iter()
+                .map(|&s| h.alloc(layout(s, 8)).unwrap())
+                .collect();
+            let end = h.mem.size_slices();
+            assert_eq!(h.free_slices(), 0);
+            for (p, &s) in blocks.iter().zip(&sizes) {
+                h.dealloc(*p, layout(s, 8));
+            }
+            for s in &sizes {
+                let qi = bins::bin(*s) as usize;
+                assert_eq!(h.queues[qi].count, 1, "page of bin {qi} retired, not freed");
+            }
+            validate(h);
+            // A fifth bin needs a page: the retired ones are released and one of their slices
+            // is reused instead of growing memory.
+            let e = h.alloc(layout(48, 8)).unwrap();
+            assert_eq!(h.mem.size_slices(), end, "no memory.grow");
+            for s in &sizes {
+                assert_eq!(h.queues[bins::bin(*s) as usize].count, 0);
+            }
+            assert_eq!(h.free_slices(), 3);
+            validate(h);
+            // Three of the released bins come back with a fresh page each from the map.
+            let again: Vec<_> = sizes[..3]
+                .iter()
+                .map(|&s| h.alloc(layout(s, 8)).unwrap())
+                .collect();
+            assert_eq!(h.free_slices(), 0);
+            assert_eq!(h.mem.size_slices(), end);
+            // And once the map is empty with nothing retired, memory does grow.
+            let g = h.alloc(layout(sizes[3], 8)).unwrap();
+            assert!(h.mem.size_slices() > end);
+            h.dealloc(g, layout(sizes[3], 8));
+            h.dealloc(e, layout(48, 8));
+            for (p, &s) in again.iter().zip(&sizes) {
+                h.dealloc(*p, layout(s, 8));
+            }
+        }
+        validate(h);
+    }
+
+    #[test]
+    fn a_forced_collection_reaches_a_retired_page_behind_a_page_in_use() {
+        let mut f = heap(64, 8, 0);
+        let h = &mut f.heap;
+        let l = layout(16, 8);
+        let per_page = bins::blocks_per_page(PageKind::Small, 16);
+        let qi = bins::bin(16) as usize;
+        unsafe {
+            // Fill pages A and B (each moves to the full queue when the next allocation finds
+            // it full) and start page C, which is the queue's only member.
+            let a: Vec<_> = (0..per_page).map(|_| h.alloc(l).unwrap()).collect();
+            let b: Vec<_> = (0..per_page).map(|_| h.alloc(l).unwrap()).collect();
+            let c = h.alloc(l).unwrap();
+            let page_a = page::header_of(PageKind::Small, a[0].as_ptr() as usize);
+            let page_b = page::header_of(PageKind::Small, b[0].as_ptr() as usize);
+            let page_c = page::header_of(PageKind::Small, c.as_ptr() as usize);
+            assert_eq!(h.queues[qi].count, 1);
+            assert_eq!(h.queues[qi].first, page_c);
+            assert_eq!(h.queues[FULL_QUEUE].count, 2);
+            // One block of A back: A returns to the end of the bin queue. Then B is emptied: its
+            // first free puts it behind A, the last one retires it.
+            h.dealloc(a[0], l);
+            for p in b {
+                h.dealloc(p, l);
+            }
+            assert_eq!(h.queues[qi].first, page_c);
+            assert_eq!(h.queues[qi].last, page_b);
+            assert_eq!(h.queues[qi].count, 3);
+            assert_eq!((*h.page_at(page_c)).retire_expire, 0);
+            assert_eq!((*h.page_at(page_a)).retire_expire, 0);
+            assert_ne!((*h.page_at(page_b)).retire_expire, 0);
+            validate(h);
+            // Two pages in use precede B; the forced collection still releases it.
+            h.collect_retired(true);
+            assert_eq!(h.queues[qi].count, 2);
+            assert_eq!(h.queues[qi].first, page_c);
+            assert_eq!(h.queues[qi].last, page_a);
+            assert!(h.slices.is_free(page_b / SLICE_SIZE));
+            validate(h);
+            h.dealloc(c, l);
+            for p in &a[1..] {
+                h.dealloc(*p, l);
+            }
         }
         validate(h);
     }
