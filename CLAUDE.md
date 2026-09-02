@@ -52,6 +52,8 @@ PATH first: `export PATH="$HOME/.wasmtime/bin:$PATH"`.
   linear memory).
 - `bench/` - benchmark harness (roofline and workloads; allocator chosen by cargo feature).
 - `scripts/` - `kani` and `memlimit` wrappers (mandatory for verifier runs).
+- `build.rs` - links this package's wasi test binaries with an 8 MiB initial memory so the
+  linker-gap test in `tests/wasi_libc_gap.rs` has whole slices to check.
 - `fuzz/`, `verify/` - fuzz targets and Kani harnesses.
 - `docs/design/`, `docs/research/`, `docs/soundness-ledger.md`.
 

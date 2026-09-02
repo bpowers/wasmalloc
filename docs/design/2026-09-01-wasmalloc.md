@@ -58,8 +58,11 @@ minimization as goals (smaller is welcome, not required).
 
 ### Memory layout
 
-- The heap is the linear memory from `align_up(__heap_base, 16)` to `memory.size() * 64 KiB`,
-  extended by `memory.grow`. It is managed as an array of 64 KiB *slices* (mimalloc's
+- The heap is the linear memory from the backend's heap base to `memory.size() * 64 KiB`,
+  extended by `memory.grow`. The base is `__heap_base` on `wasm32-unknown-unknown`; on wasi it
+  is the end of the memory present at the heap's first allocation, because wasi-libc's dlmalloc
+  owns `[__heap_base, __heap_end)` and std reaches it even with this crate installed (review
+  finding R-1, 2026-09-02). It is managed as an array of 64 KiB *slices* (mimalloc's
   `MI_ARENA_SLICE_SIZE` on 64-bit; we deliberately do not adopt the 32 KiB slices mimalloc
   uses on 32-bit hosts, because the wasm page is 64 KiB).
 - A bitmap indexed by absolute slice number (`addr >> 16`; 65536 bits, 8 KiB, static) records
@@ -76,10 +79,11 @@ minimization as goals (smaller is welcome, not required).
   C.8), so growth is geometric: grow by `max(needed, clamp(heap_size / 8, 1 MiB, 64 MiB))`
   (an eighth, not a half: the half-heap step overshot the peak by up to 50 percent, tuning log
   2026-09-02), rounded to whole slices, and before growing at all release every retired page
-  (a grow is footprint for good; a released page is one page initialisation away). Reclaim the
-  linker gap between `__heap_base` and the initial
+  (a grow is footprint for good; a released page is one page initialisation away). On
+  `wasm32-unknown-unknown`, reclaim the linker gap between `__heap_base` and the initial
   `memory.size()` as the first free slices instead of paying a grow for the first page (std's
-  dlmalloc 0.2.11 wastes that gap). Growth must be sized from the rounded, aligned request
+  dlmalloc 0.2.11 wastes that gap); on wasi the gap is wasi-libc's, so nothing is reclaimed and
+  the first page costs a grow. Growth must be sized from the rounded, aligned request
   (talc 5.0.3 undersized growth and spun to the 4 GiB limit) and must tolerate `memory.grow`
   returning `usize::MAX` (failure at the 4 GiB or host limit: return null so std reports OOM)
   and non-contiguous results (something else grew memory in between): the returned page index

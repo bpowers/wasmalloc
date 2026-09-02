@@ -26,7 +26,9 @@ pub const MAX_SLICE_INDEX: usize = (1 << 16) - 1;
 ///   most [`MAX_SLICE_INDEX`].
 /// - `size_slices()` is the current end of memory in slices and never decreases.
 /// - `heap_base()` is the first address the allocator may use; all memory from there to the end
-///   of memory, except what `grow` has not yet handed out, is exclusively the allocator's.
+///   of memory at the time of the call, except what `grow` has not yet handed out, is
+///   exclusively the allocator's. The heap reads it once, when it initialises at its first
+///   allocation, so a backend may derive it from the state of memory at that moment.
 /// - `ptr(addr)` yields a pointer valid for reads and writes at every address the allocator
 ///   owns, carrying provenance for the whole owned region, so pointer arithmetic that stays
 ///   inside owned memory is defined behaviour.
@@ -34,7 +36,9 @@ pub const MAX_SLICE_INDEX: usize = (1 << 16) - 1;
 ///   turns page header pointers back into addresses (queue links, `page::extend`, `free_page`,
 ///   `header_of`), so a backend that placed memory elsewhere would break it.
 pub unsafe trait Memory {
-    /// First address the allocator may use (the linker's `__heap_base` on wasm).
+    /// First address the allocator may use. Read once by the heap, at its first allocation;
+    /// everything from here to the end of memory at that moment becomes free slices before
+    /// memory is ever grown (see [`crate::slices::initial_free_range`]).
     fn heap_base(&self) -> usize;
 
     /// Current size of linear memory in slices.
@@ -49,23 +53,60 @@ pub unsafe trait Memory {
 }
 
 /// Real wasm linear memory number 0.
+///
+/// Where the heap starts depends on the target (`wasm_heap_base`): on
+/// `wasm32-unknown-unknown` at the linker's `__heap_base`, so the gap from there to the end of
+/// the initial memory is used before the first `memory.grow`; on wasi at the end of the memory
+/// that exists at the first allocation, because wasi-libc's malloc owns that gap.
 #[cfg(target_arch = "wasm32")]
 #[derive(Debug, Default)]
 pub struct WasmMemory;
 
+/// The heap base on `wasm32-unknown-unknown`: the linker's `__heap_base`, the end of static data
+/// and the shadow stack. Nothing on this target allocates linear memory between it and the
+/// initial `memory.size` except an allocator, and std's own (`System`, dlmalloc-rs) is replaced
+/// by this crate as the global allocator and never called by std directly. The one way to break
+/// this is a program that also allocates through `std::alloc::System` explicitly: dlmalloc-rs
+/// 0.2.13 and later donate `[__heap_base, __heap_end)` to themselves on their first allocation
+/// (Rust 1.95's std ships 0.2.11, which does not reference `__heap_base`). That is unsupported.
+#[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
+#[inline]
+fn wasm_heap_base() -> usize {
+    unsafe extern "C" {
+        static __heap_base: u8;
+    }
+    core::ptr::addr_of!(__heap_base) as usize
+}
+
+/// The heap base on wasi (`wasm32-wasip1` and `wasip2`): the end of linear memory at the time
+/// of the call. wasi-libc's dlmalloc makes `[__heap_base, __heap_end)` its first segment the
+/// first time any libc `malloc` runs (`try_init_allocator` in its dlmalloc/src/malloc.c), and
+/// std reaches libc `malloc` even with this crate installed as the global allocator
+/// (`__wasilibc_populate_preopens`, `__wasilibc_initialize_environ`, `opendir`). So the linker
+/// gap is not ours, and neither is anything dlmalloc has grown memory for since, all of which
+/// lies below the current end. Starting there makes the initial free range empty: every slice
+/// this heap ever owns comes from its own `memory.grow` calls, whose pages nobody else learns
+/// of. The heap reads the base once, at its first allocation, so later growth by either
+/// allocator only makes the other's regions non-contiguous, which both tolerate.
+///
+/// A full 4 GiB memory has no end address in a wasm32 `usize`; saturating puts the base in the
+/// last slice, which the heap treats as "nothing usable" (`slices::initial_free_range`).
+#[cfg(all(target_arch = "wasm32", target_os = "wasi"))]
+#[inline]
+fn wasm_heap_base() -> usize {
+    core::arch::wasm32::memory_size(0).saturating_mul(SLICE_SIZE)
+}
+
 #[cfg(target_arch = "wasm32")]
-// SAFETY: `memory.grow` returns fresh zero pages by the wasm specification and they are exclusively
-// ours because nothing else in a single-threaded Rust wasm program allocates linear memory
-// (std's own allocator is replaced by this crate). `__heap_base` is set by wasm-ld to the end of
-// data and stack. Linear memory is one allocation, so an exposed-provenance pointer to any
-// address in it is valid.
+// SAFETY: `memory.grow` returns fresh zero pages by the wasm specification, and nothing else
+// learns their index, so they are exclusively ours whoever else grows memory (the contract
+// allows the resulting non-contiguity). `wasm_heap_base` names memory nothing else uses, per
+// target as documented there. `memory.size` never decreases. Linear memory is one allocation,
+// so an exposed-provenance pointer to any address in it is valid and has that address.
 unsafe impl Memory for WasmMemory {
     #[inline]
     fn heap_base(&self) -> usize {
-        unsafe extern "C" {
-            static __heap_base: u8;
-        }
-        core::ptr::addr_of!(__heap_base) as usize
+        wasm_heap_base()
     }
 
     #[inline]

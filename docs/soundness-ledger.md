@@ -332,8 +332,11 @@ zeroing block; in `alloc_huge`, the `write_bytes` and `NonNull::new_unchecked`; 
 
 - Preconditions: as HEAP-01; heap invariants hold at entry.
 - Invariants relied on: the `slices` contract (a returned run was free, hence owned and
-  unreferenced, and is claimed now); page invariants of the page `find_page` returns; heap
-  invariants between operations for the collections.
+  unreferenced, and is claimed now), whose ownership of the initial free range is the `Memory`
+  contract's per-target claim (BACKEND-02: on `wasm32-unknown-unknown` the linker gap is unused
+  by anything else; on wasi the range is empty and every slice comes from this heap's own
+  `memory.grow`); page invariants of the page `find_page` returns; heap invariants between
+  operations for the collections; `heap_base > 0` (below).
 - Proof sketch. `find_page` returns a queue member of `bin` whose free list is non-empty (it
   found one, extended an expandable one, or built a fresh one and extended it, HEAP-06), so
   `pop` meets PAGE-02 and returns a block; if it did not, the release build returns `None`
@@ -345,7 +348,15 @@ zeroing block; in `alloc_huge`, the `write_bytes` and `NonNull::new_unchecked`; 
   owns; it is skipped only when every slice still had its zero bit, which `slices` sets only for
   regions fresh from `grow` and clears on every hand-out, so the memory is zero by the `Memory`
   contract. Non-null: a run starts at or above the first whole slice at or above `heap_base`,
-  which is positive on wasm (data and stack precede it) and a host address in the simulation.
+  so its address is at least `SLICE_SIZE` provided `heap_base > 0`; the `slices` module does not
+  exclude slice 0 on its own, so a zero heap base would let a run (or a page, whose blocks
+  start 64 bytes in and are non-null regardless) sit at address 0. The assumption holds on
+  every target: on `wasm32-unknown-unknown` `__heap_base` follows the shadow stack (1 MiB by
+  default, placed first by rustc's `--stack-first`) and the data segments, so it is positive for
+  every layout Rust produces; on wasi it is the end of a memory that holds at least the stack
+  and data, so at least `SLICE_SIZE`; in the simulation it is a host address inside a live
+  region. A structural guard (never adding slice 0 to the map, as slice 65535 is never added)
+  would remove the assumption and is noted as a follow-up.
   Both `collect_retired` calls happen with no page pointer held by the caller: `alloc_generic`
   calls it before `find_page`, and `acquire_run` before growing, when `fresh_page` and
   `alloc_huge` have not yet chosen a run; the heap invariants therefore hold at those points.
@@ -359,10 +370,10 @@ zeroing block; in `alloc_huge`, the `write_bytes` and `NonNull::new_unchecked`; 
   the fuzz targets. Miri as above.
 - Not machine-checked by Kani: `alloc_huge` itself (no run fits the one-slice model alongside a
   page); tests only.
-- Reviewer: adversarial-reviewer, 2026-09-02: accepted. Caveat: the non-null argument for runs
-  rests on `__heap_base > 0` (slice 0 is handed out only when the heap base is 0), true for every
-  wasm-ld layout but unstated (R-4); and on wasi targets the exclusivity the `slices` contract
-  inherits from `Memory::heap_base` is broken by R-1 (see BACKEND-02).
+- Changes: 2026-09-02, the `heap_base > 0` assumption and the per-target ownership of the
+  initial free range are now stated above (R-3, R-4); no code in these blocks changed.
+- Reviewer: adversarial-reviewer, 2026-09-02: accepted with two caveats (R-3, R-4), both
+  addressed in the text above on 2026-09-02; fresh review of the wording pending.
 
 ### HEAP-05: the queue operations and `page_at`
 
@@ -547,7 +558,8 @@ Blocks: `&mut *self.heap.get()`, and in each method the call into the heap, with
 - Machine checks: as GLOBAL-02; the model tester (`tests/model_heap.rs`, `tests/model_system.rs`
   against `System` for the tester's own soundness, `tests/model_mutants.rs` for its power).
 - Reviewer: adversarial-reviewer, 2026-09-02: accepted. Caveat: discharged among this allocator's
-  own blocks; on wasi targets wasi-libc's malloc hands out the same bytes (R-1).
+  own blocks; on wasi targets wasi-libc's malloc handed out the same bytes (R-1), resolved on
+  2026-09-02 by BACKEND-02's per-target heap base.
 
 ## backend
 
@@ -565,25 +577,53 @@ below argue that the implementations meet it.
 
 ### BACKEND-02: `unsafe impl Memory for WasmMemory`
 
-- Proof sketch: `heap_base` takes the address of the linker-provided `__heap_base` symbol with
-  `addr_of!`, never reading it; wasm-ld defines it for every wasm32 target as the end of static
-  data and the shadow stack, so memory from there to `memory.size()` is unused by the program
-  (the contract's exclusivity for the linker gap). `memory.grow` returns fresh pages that the
-  specification zero-fills, contiguous with the previous end unless another party grew memory in
-  between, in which case the returned index is still the start of our region and the contract
-  allows the gap (`slices::acquire` and `extend_with_growth` handle it). `memory.size` never
-  decreases. `ptr` is `with_exposed_provenance_mut(addr)`: linear memory is one allocation in
-  Rust's model of wasm, every address below `memory.size() * SLICE_SIZE` is valid, and the
-  returned pointer has address `addr`. `grow` maps the `usize::MAX` failure code to `None`.
-  Assumption to keep in view: nothing else in the module allocates linear memory it expects to
-  keep from the region between `__heap_base` and the memory end that existed at the first
-  allocation, or from regions `memory.grow` returns to us; a second allocator or hand-written
-  `memory.grow` in the same module is compatible only if it never touches slices this
-  allocator has been given (it may grow memory itself; that only makes our regions
-  non-contiguous).
-- Machine checks: `tests/global_wasm.rs` under wasmtime; the wasm32-wasip1 unit tests exercise
-  the slice logic against `SimMemory`, not this backend.
-- Reviewer: adversarial-reviewer, 2026-09-02: REJECTED, see review findings R-1.
+- Proof sketch. `grow`: `memory.grow` returns fresh pages that the specification zero-fills,
+  contiguous with the previous end unless another party grew memory in between, in which case
+  the returned index is still the start of our region and the contract allows the gap
+  (`slices::acquire` and `extend_with_growth` handle it); nothing else learns the index, so the
+  pages are exclusively ours. `size_slices` is `memory.size`, which never decreases. `ptr` is
+  `with_exposed_provenance_mut(addr)`: linear memory is one allocation in Rust's model of wasm,
+  every address below `memory.size() * SLICE_SIZE` is valid, and the returned pointer has
+  address `addr`. `grow` maps the `usize::MAX` failure code to `None`. `heap_base` is read by
+  the heap once, in `ensure_init`, and what it claims for the allocator is per target
+  (`wasm_heap_base`):
+  - `wasm32-unknown-unknown`: the address of the linker-provided `__heap_base` symbol, taken
+    with `addr_of!` and never read. wasm-ld defines it as the end of static data and the shadow
+    stack, and nothing in a Rust program on this target allocates linear memory between it and
+    the initial `memory.size` except an allocator: std's is `System` (dlmalloc-rs), which this
+    crate replaces as the global allocator and which std never calls directly, so the gap is
+    unused. Checked against the std of Rust 1.95: its `libdlmalloc` rlib for this target is
+    dlmalloc 0.2.11 and contains no reference to `__heap_base`. The one way to break this is a
+    program that also allocates through `std::alloc::System` explicitly, since dlmalloc-rs 0.2.13
+    and later donate `[__heap_base, __heap_end)` to themselves on their first allocation; that
+    combination is unsupported.
+  - wasi (`target_os = "wasi"`, so wasip1 and wasip2): `memory.size * SLICE_SIZE` at the time
+    of the call, saturating (a 4 GiB memory puts the base in the last slice, which
+    `initial_free_range` and `usable_limit` treat as nothing usable). wasi-libc's dlmalloc makes
+    `[__heap_base, __heap_end)` its first segment the first time any libc `malloc` runs
+    (`try_init_allocator`), and std reaches libc `malloc` even with this crate installed
+    (`__wasilibc_populate_preopens`, `__wasilibc_initialize_environ`, `opendir`), so the gap is
+    not ours; anything dlmalloc grows memory for afterwards is its own too, and lies below the
+    end of memory at our first allocation. With the base at that end the initial free range is
+    empty and every slice this heap ever owns comes from its own `memory.grow`, whose pages
+    nobody else learns of. Growth by either allocator in between only makes the other's regions
+    non-contiguous, which both tolerate.
+- Assumption to keep in view: a second allocator or hand-written `memory.grow` in the same
+  module is compatible only if it never touches slices this allocator has been given (it may
+  grow memory itself); on `wasm32-unknown-unknown` it must also leave the linker gap alone.
+- Machine checks: `tests/wasi_libc_gap.rs` under wasmtime, linked with an 8 MiB initial memory
+  by `build.rs` (`rustc-link-arg-tests`, so the roofline harness keeps its default layout) so
+  that the gap holds about a hundred whole slices: no block or run of this heap lies in
+  `[__heap_base, __heap_end)`, a libc `malloc` block covering three quarters of the gap is
+  disjoint from every live block, and writes through either leave the other intact. Before the
+  change the first assertion failed with a run at `[0x260000, 0x270000)` inside the gap
+  `[0x115490, 0x800000)`. `tests/global_wasm.rs` under wasmtime with the same link. The
+  wasm32-wasip1 unit tests exercise the slice logic against `SimMemory`, not this backend.
+- Changes: 2026-09-02, `heap_base` made target-dependent as above (review finding R-1: the
+  previous entry claimed the gap for every target, which is false on wasi, where the two
+  allocators handed out the same bytes whenever the gap held a whole slice).
+- Reviewer: adversarial-reviewer, 2026-09-02: REJECTED (R-1) before the change above. Fresh
+  review of the rewritten entry pending.
 
 ### BACKEND-03: `SimMemory::from_region`, `SimMemory::grow` and `unsafe impl Memory for SimMemory`
 

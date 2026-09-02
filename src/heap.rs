@@ -489,8 +489,10 @@ impl<M: Memory, const WORDS: usize> Heap<M, WORDS> {
         self.initialized = true;
         let heap_base = self.mem.heap_base();
         self.slices.init(heap_base / SLICE_SIZE);
-        // The linker leaves a gap between the heap base and the end of the initial memory; use
-        // it before paying for a memory.grow. Its contents are not guaranteed zero.
+        // Whatever lies between the heap base and the end of the initial memory is ours by the
+        // `Memory` contract (the linker gap on wasm32-unknown-unknown; nothing on wasi, where the
+        // backend starts at the end of memory because wasi-libc's malloc owns the gap); use it
+        // before paying for a memory.grow. Its contents are not guaranteed zero.
         let (first, count) = slices::initial_free_range(heap_base, self.mem.size_slices());
         if count > 0 {
             self.slices.add_free(first, count, false);
