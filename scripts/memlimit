@@ -54,9 +54,11 @@ if command -v systemd-run >/dev/null 2>&1 \
   set -e
   if [ -z "${MEMLIMIT_QUIET:-}" ]; then
     # Give journald a moment to record the scope's exit accounting.
+    # grep exits 1 when the line is not there yet; that must not trip errexit/pipefail.
+    line=""
     for _ in 1 2 3 4 5; do
       line=$(journalctl --user -q --no-pager -o cat -u "$unit.scope" 2>/dev/null \
-             | grep -E 'memory peak|oom-kill' | tail -2 | tr '\n' ' ')
+             | { grep -E 'memory peak|oom-kill' || true; } | tail -2 | tr '\n' ' ')
       [ -n "$line" ] && break
       sleep 0.2
     done
