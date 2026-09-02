@@ -3,15 +3,15 @@
   "engineVersion": "V8 15.2.124",
   "flags": "--no-liftoff",
   "note": null,
-  "wasm": "/home/bpowers/src/wasm-clalloc/.worktrees/roofline/bench/roofline/target/dist/wasmalloc-release-z-nolto-wasmopt.wasm",
+  "wasm": "/home/bpowers/src/wasm-clalloc/bench/roofline/target/dist/wasmalloc-release-z-nolto-wasmopt.wasm",
   "variant": "wasmalloc",
   "memoryPagesAtStart": 20,
   "reps": 7,
   "scale": 1,
   "tierHint": "any",
   "callOverheadNs": {
-    "median": 0.952,
-    "min": 0.4530000000000012,
+    "median": 1.2250000000000005,
+    "min": 0.5679999999999996,
     "tier": "turbofan"
   },
   "results": [
@@ -20,15 +20,18 @@
       "unit": "alloc+free pair",
       "n": 2000000,
       "opsPerCall": 2000000,
-      "medianNsPerOp": 3.598499523999998,
-      "minNsPerOp": 3.5829995240000057,
-      "warmupCalls": 4,
+      "medianNsPerOp": 2.544999387500002,
+      "minNsPerOp": 2.1289993874999977,
+      "warmupCalls": 6,
       "liftoffWarmupCalls": 0,
-      "firstCallNsPerOp": 5.886999524,
+      "firstCallNsPerOp": 6.527499387500001,
       "tier": "turbofan",
       "tierStable": true,
       "pagesBefore": 20,
       "pagesAfter": 36,
+      "growCallsBefore": null,
+      "growCallsFirstCall": null,
+      "growCallsAfter": null,
       "checksum": 0
     },
     {
@@ -36,16 +39,19 @@
       "unit": "free+alloc step",
       "n": 200000,
       "opsPerCall": 200000,
-      "medianNsPerOp": 7.58499524000005,
-      "minNsPerOp": 7.579995240000026,
+      "medianNsPerOp": 7.339993875000017,
+      "minNsPerOp": 7.329993874999969,
       "warmupCalls": 4,
       "liftoffWarmupCalls": 0,
-      "firstCallNsPerOp": 10.33999523999999,
+      "firstCallNsPerOp": 10.584993875000023,
       "tier": "turbofan",
       "tierStable": true,
       "pagesBefore": 36,
-      "pagesAfter": 181,
-      "checksum": 1645932684
+      "pagesAfter": 132,
+      "growCallsBefore": null,
+      "growCallsFirstCall": null,
+      "growCallsAfter": null,
+      "checksum": 1592162929
     }
   ]
 }

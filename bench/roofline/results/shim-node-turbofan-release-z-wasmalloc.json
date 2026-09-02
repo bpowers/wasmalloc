@@ -3,15 +3,15 @@
   "engineVersion": "node 22.22.2 / V8 12.4.254.21-node.39",
   "flags": "--no-liftoff",
   "note": null,
-  "wasm": "/home/bpowers/src/wasm-clalloc/.worktrees/roofline/bench/roofline/target/dist/wasmalloc-release-z.wasm",
+  "wasm": "/home/bpowers/src/wasm-clalloc/bench/roofline/target/dist/wasmalloc-release-z.wasm",
   "variant": "wasmalloc",
   "memoryPagesAtStart": 20,
   "reps": 7,
   "scale": 1,
   "tierHint": "any",
   "callOverheadNs": {
-    "median": 1.1148859999999987,
-    "min": 0.36632900000000035,
+    "median": 1.6274450000000016,
+    "min": 0.45989900000000006,
     "tier": "turbofan"
   },
   "results": [
@@ -20,15 +20,18 @@
       "unit": "alloc+free pair",
       "n": 2000000,
       "opsPerCall": 2000000,
-      "medianNsPerOp": 8.063457442556997,
-      "minNsPerOp": 7.477819442556994,
-      "warmupCalls": 4,
+      "medianNsPerOp": 4.726929186277497,
+      "minNsPerOp": 4.676724186277505,
+      "warmupCalls": 6,
       "liftoffWarmupCalls": 0,
-      "firstCallNsPerOp": 9.417957942556997,
+      "firstCallNsPerOp": 8.0208986862775,
       "tier": "turbofan",
       "tierStable": true,
       "pagesBefore": 20,
       "pagesAfter": 36,
+      "growCallsBefore": null,
+      "growCallsFirstCall": null,
+      "growCallsAfter": null,
       "checksum": 0
     },
     {
@@ -36,16 +39,19 @@
       "unit": "free+alloc step",
       "n": 200000,
       "opsPerCall": 200000,
-      "medianNsPerOp": 13.448649425570117,
-      "minNsPerOp": 13.39419942557003,
+      "medianNsPerOp": 12.109006862775054,
+      "minNsPerOp": 12.106356862774925,
       "warmupCalls": 4,
       "liftoffWarmupCalls": 0,
-      "firstCallNsPerOp": 14.949894425570015,
+      "firstCallNsPerOp": 14.097096862775027,
       "tier": "turbofan",
       "tierStable": true,
       "pagesBefore": 36,
-      "pagesAfter": 181,
-      "checksum": 1645932684
+      "pagesAfter": 132,
+      "growCallsBefore": null,
+      "growCallsFirstCall": null,
+      "growCallsAfter": null,
+      "checksum": 1592162929
     }
   ]
 }

@@ -3,15 +3,15 @@
   "engineVersion": "node 22.22.2 / V8 12.4.254.21-node.39",
   "flags": "--no-liftoff",
   "note": null,
-  "wasm": "/home/bpowers/src/wasm-clalloc/.worktrees/roofline/bench/roofline/target/dist/pages-release.wasm",
+  "wasm": "/home/bpowers/src/wasm-clalloc/bench/roofline/target/dist/pages-release.wasm",
   "variant": "pages",
   "memoryPagesAtStart": 20,
   "reps": 3,
   "scale": 1,
   "tierHint": "any",
   "callOverheadNs": {
-    "median": 0.9517570000000006,
-    "min": 0.3719389999999976,
+    "median": 1.5703040000000001,
+    "min": 0.45803800000000194,
     "tier": "turbofan"
   },
   "results": [
@@ -20,15 +20,18 @@
       "unit": "alloc+touch+free, 256K-4M",
       "n": 50,
       "opsPerCall": 50,
-      "medianNsPerOp": 2375.9809648598625,
-      "minNsPerOp": 2338.7609648600423,
+      "medianNsPerOp": 2928.5685939199034,
+      "minNsPerOp": 2886.5485939199807,
       "warmupCalls": 5,
       "liftoffWarmupCalls": 0,
-      "firstCallNsPerOp": 243287.36096485986,
+      "firstCallNsPerOp": 288541.2085939201,
       "tier": "turbofan",
       "tierStable": true,
       "pagesBefore": 20,
       "pagesAfter": 1300,
+      "growCallsBefore": null,
+      "growCallsFirstCall": null,
+      "growCallsAfter": null,
       "checksum": 0
     }
   ]

@@ -1,4 +1,4 @@
-dlmalloc-release.wasm: 26010 bytes, 79 functions
+dlmalloc-release.wasm: 26041 bytes, 80 functions
   alloc_free_32: 46 instructions, 4 calls: __rust_no_alloc_shim_is_unstable_v2, __rust_alloc, __rust_dealloc, roofline::workloads::oom
   churn: 145 instructions, 4 calls: __rust_dealloc, __rust_no_alloc_shim_is_unstable_v2, __rust_alloc, roofline::workloads::oom
   realloc_doubling: 308 instructions, 20 calls: __rust_no_alloc_shim_is_unstable_v2, __rust_alloc, __rust_realloc x16, __rust_dealloc, roofline::workloads::oom
@@ -7,7 +7,7 @@ dlmalloc-release.wasm: 26010 bytes, 79 functions
   __rust_realloc: 6 instructions, 1 calls: __rdl_realloc
   __rust_no_alloc_shim_is_unstable_v2: 1 instructions, 0 calls
 
-dlmalloc-release-wasmopt-names.wasm: 20788 bytes, 53 functions
+dlmalloc-release-wasmopt-names.wasm: 20819 bytes, 54 functions
   alloc_free_32: 39 instructions, 2 calls: __rdl_alloc, __rdl_dealloc
   churn: 126 instructions, 2 calls: __rdl_dealloc, __rdl_alloc
   realloc_doubling: 301 instructions, 18 calls: __rdl_alloc, __rdl_realloc x16, __rdl_dealloc
@@ -16,7 +16,7 @@ dlmalloc-release-wasmopt-names.wasm: 20788 bytes, 53 functions
   __rust_realloc$: no function matches
   no_alloc_shim: no function matches
 
-dlmalloc-release-nolto.wasm: 25878 bytes, 79 functions
+dlmalloc-release-nolto.wasm: 25909 bytes, 80 functions
   alloc_free_32: 46 instructions, 4 calls: __rust_no_alloc_shim_is_unstable_v2, __rust_alloc, __rust_dealloc, roofline::workloads::oom
   churn: 145 instructions, 4 calls: __rust_dealloc, __rust_no_alloc_shim_is_unstable_v2, __rust_alloc, roofline::workloads::oom
   realloc_doubling: 308 instructions, 20 calls: __rust_no_alloc_shim_is_unstable_v2, __rust_alloc, __rust_realloc x16, __rust_dealloc, roofline::workloads::oom
@@ -25,7 +25,7 @@ dlmalloc-release-nolto.wasm: 25878 bytes, 79 functions
   __rust_realloc: 6 instructions, 1 calls: __rdl_realloc
   __rust_no_alloc_shim_is_unstable_v2: 1 instructions, 0 calls
 
-dlmalloc-release-nolto-wasmopt-names.wasm: 20656 bytes, 53 functions
+dlmalloc-release-nolto-wasmopt-names.wasm: 20687 bytes, 54 functions
   alloc_free_32: 39 instructions, 2 calls: __rdl_alloc, __rdl_dealloc
   churn: 126 instructions, 2 calls: __rdl_dealloc, __rdl_alloc
   realloc_doubling: 301 instructions, 18 calls: __rdl_alloc, __rdl_realloc x16, __rdl_dealloc
@@ -34,7 +34,7 @@ dlmalloc-release-nolto-wasmopt-names.wasm: 20656 bytes, 53 functions
   __rust_realloc$: no function matches
   no_alloc_shim: no function matches
 
-dlmalloc-release-z.wasm: 25841 bytes, 85 functions
+dlmalloc-release-z.wasm: 25872 bytes, 86 functions
   alloc_free_32: 42 instructions, 3 calls: alloc[3ca501edff3f0c7c]::alloc::alloc, __rust_dealloc, roofline::workloads::oom
   churn: 138 instructions, 3 calls: __rust_dealloc, alloc[3ca501edff3f0c7c]::alloc::alloc, roofline::workloads::oom
   realloc_doubling: 74 instructions, 4 calls: alloc[3ca501edff3f0c7c]::alloc::alloc, __rust_dealloc, __rust_realloc, roofline::workloads::oom
@@ -43,7 +43,7 @@ dlmalloc-release-z.wasm: 25841 bytes, 85 functions
   __rust_realloc: 6 instructions, 1 calls: __rdl_realloc
   __rust_no_alloc_shim_is_unstable_v2: 1 instructions, 0 calls
 
-dlmalloc-release-z-wasmopt-names.wasm: 20321 bytes, 53 functions
+dlmalloc-release-z-wasmopt-names.wasm: 20352 bytes, 54 functions
   alloc_free_32: 34 instructions, 2 calls: __rdl_alloc, __rdl_dealloc
   churn: 124 instructions, 2 calls: __rdl_dealloc, __rdl_alloc
   realloc_doubling: 66 instructions, 3 calls: __rdl_alloc, __rdl_dealloc, __rdl_realloc
@@ -52,7 +52,7 @@ dlmalloc-release-z-wasmopt-names.wasm: 20321 bytes, 53 functions
   __rust_realloc$: no function matches
   no_alloc_shim: no function matches
 
-dlmalloc-release-z-nolto.wasm: 25847 bytes, 85 functions
+dlmalloc-release-z-nolto.wasm: 25878 bytes, 86 functions
   alloc_free_32: 42 instructions, 3 calls: alloc[3ca501edff3f0c7c]::alloc::alloc, __rust_dealloc, roofline::workloads::oom
   churn: 138 instructions, 3 calls: __rust_dealloc, alloc[3ca501edff3f0c7c]::alloc::alloc, roofline::workloads::oom
   realloc_doubling: 74 instructions, 4 calls: alloc[3ca501edff3f0c7c]::alloc::alloc, __rust_dealloc, __rust_realloc, roofline::workloads::oom
@@ -61,7 +61,7 @@ dlmalloc-release-z-nolto.wasm: 25847 bytes, 85 functions
   __rust_realloc: 6 instructions, 1 calls: __rdl_realloc
   __rust_no_alloc_shim_is_unstable_v2: 1 instructions, 0 calls
 
-dlmalloc-release-z-nolto-wasmopt-names.wasm: 20321 bytes, 53 functions
+dlmalloc-release-z-nolto-wasmopt-names.wasm: 20352 bytes, 54 functions
   alloc_free_32: 34 instructions, 2 calls: __rdl_alloc, __rdl_dealloc
   churn: 124 instructions, 2 calls: __rdl_dealloc, __rdl_alloc
   realloc_doubling: 66 instructions, 3 calls: __rdl_alloc, __rdl_dealloc, __rdl_realloc

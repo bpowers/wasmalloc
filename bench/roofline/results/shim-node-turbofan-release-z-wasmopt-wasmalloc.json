@@ -3,15 +3,15 @@
   "engineVersion": "node 22.22.2 / V8 12.4.254.21-node.39",
   "flags": "--no-liftoff",
   "note": null,
-  "wasm": "/home/bpowers/src/wasm-clalloc/.worktrees/roofline/bench/roofline/target/dist/wasmalloc-release-z-wasmopt.wasm",
+  "wasm": "/home/bpowers/src/wasm-clalloc/bench/roofline/target/dist/wasmalloc-release-z-wasmopt.wasm",
   "variant": "wasmalloc",
   "memoryPagesAtStart": 20,
   "reps": 7,
   "scale": 1,
   "tierHint": "any",
   "callOverheadNs": {
-    "median": 1.1283659999999998,
-    "min": 0.3669089999999997,
+    "median": 1.517316000000001,
+    "min": 0.4565190000000001,
     "tier": "turbofan"
   },
   "results": [
@@ -20,15 +20,18 @@
       "unit": "alloc+free pair",
       "n": 2000000,
       "opsPerCall": 2000000,
-      "medianNsPerOp": 3.9248364358169967,
-      "minNsPerOp": 3.8857214358170014,
-      "warmupCalls": 4,
+      "medianNsPerOp": 3.1127592413420015,
+      "minNsPerOp": 3.0613342413419997,
+      "warmupCalls": 6,
       "liftoffWarmupCalls": 0,
-      "firstCallNsPerOp": 5.548745935817,
+      "firstCallNsPerOp": 6.133890241341998,
       "tier": "turbofan",
       "tierStable": true,
       "pagesBefore": 20,
       "pagesAfter": 36,
+      "growCallsBefore": null,
+      "growCallsFirstCall": null,
+      "growCallsAfter": null,
       "checksum": 0
     },
     {
@@ -36,16 +39,19 @@
       "unit": "free+alloc step",
       "n": 200000,
       "opsPerCall": 200000,
-      "medianNsPerOp": 8.9535643581699,
-      "minNsPerOp": 8.928814358170003,
+      "medianNsPerOp": 8.67016241342004,
+      "minNsPerOp": 8.611317413419965,
       "warmupCalls": 4,
       "liftoffWarmupCalls": 0,
-      "firstCallNsPerOp": 10.412909358169998,
+      "firstCallNsPerOp": 10.048412413420106,
       "tier": "turbofan",
       "tierStable": true,
       "pagesBefore": 36,
-      "pagesAfter": 181,
-      "checksum": 1645932684
+      "pagesAfter": 132,
+      "growCallsBefore": null,
+      "growCallsFirstCall": null,
+      "growCallsAfter": null,
+      "checksum": 1592162929
     }
   ]
 }

@@ -3,18 +3,18 @@
   "engineVersion": "node 22.22.2 / V8 12.4.254.21-node.39",
   "flags": "(default)",
   "note": null,
-  "wasm": "/home/bpowers/src/wasm-clalloc/.worktrees/roofline/bench/roofline/target/dist/dlmalloc-release.wasm",
+  "wasm": "/home/bpowers/src/wasm-clalloc/bench/roofline/target/dist/dlmalloc-release.wasm",
   "variant": "dlmalloc",
   "memoryPagesAtStart": 20,
   "tierup": {
     "fn": "alloc_free_32",
     "n": 100,
-    "callsUntilTierUp": 991,
-    "itersUntilTierUp": 99100,
+    "callsUntilTierUp": 938,
+    "itersUntilTierUp": 93800,
     "gaveUpAfterCalls": null,
     "tierAfter": "turbofan",
     "liftoffNsPerOp": null,
-    "optimizedNsPerOp": 9.1380466,
-    "checksum": 2159379658
+    "optimizedNsPerOp": 9.49624185,
+    "checksum": 0
   }
 }

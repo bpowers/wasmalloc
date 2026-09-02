@@ -3,7 +3,7 @@
   "engineVersion": "V8 15.2.124",
   "flags": null,
   "note": null,
-  "wasm": "/home/bpowers/src/wasm-clalloc/.worktrees/roofline/bench/roofline/target/dist/talc-release.wasm",
+  "wasm": "/home/bpowers/src/wasm-clalloc/bench/roofline/target/dist/talc-release.wasm",
   "variant": "talc",
   "memoryPagesAtStart": 20,
   "tierup": {
@@ -14,7 +14,7 @@
     "gaveUpAfterCalls": null,
     "tierAfter": "turbofan",
     "liftoffNsPerOp": null,
-    "optimizedNsPerOp": 10.01908,
+    "optimizedNsPerOp": 8.998539999999998,
     "checksum": 1121893665
   }
 }

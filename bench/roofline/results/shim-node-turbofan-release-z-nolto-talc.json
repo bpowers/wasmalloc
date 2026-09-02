@@ -3,15 +3,15 @@
   "engineVersion": "node 22.22.2 / V8 12.4.254.21-node.39",
   "flags": "--no-liftoff",
   "note": null,
-  "wasm": "/home/bpowers/src/wasm-clalloc/.worktrees/roofline/bench/roofline/target/dist/talc-release-z-nolto.wasm",
+  "wasm": "/home/bpowers/src/wasm-clalloc/bench/roofline/target/dist/talc-release-z-nolto.wasm",
   "variant": "talc",
   "memoryPagesAtStart": 20,
   "reps": 7,
   "scale": 1,
   "tierHint": "any",
   "callOverheadNs": {
-    "median": 0.9536470000000037,
-    "min": 0.3658179999999973,
+    "median": 1.4366149999999962,
+    "min": 0.45846800000000343,
     "tier": "turbofan"
   },
   "results": [
@@ -20,15 +20,18 @@
       "unit": "alloc+free pair",
       "n": 2000000,
       "opsPerCall": 2000000,
-      "medianNsPerOp": 22.554493523176475,
-      "minNsPerOp": 22.522549023176495,
-      "warmupCalls": 3,
+      "medianNsPerOp": 21.2139982816925,
+      "minNsPerOp": 21.18915828169252,
+      "warmupCalls": 4,
       "liftoffWarmupCalls": 0,
-      "firstCallNsPerOp": 23.0679715231765,
+      "firstCallNsPerOp": 24.480692281692505,
       "tier": "turbofan",
       "tierStable": true,
       "pagesBefore": 20,
       "pagesAfter": 21,
+      "growCallsBefore": null,
+      "growCallsFirstCall": null,
+      "growCallsAfter": null,
       "checksum": 0
     },
     {
@@ -36,16 +39,19 @@
       "unit": "free+alloc step",
       "n": 200000,
       "opsPerCall": 200000,
-      "medianNsPerOp": 41.18161023176485,
-      "minNsPerOp": 41.08675523176503,
-      "warmupCalls": 4,
+      "medianNsPerOp": 40.745107816924715,
+      "minNsPerOp": 40.56445781692493,
+      "warmupCalls": 3,
       "liftoffWarmupCalls": 0,
-      "firstCallNsPerOp": 45.89069023176465,
+      "firstCallNsPerOp": 43.16144781692505,
       "tier": "turbofan",
       "tierStable": true,
       "pagesBefore": 21,
       "pagesAfter": 121,
-      "checksum": 3925478349
+      "growCallsBefore": null,
+      "growCallsFirstCall": null,
+      "growCallsAfter": null,
+      "checksum": 3428655237
     }
   ]
 }

@@ -1,4 +1,4 @@
-sizeclass-release.wasm: 18446 bytes, 70 functions
+sizeclass-release.wasm: 18477 bytes, 71 functions
   alloc_free_32: 84 instructions, 3 calls: __rust_no_alloc_shim_is_unstable_v2, roofline::alloc::bump::Bump::alloc_slow, roofline::workloads::oom
   churn: 247 instructions, 4 calls: __rust_no_alloc_shim_is_unstable_v2, roofline::alloc::bump::Bump::alloc_slow x2, roofline::workloads::oom
   realloc_doubling: 225 instructions, 5 calls: __rust_no_alloc_shim_is_unstable_v2, roofline::alloc::bump::Bump::alloc_slow x3, roofline::workloads::oom
@@ -7,7 +7,7 @@ sizeclass-release.wasm: 18446 bytes, 70 functions
   __rust_realloc: 140 instructions, 2 calls: roofline::alloc::bump::Bump::alloc_slow x2
   __rust_no_alloc_shim_is_unstable_v2: 1 instructions, 0 calls
 
-sizeclass-release-wasmopt-names.wasm: 13798 bytes, 46 functions
+sizeclass-release-wasmopt-names.wasm: 13829 bytes, 47 functions
   alloc_free_32: 76 instructions, 1 calls: roofline::alloc::bump::Bump::alloc_slow
   churn: 224 instructions, 2 calls: roofline::alloc::bump::Bump::alloc_slow x2
   realloc_doubling: 201 instructions, 3 calls: roofline::alloc::bump::Bump::alloc_slow x3
@@ -16,7 +16,7 @@ sizeclass-release-wasmopt-names.wasm: 13798 bytes, 46 functions
   __rust_realloc: 133 instructions, 2 calls: roofline::alloc::bump::Bump::alloc_slow x2
   no_alloc_shim: no function matches
 
-sizeclass-release-nolto.wasm: 20244 bytes, 71 functions
+sizeclass-release-nolto.wasm: 20275 bytes, 72 functions
   alloc_free_32: 86 instructions, 3 calls: __rust_no_alloc_shim_is_unstable_v2, roofline::alloc::bump::Bump::alloc_slow, roofline::workloads::oom
   churn: 247 instructions, 4 calls: __rust_no_alloc_shim_is_unstable_v2, roofline::alloc::bump::Bump::alloc_slow x2, roofline::workloads::oom
   realloc_doubling: 927 instructions, 19 calls: __rust_no_alloc_shim_is_unstable_v2, roofline::alloc::bump::Bump::alloc_slow x17, roofline::workloads::oom
@@ -25,7 +25,7 @@ sizeclass-release-nolto.wasm: 20244 bytes, 71 functions
   __rust_realloc: 6 instructions, 1 calls: core::alloc::global::GlobalAlloc::realloc
   __rust_no_alloc_shim_is_unstable_v2: 1 instructions, 0 calls
 
-sizeclass-release-nolto-wasmopt-names.wasm: 15324 bytes, 46 functions
+sizeclass-release-nolto-wasmopt-names.wasm: 15355 bytes, 47 functions
   alloc_free_32: 75 instructions, 1 calls: roofline::alloc::bump::Bump::alloc_slow
   churn: 224 instructions, 2 calls: roofline::alloc::bump::Bump::alloc_slow x2
   realloc_doubling: 892 instructions, 17 calls: roofline::alloc::bump::Bump::alloc_slow x17
@@ -34,7 +34,7 @@ sizeclass-release-nolto-wasmopt-names.wasm: 15324 bytes, 46 functions
   __rust_realloc$: no function matches
   no_alloc_shim: no function matches
 
-sizeclass-release-z.wasm: 17010 bytes, 79 functions
+sizeclass-release-z.wasm: 17041 bytes, 80 functions
   alloc_free_32: 42 instructions, 3 calls: alloc[3ca501edff3f0c7c]::alloc::alloc, __rust_dealloc, roofline::workloads::oom
   churn: 138 instructions, 3 calls: __rust_dealloc, alloc[3ca501edff3f0c7c]::alloc::alloc, roofline::workloads::oom
   realloc_doubling: 74 instructions, 4 calls: alloc[3ca501edff3f0c7c]::alloc::alloc, __rust_dealloc, __rust_realloc, roofline::workloads::oom
@@ -43,7 +43,7 @@ sizeclass-release-z.wasm: 17010 bytes, 79 functions
   __rust_realloc: 6 instructions, 1 calls: core::alloc::global::GlobalAlloc::realloc
   __rust_no_alloc_shim_is_unstable_v2: 1 instructions, 0 calls
 
-sizeclass-release-z-wasmopt-names.wasm: 12160 bytes, 48 functions
+sizeclass-release-z-wasmopt-names.wasm: 12191 bytes, 49 functions
   alloc_free_32: 35 instructions, 2 calls: __rust_alloc, __rust_dealloc
   churn: 125 instructions, 2 calls: __rust_dealloc, __rust_alloc
   realloc_doubling: 67 instructions, 3 calls: __rust_alloc, __rust_dealloc, __rust_realloc
@@ -52,7 +52,7 @@ sizeclass-release-z-wasmopt-names.wasm: 12160 bytes, 48 functions
   __rust_realloc: 141 instructions, 2 calls: roofline::alloc::bump::Bump::alloc_slow x2
   no_alloc_shim: no function matches
 
-sizeclass-release-z-nolto.wasm: 17128 bytes, 79 functions
+sizeclass-release-z-nolto.wasm: 17159 bytes, 80 functions
   alloc_free_32: 45 instructions, 2 calls: alloc[3ca501edff3f0c7c]::alloc::alloc, roofline::workloads::oom
   churn: 161 instructions, 2 calls: alloc[3ca501edff3f0c7c]::alloc::alloc, roofline::workloads::oom
   realloc_doubling: 70 instructions, 3 calls: alloc[3ca501edff3f0c7c]::alloc::alloc, __rust_realloc, roofline::workloads::oom
@@ -61,7 +61,7 @@ sizeclass-release-z-nolto.wasm: 17128 bytes, 79 functions
   __rust_realloc: 6 instructions, 1 calls: core::alloc::global::GlobalAlloc::realloc
   __rust_no_alloc_shim_is_unstable_v2: 1 instructions, 0 calls
 
-sizeclass-release-z-nolto-wasmopt-names.wasm: 12306 bytes, 48 functions
+sizeclass-release-z-nolto-wasmopt-names.wasm: 12337 bytes, 49 functions
   alloc_free_32: 38 instructions, 1 calls: __rust_alloc
   churn: 147 instructions, 1 calls: __rust_alloc
   realloc_doubling: 63 instructions, 2 calls: __rust_alloc, core::alloc::global::GlobalAlloc::realloc

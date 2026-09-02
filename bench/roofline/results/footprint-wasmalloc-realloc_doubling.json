@@ -3,15 +3,15 @@
   "engineVersion": "node 22.22.2 / V8 12.4.254.21-node.39",
   "flags": "--no-liftoff",
   "note": null,
-  "wasm": "/home/bpowers/src/wasm-clalloc/.worktrees/roofline/bench/roofline/target/dist/wasmalloc-release.wasm",
+  "wasm": "/home/bpowers/src/wasm-clalloc/bench/roofline/target/dist/wasmalloc-release.wasm",
   "variant": "wasmalloc",
   "memoryPagesAtStart": 20,
   "reps": 3,
   "scale": 1,
   "tierHint": "any",
   "callOverheadNs": {
-    "median": 1.1259569999999999,
-    "min": 0.37496800000000263,
+    "median": 1.5585549999999984,
+    "min": 0.45870800000000145,
     "tier": "turbofan"
   },
   "results": [
@@ -20,16 +20,19 @@
       "unit": "16 B to 1 MiB realloc chain",
       "n": 100,
       "opsPerCall": 100,
-      "medianNsPerOp": 9848.758740429974,
-      "minNsPerOp": 9845.358740430032,
+      "medianNsPerOp": 778.7744144499582,
+      "minNsPerOp": 772.3844144498911,
       "warmupCalls": 4,
       "liftoffWarmupCalls": 0,
-      "firstCallNsPerOp": 66761.25874043001,
+      "firstCallNsPerOp": 79113.42441445,
       "tier": "turbofan",
       "tierStable": true,
       "pagesBefore": 20,
-      "pagesAfter": 288,
-      "checksum": 0
+      "pagesAfter": 68,
+      "growCallsBefore": null,
+      "growCallsFirstCall": null,
+      "growCallsAfter": null,
+      "checksum": 1662567944
     }
   ]
 }

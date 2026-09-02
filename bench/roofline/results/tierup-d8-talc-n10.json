@@ -3,18 +3,18 @@
   "engineVersion": "V8 15.2.124",
   "flags": null,
   "note": null,
-  "wasm": "/home/bpowers/src/wasm-clalloc/.worktrees/roofline/bench/roofline/target/dist/talc-release.wasm",
+  "wasm": "/home/bpowers/src/wasm-clalloc/bench/roofline/target/dist/talc-release.wasm",
   "variant": "talc",
   "memoryPagesAtStart": 20,
   "tierup": {
     "fn": "alloc_free_32",
     "n": 10,
-    "callsUntilTierUp": 6315,
-    "itersUntilTierUp": 63150,
+    "callsUntilTierUp": 6417,
+    "itersUntilTierUp": 64170,
     "gaveUpAfterCalls": null,
     "tierAfter": "turbofan",
-    "liftoffNsPerOp": 84.60000000000001,
-    "optimizedNsPerOp": 19.755200000000002,
+    "liftoffNsPerOp": 93.79999999999998,
+    "optimizedNsPerOp": 21.7003,
     "checksum": 1070419591
   }
 }

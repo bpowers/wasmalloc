@@ -3,18 +3,18 @@
   "engineVersion": "node 22.22.2 / V8 12.4.254.21-node.39",
   "flags": "(default)",
   "note": null,
-  "wasm": "/home/bpowers/src/wasm-clalloc/.worktrees/roofline/bench/roofline/target/dist/bump-release.wasm",
+  "wasm": "/home/bpowers/src/wasm-clalloc/bench/roofline/target/dist/bump-release.wasm",
   "variant": "bump",
   "memoryPagesAtStart": 20,
   "tierup": {
     "fn": "alloc_free_32",
     "n": 10,
-    "callsUntilTierUp": 7743,
-    "itersUntilTierUp": 77430,
+    "callsUntilTierUp": 10293,
+    "itersUntilTierUp": 102930,
     "gaveUpAfterCalls": null,
     "tierAfter": "turbofan",
-    "liftoffNsPerOp": 50.19879999999972,
-    "optimizedNsPerOp": 7.7293894,
+    "liftoffNsPerOp": 76.81570000000022,
+    "optimizedNsPerOp": 9.451151700000002,
     "checksum": 67221096
   }
 }

@@ -800,3 +800,117 @@ mark `Heap::alloc` and `Heap::dealloc` (or the `GlobalAlloc` methods of `WasmAll
 Not worth doing: folding `free_is_zero` into `flags` (no measurable cost);
 anything aimed at `large_alloc_free` time (at the floor); the JS-side call
 overhead (about 1 ns, subtracted).
+
+## 14. Rerun against main after both tuning passes (2026-09-02)
+
+Same harness and protocol as sections 4 to 6, run against main at commit 800fdc7 (tuning-a and
+tuning-b merged: u32 counters, inline retire test, aligned frees on the fast path, header-less runs
+above a 40 KiB medium limit with 256 KiB medium pages, in-place run growth through memory.grow,
+eighth-of-heap growth step, retired pages released before growth). Median ns per operation; the
+full tables including floors, mimics and lol_alloc are in results/REPORT.md.
+
+### node 22 (V8 12.4), optimizing tier
+
+| workload | freelist floor | sizeclass floor | wasmalloc | dlmalloc | talc |
+|---|---:|---:|---:|---:|---:|
+| alloc_free_32 | 1.80 | 1.87 | 2.54 | 7.98 | 11.73 |
+| alloc_free_32_align16 | 1.80 | 1.87 | 2.50 | 13.77 | 11.74 |
+| batch_lifo_32 | 1.89 | 1.91 | 2.97 | 9.04 | 10.07 |
+| batch_fifo_32 | 1.88 | 1.98 | 2.99 | 12.47 | 10.02 |
+| churn | 3.14 | 3.69 | 7.15 | 60.68 | 31.92 |
+| random_actions | 19.15 | 22.06 | 14.61 | 43.30 | 22.50 |
+| random_actions_norealloc | 6.27 | 9.15 | 10.93 | 37.64 | 19.56 |
+| vec_push_growth | 408,229 | 441,256 | 387,948 | 386,173 | 385,937 |
+| realloc_doubling | 35,940 | 42,533 | 638.69 | 66.19 | 81.49 |
+| large_alloc_free | 2,181 | 2,428 | 2,063 | 1,867 | 2,467 |
+
+### node 22, Liftoff only
+
+| workload | freelist floor | sizeclass floor | wasmalloc | dlmalloc | talc |
+|---|---:|---:|---:|---:|---:|
+| alloc_free_32 | 3.78 | 3.71 | 3.68 | 10.99 | 18.97 |
+| alloc_free_32_align16 | 3.76 | 3.68 | 3.66 | 19.71 | 18.67 |
+| batch_lifo_32 | 3.66 | 3.78 | 4.85 | 12.54 | 18.62 |
+| batch_fifo_32 | 3.79 | 3.39 | 4.85 | 17.89 | 18.58 |
+| churn | 5.46 | 6.23 | 9.89 | 69.16 | 38.58 |
+| random_actions | 24.49 | 22.87 | 19.01 | 51.49 | 27.45 |
+| random_actions_norealloc | 7.76 | 10.15 | 14.39 | 44.73 | 24.32 |
+| vec_push_growth | 1,122,087 | 1,131,780 | 1,105,387 | 1,102,637 | 1,100,050 |
+| realloc_doubling | 35,999 | 54,493 | 786.68 | 112.08 | 155.39 |
+| large_alloc_free | 2,256 | 2,360 | 1,843 | 1,953 | 2,305 |
+
+### d8 (V8 15.2), optimizing tier
+
+| workload | freelist floor | sizeclass floor | wasmalloc | dlmalloc | talc |
+|---|---:|---:|---:|---:|---:|
+| alloc_free_32 | 0.55 | 0.56 | 1.13 | 4.09 | 8.43 |
+| alloc_free_32_align16 | 0.55 | 0.56 | 1.13 | 7.85 | 8.43 |
+| batch_lifo_32 | 0.93 | 0.95 | 1.88 | 4.37 | 6.54 |
+| batch_fifo_32 | 0.92 | 0.94 | 1.88 | 5.92 | 6.12 |
+| churn | 10.57 | 3.34 | 6.45 | 55.75 | 26.06 |
+| random_actions | 21.03 | 20.76 | 14.24 | 40.66 | 20.08 |
+| random_actions_norealloc | 5.90 | 8.34 | 10.17 | 34.10 | 17.85 |
+| vec_push_growth | 459,700 | 426,950 | 390,250 | 387,500 | 387,150 |
+| realloc_doubling | 37,660 | 45,790 | 619.99 | 39.99 | 59.99 |
+| large_alloc_free | 2,180 | 2,300 | 2,060 | 2,180 | 2,480 |
+
+### d8 (V8 15.2), Liftoff only
+
+| workload | freelist floor | sizeclass floor | wasmalloc | dlmalloc | talc |
+|---|---:|---:|---:|---:|---:|
+| alloc_free_32 | 4.03 | 4.09 | 4.62 | 18.61 | 23.45 |
+| alloc_free_32_align16 | 4.07 | 4.08 | 4.62 | 29.03 | 23.43 |
+| batch_lifo_32 | 4.20 | 4.19 | 5.32 | 19.95 | 21.80 |
+| batch_fifo_32 | 4.19 | 4.26 | 5.35 | 25.44 | 21.56 |
+| churn | 6.37 | 6.95 | 10.90 | 74.55 | 42.91 |
+| random_actions | 27.03 | 32.18 | 20.25 | 55.19 | 30.65 |
+| random_actions_norealloc | 8.27 | 10.73 | 14.85 | 48.37 | 27.09 |
+| vec_push_growth | 1,132,150 | 1,174,350 | 1,105,750 | 1,117,250 | 1,101,000 |
+| realloc_doubling | 37,410 | 41,330 | 799.99 | 139.99 | 169.99 |
+| large_alloc_free | 2,080 | 3,140 | 1,840 | 1,980 | 2,260 |
+
+### JavaScriptCore
+
+| workload | freelist floor | sizeclass floor | wasmalloc | dlmalloc | talc |
+|---|---:|---:|---:|---:|---:|
+| alloc_free_32 | 0.54 | 0.55 | 1.00 | 4.67 | 10.15 |
+| alloc_free_32_align16 | 0.55 | 0.55 | 1.01 | 10.31 | 10.15 |
+| batch_lifo_32 | 0.93 | 0.94 | 1.35 | 4.72 | 8.62 |
+| batch_fifo_32 | 0.93 | 0.93 | 1.35 | 9.07 | 8.59 |
+| churn | 3.31 | 3.27 | 6.12 | 52.94 | 25.97 |
+| random_actions | 20.50 | 19.50 | 13.58 | 40.11 | 19.37 |
+| random_actions_norealloc | 5.96 | 8.02 | 9.94 | 34.51 | 17.09 |
+| vec_push_growth | 666,479 | 653,137 | 444,861 | 584,460 | 584,656 |
+| realloc_doubling | 41,892 | 37,241 | 676.25 | 80.54 | 65.89 |
+| large_alloc_free | 2,944 | 2,471 | 2,212 | 2,417 | 2,246 |
+
+### wasmtime (Cranelift)
+
+| workload | freelist floor | sizeclass floor | wasmalloc | dlmalloc | talc |
+|---|---:|---:|---:|---:|---:|
+| alloc_free_32 | 0.74 | 0.73 | 1.10 | 4.72 | 8.27 |
+| alloc_free_32_align16 | 0.74 | 0.73 | 1.10 | 5.43 | 8.27 |
+| batch_lifo_32 | 1.06 | 1.04 | 1.52 | 5.04 | 7.46 |
+| batch_fifo_32 | 1.09 | 1.07 | 1.81 | 6.83 | 7.25 |
+| churn | 3.00 | 3.21 | 6.07 | 48.32 | 26.22 |
+| random_actions | 19.08 | 20.08 | 14.26 | 38.33 | 20.22 |
+| random_actions_norealloc | 5.96 | 8.21 | 10.25 | 32.81 | 17.52 |
+| vec_push_growth | 412,188 | 414,641 | 561,796 | 381,888 | 563,074 |
+| realloc_doubling | 35,795 | 39,489 | 600.90 | 39.40 | 60.90 |
+| large_alloc_free | 2,665 | 2,565 | 2,397 | 2,390 | 2,392 |
+
+### Footprint: memory.size in 64 KiB pages after one workload (fresh process, 20 pages at start)
+
+| workload | wasmalloc | dlmalloc | talc |
+|---|---:|---:|---:|
+| alloc_free_32 | 36 | 21 | 21 |
+| alloc_free_32_align16 | 36 | 21 | 21 |
+| batch_lifo_32 | 36 | 21 | 21 |
+| batch_fifo_32 | 36 | 21 | 21 |
+| churn | 132 | 104 | 121 |
+| random_actions | 68 | 32 | 34 |
+| random_actions_norealloc | 84 | 38 | 41 |
+| vec_push_growth | 68 | 54 | 54 |
+| realloc_doubling | 68 | 54 | 54 |
+| large_alloc_free | 132 | 149 | 149 |
+
