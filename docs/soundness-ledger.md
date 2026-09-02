@@ -597,24 +597,28 @@ Blocks: `&mut *self.heap.get()`, and in each method the call into the heap, with
 - Preconditions: no other `&mut Heap` is live (calls into the allocator never nest); for
   `dealloc` and `realloc`, `ptr` was returned by this allocator (the `GlobalAlloc` contract).
 - Proof sketch: `heap()` creates a `&mut Heap` that lives for one method call. Calls cannot
-  nest because the heap allocates nothing (`no_std`, no collections, no formatting) and, in a
-  release build, cannot panic or unwind (the release profile aborts on panic and the only panic
-  call site left in the allocator's code is the `page::extend` division discussed under
-  PAGE-04, whose divisor is never zero). In a build with debug assertions a failing assertion
-  runs the panic hook before aborting, and std's hook may allocate, which would re-enter the
-  allocator while a `&mut Heap` is live; this can only happen once an invariant is already
-  broken, and is the reason the allocator's own invariant checks are debug-only. The
-  single-thread argument is GLOBAL-01. `ptr` is non-null because `alloc` never returns a
-  null block as a success (HEAP-01, HEAP-04) and the contract requires a pointer this allocator
-  returned.
+  nest because the heap allocates nothing (`no_std`, no collections, no formatting) and cannot
+  unwind: every target this crate compiles for is `panic-strategy = "abort"` in its target
+  specification (`rustc --print target-spec-json` for `wasm32-unknown-unknown`, `wasm32-wasip1`
+  and `wasm32-wasip2` all say so), a property of the target that no consumer's build profile
+  changes; the crate's own `[profile.release] panic = "abort"` does not carry this, since a
+  dependency's profile is never inherited (R-6). In a release build the allocator's own code also
+  has no panic call site at all (PAGE-04, PAGE-01, checked on the roofline build on 2026-09-02).
+  In a build with debug assertions a failing assertion runs the panic hook before the abort,
+  and std's hook formats the message and may allocate (`queue_index`'s `debug_assert!` carries a
+  formatted message), which re-enters the allocator while a `&mut Heap` is live; this can only
+  happen once an invariant is already broken, and is the reason the allocator's own invariant
+  checks are debug-only. The single-thread argument is GLOBAL-01. `ptr` is non-null because
+  `alloc` never returns a null block as a success (HEAP-01, HEAP-04) and the contract requires a
+  pointer this allocator returned.
 - Machine checks: `tests/global_wasm.rs` under wasmtime (std collections, churn, zeroed and
   over-aligned allocations through the static). The heap methods themselves are HEAP-01 to
   HEAP-04.
-- Reviewer: adversarial-reviewer, 2026-09-02: accepted. Caveat: the no-unwind property follows
-  from the wasm32 targets' `panic-strategy = "abort"`, not from this crate's `[profile.release]`,
-  which consumers never inherit (R-6); as the entry anticipates, a failing `debug_assert!` with a
-  formatted message (`queue_index`) does allocate in the panic hook, so debug builds re-enter on a
-  broken invariant.
+- Changes: 2026-09-02, the no-unwind argument cites the target specifications and the
+  debug-hook allocation is named (R-6); no code changed.
+- Reviewer: adversarial-reviewer, 2026-09-02: accepted with a caveat (R-6: cite the targets'
+  `panic-strategy`, not the profile, and note the debug-hook allocation), both folded into the
+  text above on 2026-09-02.
 
 ### GLOBAL-03: `unsafe impl GlobalAlloc for WasmAlloc`
 

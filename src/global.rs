@@ -8,8 +8,9 @@
 //! One [`Heap`] over [`WasmMemory`] lives inside the static. The program is single-threaded (this
 //! crate does not support the `atomics` target feature, see the crate documentation), so the
 //! `GlobalAlloc` methods, which take `&self`, hand out `&mut Heap` through an `UnsafeCell`
-//! without any synchronisation. The heap never allocates, panics or unwinds while servicing a
-//! request, so it cannot re-enter itself.
+//! without any synchronisation. The heap never allocates while servicing a request and cannot
+//! unwind (every wasm32 target is `panic-strategy = "abort"`, and the allocator's release code
+//! has no panic call site), so it cannot re-enter itself.
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::cell::UnsafeCell;
@@ -66,7 +67,7 @@ fn to_raw(p: Option<NonNull<u8>>) -> *mut u8 {
 
 // SAFETY: the heap implements the GlobalAlloc contract: blocks are aligned and sized for their
 // Layout, never overlap while live, dealloc and realloc recompute the block's page from the
-// Layout the caller passes back, and the heap never unwinds.
+// Layout the caller passes back, and the heap never unwinds (the wasm32 targets abort on panic).
 unsafe impl GlobalAlloc for WasmAlloc {
     #[inline(always)]
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
