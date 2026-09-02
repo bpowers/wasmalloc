@@ -3,3 +3,4 @@
 *.wasm
 !docs/**/*.wasm
 /.worktrees/
+/third_party

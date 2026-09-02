@@ -15,7 +15,12 @@ Research reports: `docs/research/`. mimalloc v3.5.1 reference source: `~/src/mim
 
 - Rust 1.95 stable (nightly only for Miri and tools that need it); targets
   `wasm32-unknown-unknown`, `wasm32-wasip1`, and the host for tests.
-- Engines: node 22 (V8) at `node`, `~/.wasmtime/bin/wasmtime`; `wasm-opt` 125.
+- Engines: node 22 (V8 12.4) at `node`; node 24 (V8 13.6) at
+  `third_party/node-v24.20.0-linux-x64/bin/node`; d8 (V8 15.2) and jsc under `~/.jsvu/bin`;
+  `~/.wasmtime/bin/wasmtime`; `wasm-opt` 125.
+- `third_party/` (gitignored) holds external checkouts used for real-workload testing: `simlin`
+  and `resvg-wasm` (the user's wasm apps) and the node 24 tarball. Never commit anything there;
+  hack branches inside those clones are fine.
 - Verification: Kani harnesses, Miri, differential fuzzing (see `docs/research/verification.md`).
   Run Kani ONLY through `scripts/kani` (never bare `cargo kani`): it caps memory with a cgroup
   (default 6 GiB, `KANI_MEM`) and time (default 30 min, `KANI_TIMEOUT`). An uncapped CBMC run
