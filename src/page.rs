@@ -302,7 +302,11 @@ pub unsafe fn extend<M: Memory>(page: *mut Page, mem: &M) -> bool {
             return false;
         }
         let block_size = (*page).block_size as usize;
-        let max_extend = (MAX_EXTEND_SIZE / block_size).max(1);
+        // `block_size` is `bin_size(bin) >= MIN_BLOCK_SIZE` for every header `init` writes and
+        // nothing else writes the field, so `.max(1)` changes no reachable value; it lets the
+        // compiler drop the division-by-zero check, which was the last panic path in the
+        // allocator's release code (ledger PAGE-04).
+        let max_extend = (MAX_EXTEND_SIZE / block_size.max(1)).max(1);
         let extend = (reserved - capacity).min(max_extend);
         let first = page.addr() + (*page).block_start as usize + capacity * block_size;
         let last = first + (extend - 1) * block_size;

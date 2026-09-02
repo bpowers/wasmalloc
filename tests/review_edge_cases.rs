@@ -335,11 +335,13 @@ fn a_page_reused_through_the_direct_table_is_still_released() {
 /// countdown is not reset), parked in the full queue by the next search, brought back to the
 /// end of its bin queue by one free and then emptied by the rest, keeps `retire_expire != 0`
 /// with `used == 0`, so `needs_transition` skips `retire`, no collection reaches it behind
-/// three pages in use, and memory grows although a whole slice sits empty in a queue.
+/// three pages in use, and memory grew although a whole slice sat empty in a queue.
 ///
-/// Ignored because it fails: `cargo test --test review_edge_cases -- --ignored`.
+/// Fixed on 2026-09-02: the search clears the countdown of a page it parks, so the free that
+/// empties the page after it comes back goes through `retire` (with four pages in the queue,
+/// that releases it at once), and the release before growth walks every bin queue regardless of
+/// the range and the window.
 #[test]
-#[ignore = "R-2: an emptied page beyond the collection window is never released before growth"]
 fn an_emptied_page_behind_three_others_is_released_before_memory_grows() {
     use wasmalloc::bins::PageKind;
     use wasmalloc::page::{self, Page};
@@ -387,21 +389,19 @@ fn an_emptied_page_behind_three_others_is_released_before_memory_grows() {
         h.dealloc(q_blocks[0], l);
         h.dealloc(r_blocks[0], l);
         h.dealloc(p_blocks[0], l);
-        // Emptying P now takes the fast path every time: `used == 0 && retire_expire != 0`.
+        // Before the fix, emptying P took the fast path every time (`used == 0 &&
+        // retire_expire != 0`) and left an empty page nobody would release. Now the park
+        // cleared the countdown, so the last free retires P, and with four pages in the queue
+        // `retire` releases it at once.
         for &b in &p_blocks[1..] {
             h.dealloc(b, l);
         }
-        assert_eq!((*p).used, 0);
-        assert_ne!((*p).retire_expire, 0);
-        // A page of another bin needs one slice. P's slice is the only candidate, and the
-        // heap promises to release retired pages before growing memory.
+        assert_eq!(h.free_slices(), 1, "P's slice is back in the map");
+        // A page of another bin needs one slice: P's, without growing memory.
         let other = h.alloc(layout(100, 8)).unwrap();
         let grew = h.memory().size_slices() - end;
-        eprintln!(
-            "memory grew by {grew} slices with page P empty (retire_expire {})",
-            (*p).retire_expire
-        );
         assert_eq!(grew, 0, "P was not released before memory grew");
+        assert_eq!(h.free_slices(), 0);
         h.dealloc(other, layout(100, 8));
         h.dealloc(s_block, l);
         for &b in q_blocks[1..].iter().chain(&r_blocks[1..]) {

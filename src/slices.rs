@@ -20,9 +20,10 @@
 //! Searches return the lowest-addressed fit. Together with the growth policy in [`acquire`] this
 //! keeps the heap dense at the bottom of memory so that the top can be grown in large steps:
 //! `memory.grow` costs tens of microseconds in V8 regardless of size (see
-//! `docs/research/landscape.md`), so growth is geometric in the heap size, and the linker gap
-//! between `__heap_base` and the initial `memory.size` is reclaimed via [`initial_free_range`]
-//! before the first grow.
+//! `docs/research/landscape.md`), so growth is geometric in the heap size, and the memory
+//! between the backend's heap base and the initial `memory.size` (the linker gap on
+//! `wasm32-unknown-unknown`; nothing on wasi, see `backend`) is reclaimed via
+//! [`initial_free_range`] before the first grow.
 //!
 //! The exception is a run that is being grown by `realloc`. [`extend_with_growth`] extends a
 //! run in place through the free slices after it and, when the run reaches the end of memory,
@@ -817,11 +818,13 @@ fn add_region<const WORDS: usize>(map: &mut SliceMap<WORDS>, start: usize, count
     }
 }
 
-/// The linker gap: slices between `heap_base` and the initial end of memory, which the heap
-/// reclaims at startup instead of paying a `memory.grow` for its first page.
+/// The slices between `heap_base` and the initial end of memory (the linker gap on
+/// `wasm32-unknown-unknown`), which the heap reclaims at startup instead of paying a
+/// `memory.grow` for its first page.
 ///
 /// Returns the first wholly usable slice, `ceil(heap_base / SLICE_SIZE)`, and how many slices
-/// follow it up to `size_slices` (zero when the heap base sits in the last slice).
+/// follow it up to `size_slices` (zero when the heap base is the end of memory, as on wasi, or
+/// sits in the last slice).
 pub fn initial_free_range(heap_base: usize, size_slices: usize) -> (usize, usize) {
     let first = heap_base.div_ceil(SLICE_SIZE);
     (first, size_slices.saturating_sub(first))

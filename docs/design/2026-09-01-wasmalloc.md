@@ -95,8 +95,11 @@ Status against these criteria is recorded in "Implementation status" below.
 
 ### Memory layout
 
-- The heap is the linear memory from `align_up(__heap_base, 16)` to `memory.size() * 64 KiB`,
-  extended by `memory.grow`. It is managed as an array of 64 KiB *slices* (mimalloc's
+- The heap is the linear memory from the backend's heap base to `memory.size() * 64 KiB`,
+  extended by `memory.grow`. The base is `__heap_base` on `wasm32-unknown-unknown`; on wasi it
+  is the end of the memory present at the heap's first allocation, because wasi-libc's dlmalloc
+  owns `[__heap_base, __heap_end)` and std reaches it even with this crate installed (review
+  finding R-1, 2026-09-02). It is managed as an array of 64 KiB *slices* (mimalloc's
   `MI_ARENA_SLICE_SIZE` on 64-bit; we deliberately do not adopt the 32 KiB slices mimalloc
   uses on 32-bit hosts, because the wasm page is 64 KiB).
 - A bitmap indexed by absolute slice number (`addr >> 16`; 65536 bits, 8 KiB, static) records
@@ -113,10 +116,11 @@ Status against these criteria is recorded in "Implementation status" below.
   C.8), so growth is geometric: grow by `max(needed, clamp(heap_size / 8, 1 MiB, 64 MiB))`
   (an eighth, not a half: the half-heap step overshot the peak by up to 50 percent, tuning log
   2026-09-02), rounded to whole slices, and before growing at all release every retired page
-  (a grow is footprint for good; a released page is one page initialisation away). Reclaim the
-  linker gap between `__heap_base` and the initial
+  (a grow is footprint for good; a released page is one page initialisation away). On
+  `wasm32-unknown-unknown`, reclaim the linker gap between `__heap_base` and the initial
   `memory.size()` as the first free slices instead of paying a grow for the first page (std's
-  dlmalloc 0.2.11 wastes that gap). Growth must be sized from the rounded, aligned request
+  dlmalloc 0.2.11 wastes that gap); on wasi the gap is wasi-libc's, so nothing is reclaimed and
+  the first page costs a grow. Growth must be sized from the rounded, aligned request
   (talc 5.0.3 undersized growth and spun to the 4 GiB limit) and must tolerate `memory.grow`
   returning `usize::MAX` (failure at the 4 GiB or host limit: return null so std reports OOM)
   and non-contiguous results (something else grew memory in between): the returned page index
@@ -381,7 +385,8 @@ realloc_doubling 12.2/13.4/12.4/12.2 us (288, 5), large_alloc_free 2.24/1.95/2.1
    index, queue indices are masked over 64 queues, the direct table is written in an index
    loop, the step divisor is clamped). Module panic call sites 29 -> 6 (the harness's std and
    `page::extend`'s `MAX_EXTEND_SIZE / block_size`, an unsafe block under ledger PAGE-04 left
-   for a reviewed change); `__rust_realloc` 3 -> 0; raw module 47903 -> 47208 bytes, after
+   for a reviewed change, done on 2026-09-02, review fixes item 2 below); `__rust_realloc`
+   3 -> 0; raw module 47903 -> 47208 bytes, after
    wasm-opt -O3 20871 -> 20558. Timings unchanged (churn read 8.30 once on node and 7.00,
    7.25, 6.97 in three alternating reruns against 7.10 for the previous build). Kept.
 
@@ -399,3 +404,32 @@ Next: the per-bin page cost (random_actions at 2.1x dlmalloc), the `page::extend
 (with a PAGE-04 review), a zero-initialised heap static (roadmap 8), heap Kani harnesses and
 ledger entries (roadmap 9), and `alloc_zeroed` for runs extended through `memory.grow`, whose
 fresh slices are known zero but are not yet reported as such to a zeroing realloc.
+
+### 2026-09-02, review fixes (the adversarial ledger review, `docs/soundness-ledger.md`)
+
+1. **Every empty page is released before memory grows, whatever its countdown** (review
+   finding R-2). A page retired, drained through the direct table (the fast paths never touch
+   `retire_expire`), parked in the full queue, brought back by a free and emptied behind three
+   pages in use kept a stale countdown and was never reached by the collection, so memory grew
+   with an empty slice in a queue. Now the search clears the countdown of a page it parks, so
+   the page's last free goes through `retire`; `retire` refreshes the countdown and the retired
+   range instead of returning early; and the release that precedes a `memory.grow`
+   (`Heap::release_empty_pages`) walks every bin queue that holds a page, found through an
+   occupancy bitmask the queue operations maintain, rather than the retired range's three-page
+   window. A first version scanned all 60 queue heads in a plain loop, which was fine at run
+   time but made CBMC unroll the queue walk once per queue and pushed three heap proofs past
+   their 4 GiB cap; the bitmask keeps the proofs at an unwind bound of 2. Hot paths untouched;
+   measured anyway, three interleaved runs each of the `wasmalloc` variant (median ns per
+   pair): alloc_free_32 2.50 to 2.52 -> 2.49 to 2.51 on node 22 `--no-liftoff`, 1.122 to 1.124
+   -> 1.122 to 1.123 on d8 (V8 15.2) `--no-liftoff`; batch_lifo_32 2.98 to 3.00 -> 2.96 to 2.98
+   on node (one run read 2.54), 1.87 to 1.88 -> 1.83 to 1.88 on d8. Kept.
+2. **No panic call site left in the allocator's release code** (ledger PAGE-04 and PAGE-01).
+   `page::extend` divides `MAX_EXTEND_SIZE` by the header's `block_size`, and `page::init`
+   divides the block area by it through `bins::blocks_per_page`; the compiler cannot see that
+   the field is at least 8, so both carried a division-by-zero check and the panic string it
+   pulls in. Both now divide by `block_size` or 1, identical for every reachable header. On the
+   roofline `wasmalloc` release build for wasm32-unknown-unknown (`wasm-tools demangle`, then
+   `print`, counting `call` instructions whose callee is a panic function; tuning-b item 6
+   counted differently): 14 -> 11 in the module, all remaining in the harness's std, 2 -> 0 in
+   `wasmalloc::` functions; "attempt to divide by zero" gone from the data segments; raw module
+   47932 -> 47617 bytes, 21418 -> 21186 after `wasm-opt -O3`. Kept.
