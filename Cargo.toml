@@ -9,7 +9,7 @@ repository = "https://github.com/bpowers/wasmalloc"
 readme = "README.md"
 keywords = ["allocator", "wasm", "webassembly", "no_std", "mimalloc"]
 categories = ["memory-management", "no-std", "wasm"]
-include = ["src/**", "Cargo.toml", "README.md", "LICENSE-APACHE", "LICENSE-MIT", "docs/design/*.md", "docs/soundness-ledger.md"]
+include = ["/src/**", "/Cargo.toml", "/README.md", "/LICENSE-APACHE", "/LICENSE-MIT", "/docs/design/*.md", "/docs/soundness-ledger.md"]
 
 [workspace]
 members = ["."]
