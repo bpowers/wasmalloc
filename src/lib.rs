@@ -12,6 +12,8 @@
 //! - [`page`]: the in-band page header and block free-list operations.
 //! - [`heap`]: bin queues, the direct table, page lifecycle, and alloc/dealloc/realloc.
 //! - [`global`] (wasm32 only): [`WasmAlloc`], the `#[global_allocator]` over a static heap.
+//! - [`testing`] (feature `testing`): the model-based tester every allocator change is judged
+//!   against, plus the simulated-memory helpers integration tests and fuzz targets share.
 //!
 //! Threads are not supported: the crate assumes wasm32 without the `atomics` target feature and
 //! refuses to build with it.
@@ -20,7 +22,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 #![warn(missing_docs)]
 
-#[cfg(test)]
+#[cfg(any(test, feature = "testing"))]
 extern crate std;
 
 pub mod backend;
@@ -30,6 +32,8 @@ pub mod global;
 pub mod heap;
 pub mod page;
 pub mod slices;
+#[cfg(feature = "testing")]
+pub mod testing;
 
 #[cfg(target_arch = "wasm32")]
 pub use global::WasmAlloc;

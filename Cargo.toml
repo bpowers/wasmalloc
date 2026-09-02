@@ -12,15 +12,24 @@ publish = false
 
 [workspace]
 members = ["."]
-# bench/roofline keeps its own profiles and lockfile on purpose.
-exclude = ["bench/roofline"]
+# bench/roofline keeps its own profiles and lockfile on purpose; fuzz needs nightly and
+# libfuzzer-sys, which must not slow down or destabilise the main gate.
+exclude = ["bench/roofline", "fuzz"]
 
 [lib]
 crate-type = ["rlib"]
 
+[features]
+# Pulls in std for the test helpers under `testing` (the model-based tester, the simulated
+# memory Region). Never enable it in a #[global_allocator] build.
+testing = []
+
 [dependencies]
 
 [dev-dependencies]
+# Integration tests and doctests see the crate with the `testing` feature enabled; this
+# self-dependency is the only way to turn a feature on for them alone.
+wasmalloc = { path = ".", features = ["testing"] }
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

@@ -1,0 +1,33 @@
+[package]
+name = "wasmalloc-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+description = "cargo-fuzz targets for wasmalloc; excluded from the root workspace (needs nightly)"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.wasmalloc]
+path = ".."
+features = ["testing"]
+
+[[bin]]
+name = "model"
+path = "fuzz_targets/model.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "model_heap"
+path = "fuzz_targets/model_heap.rs"
+test = false
+doc = false
+bench = false
+
+# Excluded from the root workspace (see its Cargo.toml); this is its own workspace root.
+[workspace]

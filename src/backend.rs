@@ -197,39 +197,92 @@ unsafe impl Memory for SimMemory {
     }
 }
 
-#[cfg(test)]
-pub(crate) mod testing {
-    //! A heap-allocated, 4 MiB-aligned region for tests.
+#[cfg(any(test, feature = "testing"))]
+pub mod testing {
+    //! Host regions for simulated memories: 4 MiB-aligned so that every page kind's address mask
+    //! behaves exactly as on wasm.
     use super::*;
     use crate::bins::LARGE_PAGE_SIZE;
     use std::alloc::{Layout, alloc, dealloc};
 
-    /// Owns an aligned region and the `SimMemory` over it.
-    pub struct Region {
+    /// A 4 MiB-aligned region of host memory, freed on drop.
+    ///
+    /// The region comes from the host allocator, so its pages are committed lazily by the OS: a
+    /// multi-gigabyte region costs nothing until a simulated memory grows into it.
+    pub struct HostRegion {
         ptr: *mut u8,
         layout: Layout,
-        pub mem: SimMemory,
     }
 
-    impl Region {
-        pub fn new(total_slices: usize, initial_slices: usize, heap_base_offset: usize) -> Self {
+    impl HostRegion {
+        /// A region of `total_slices` slices. Panics if the host cannot provide it.
+        pub fn new(total_slices: usize) -> Self {
             let layout =
                 Layout::from_size_align(total_slices * SLICE_SIZE, LARGE_PAGE_SIZE).unwrap();
-            // SAFETY: layout has non-zero size.
+            // SAFETY: the layout has a non-zero size.
             let ptr = unsafe { alloc(layout) };
             assert!(!ptr.is_null(), "failed to allocate test region");
-            // SAFETY: freshly allocated region owned by this struct for its whole lifetime.
-            let mem = unsafe {
-                SimMemory::from_region(ptr, layout.size(), initial_slices, heap_base_offset)
-            };
-            Region { ptr, layout, mem }
+            HostRegion { ptr, layout }
+        }
+
+        /// Start of the region.
+        pub fn as_ptr(&self) -> *mut u8 {
+            self.ptr
+        }
+
+        /// Length of the region in bytes.
+        pub fn len(&self) -> usize {
+            self.layout.size()
+        }
+
+        /// Whether the region is empty (never: a region holds at least one slice).
+        pub fn is_empty(&self) -> bool {
+            self.len() == 0
+        }
+
+        /// A simulated linear memory over the whole region, initially `initial_slices` long
+        /// with its heap `heap_base_offset` bytes in.
+        ///
+        /// # Safety
+        ///
+        /// The returned memory must be dropped before the region, and no other `SimMemory` may
+        /// be live over the same region at the same time.
+        pub unsafe fn simulate(&self, initial_slices: usize, heap_base_offset: usize) -> SimMemory {
+            // SAFETY: the region is valid for its whole length while `self` lives, and the
+            // caller promises exclusivity and that the memory does not outlive the region.
+            unsafe {
+                SimMemory::from_region(self.ptr, self.len(), initial_slices, heap_base_offset)
+            }
         }
     }
 
-    impl Drop for Region {
+    impl Drop for HostRegion {
         fn drop(&mut self) {
             // SAFETY: allocated in `new` with this layout.
             unsafe { dealloc(self.ptr, self.layout) };
+        }
+    }
+
+    /// A [`HostRegion`] together with the `SimMemory` over it.
+    pub struct Region {
+        // Declared after `mem` so that the memory is dropped before the region it points into.
+        /// The simulated linear memory over the region.
+        pub mem: SimMemory,
+        _region: HostRegion,
+    }
+
+    impl Region {
+        /// A region of `total_slices` slices whose simulated memory starts at `initial_slices`
+        /// and whose heap begins `heap_base_offset` bytes in. Panics if the host cannot
+        /// provide the region.
+        pub fn new(total_slices: usize, initial_slices: usize, heap_base_offset: usize) -> Self {
+            let region = HostRegion::new(total_slices);
+            // SAFETY: `mem` is the only memory over the region and drops before it (field order).
+            let mem = unsafe { region.simulate(initial_slices, heap_base_offset) };
+            Region {
+                mem,
+                _region: region,
+            }
         }
     }
 }
