@@ -113,8 +113,9 @@ Status against these criteria is recorded in "Implementation status" below.
   aligned runs, so the failure mode is footprint, not correctness.
 - Growth policy: `memory.grow` costs 50 to 75 microseconds per call in V8 regardless of the
   number of pages requested (about 100x wasmtime; measured in `docs/research/landscape.md`
-  C.8), so growth is geometric: grow by `max(needed, clamp(heap_size / 8, 1 MiB, 64 MiB))`
-  (an eighth, not a half: the half-heap step overshot the peak by up to 50 percent, tuning log
+  C.8), so growth is geometric: grow by `max(needed, clamp(heap_size / 8, 2 slices, 64 MiB))`
+  (an eighth, not a half: the half-heap step overshot the peak by up to 50 percent; a floor of
+  two slices, not 1 MiB: the 1 MiB floor was pure footprint on small heaps, tuning log
   2026-09-02), rounded to whole slices, and before growing at all release every retired page
   (a grow is footprint for good; a released page is one page initialisation away). On
   `wasm32-unknown-unknown`, reclaim the linker gap between `__heap_base` and the initial

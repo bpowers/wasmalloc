@@ -606,13 +606,19 @@ fn set_bits<const WORDS: usize>(bits: &mut [u64; WORDS], rel: usize, count: usiz
 
 /// How much to grow linear memory when the map runs dry, in slices.
 ///
-/// Each `memory.grow` costs the same tens of microseconds in V8 12.4 whether it asks for one
+/// Each `memory.grow` costs the same 80 to 110 us in V8 12.4 and 13.6 whether it asks for one
 /// page or a thousand (under a microsecond on V8 15.2, JavaScriptCore and wasmtime), so the step
 /// is a fraction of the current heap, clamped to a range; a request larger than the step is
 /// always granted in full. The fraction trades footprint for calls: a step of half the heap
 /// overshoots the peak by up to 50 percent and costs about three calls per doubling of the heap,
 /// an eighth overshoots by at most 12.5 percent and costs about six, which for a heap growing to
-/// 64 MiB is some 2 ms of `memory.grow` in total on V8 12.4 and negligible elsewhere.
+/// 64 MiB is some 3 ms of `memory.grow` in total on V8 12.4 and negligible elsewhere.
+///
+/// The floor is two slices, not a large first step: a 1 MiB floor made a program that needs one
+/// 64 KiB page take sixteen, and its 16-slice steps left the roofline's small workloads at 1.7
+/// to 2.1x dlmalloc's footprint (tuning log, 2026-09-02, footprint). The heap is counted from
+/// slice 0, so on wasm it is at least the shadow stack's 16 slices and the eighth governs from
+/// the first grow; a heap that stays small pays a handful of extra calls, once, while it grows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GrowPolicy {
     /// Smallest step.
@@ -624,9 +630,9 @@ pub struct GrowPolicy {
 }
 
 impl GrowPolicy {
-    /// An eighth of the heap, between 1 MiB and 64 MiB per step.
+    /// An eighth of the heap, between two slices (128 KiB) and 64 MiB per step.
     pub const DEFAULT: GrowPolicy = GrowPolicy {
-        min_grow: 16,
+        min_grow: 2,
         max_grow: 1024,
         step_divisor: 8,
     };
@@ -1553,7 +1559,8 @@ mod tests {
             "no growth while the gap serves"
         );
 
-        // The map is empty now: grow by the minimum step and serve from the fresh region.
+        // The map is empty now: grow by the minimum step (an eighth of a three-slice heap is
+        // less than two) and serve from the fresh region.
         let run = acquire(&mut m, &mut r.mem, 1, 1, &GrowPolicy::DEFAULT).unwrap();
         assert_eq!(
             run,
@@ -1562,21 +1569,23 @@ mod tests {
                 zeroed: true
             }
         );
-        assert_eq!(r.mem.size_slices(), first + 3 + 16);
-        assert_eq!(m.free_count(), 15);
-        for i in first + 4..first + 19 {
-            assert!(m.is_zero(i));
-        }
+        assert_eq!(r.mem.size_slices(), first + 3 + 2);
+        assert_eq!(m.free_count(), 1);
+        assert!(m.is_zero(first + 4));
         check_invariants(&m);
     }
 
     #[test]
     fn grow_policy_step_is_the_clamped_fraction() {
         let p = GrowPolicy::DEFAULT;
-        assert_eq!((p.min_grow, p.max_grow, p.step_divisor), (16, 1024, 8));
-        assert_eq!(p.step(0), 16);
-        assert_eq!(p.step(127), 16);
-        assert_eq!(p.step(128), 16);
+        assert_eq!((p.min_grow, p.max_grow, p.step_divisor), (2, 1024, 8));
+        assert_eq!(p.step(0), 2);
+        assert_eq!(p.step(15), 2);
+        assert_eq!(p.step(16), 2);
+        assert_eq!(p.step(24), 3);
+        // A wasm heap is counted from slice 0 and the shadow stack alone is 16 slices, so the
+        // eighth governs from the first grow there.
+        assert_eq!(p.step(20), 2);
         assert_eq!(p.step(136), 17);
         assert_eq!(p.step(8192), 1024);
         assert_eq!(p.step(usize::MAX), 1024);
@@ -1853,7 +1862,11 @@ mod tests {
         let first = region_start(&r.mem, 2);
         let mut m = SliceMap::<W>::new();
         m.init(first);
-        let policy = GrowPolicy::DEFAULT;
+        // A step the ten remaining slices cannot serve.
+        let policy = GrowPolicy {
+            min_grow: 16,
+            ..GrowPolicy::DEFAULT
+        };
         let a = acquire(&mut m, &mut r.mem, 1, 1, &policy).unwrap();
         assert_eq!(
             a,
