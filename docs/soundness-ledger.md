@@ -361,9 +361,9 @@ Blocks: `Layout::from_size_align_unchecked`, the `self.alloc(new_layout)` for a 
 
 ### HEAP-04: `alloc_generic`, `alloc_huge` and `acquire_run`, the slow-path hand-out
 
-Blocks: in `alloc_generic`, the `collect_retired(false)`, `find_page`, `page::pop` and the
-zeroing block; in `alloc_huge`, the `write_bytes` and `NonNull::new_unchecked`; in
-`acquire_run`, the `collect_retired(true)`.
+Blocks: in `alloc_generic`, the `page::has_free` read of the bin queue's first page, the
+`collect_retired(false)`, `find_page`, `page::pop` and the zeroing block; in `alloc_huge`, the
+`write_bytes` and `NonNull::new_unchecked`; in `acquire_run`, the `collect_retired(true)`.
 
 - Preconditions: as HEAP-01; heap invariants hold at entry.
 - Invariants relied on: the `slices` contract (a returned run was free, hence owned and
@@ -372,11 +372,19 @@ zeroing block; in `alloc_huge`, the `write_bytes` and `NonNull::new_unchecked`; 
   by anything else; on wasi the range is empty and every slice comes from this heap's own
   `memory.grow`); page invariants of the page `find_page` returns; heap invariants between
   operations for the collections; `heap_base > 0` (below).
-- Proof sketch. `find_page` returns a queue member of `bin` whose free list is non-empty (it
-  found one, extended an expandable one, or built a fresh one and extended it, HEAP-06), so
-  `pop` meets PAGE-02 and returns a block; if it did not, the release build returns `None`
-  rather than dereferencing anything. Zeroing as in HEAP-01 with `bin_size(bin) >=
-  layout.size()`. `alloc_huge`: `huge_slices(layout) * SLICE_SIZE >= layout.size()` and the run
+- Proof sketch. The page popped is either the first page of the queue of `bin`, taken when
+  `bin > DIRECT_MAX_BIN` and its free list is non-empty, or what `find_page` returns. Queue
+  head: `queues[bin].first` is 0 or a queue member (heap invariant 1), hence a live page of
+  `bin` whose header `has_free` may read (PAGE-05), and it is 0 before `ensure_init` has run
+  because every queue starts empty and only `fresh_page`, after `ensure_init`, adds pages; the
+  bin's blocks are `bin_size(bin) >= rounded size` bytes and aligned for the Layout exactly as
+  the direct table's are (HEAP-01, and the table is a cache of these very heads by heap
+  invariant 3; Kani `dealloc_fast_path_agrees_with_classify` pins `bin > DIRECT_MAX_BIN` to
+  the sizes the table does not cover). `find_page` returns a queue member of `bin` whose free
+  list is non-empty (it found one, extended an expandable one, or built a fresh one and
+  extended it, HEAP-06). Either way `pop` meets PAGE-02 and returns a block; if it did not, the
+  release build returns `None` rather than dereferencing anything. Zeroing as in HEAP-01 with
+  `bin_size(bin) >= layout.size()`. `alloc_huge`: `huge_slices(layout) * SLICE_SIZE >= layout.size()` and the run
   alignment `layout.align().div_ceil(SLICE_SIZE).max(1)` is a power of two whose multiples in
   slices are addresses aligned for the Layout (Kani `huge_runs_cover_the_layout_and_its_alignment`),
   so the run covers the request; `write_bytes` clears `layout.size()` bytes of memory the run
@@ -396,7 +404,9 @@ zeroing block; in `alloc_huge`, the `write_bytes` and `NonNull::new_unchecked`; 
   calls it before `find_page`, and `acquire_run` before growing, when `fresh_page` and
   `alloc_huge` have not yet chosen a run; the heap invariants therefore hold at those points.
 - Machine checks: Kani `first_allocation_builds_a_valid_heap` (the whole slow path onto a
-  fresh page, with the linker gap or through `grow`), `the_search_parks_a_full_page_in_the_full_queue`
+  fresh page, with the linker gap or through `grow`),
+  `an_allocation_above_the_direct_table_pops_the_queue_head` (the queue-head path on a
+  prepared page, the generic counter untouched), `the_search_parks_a_full_page_in_the_full_queue`
   (a failed page supply leaves the heap valid), `huge_runs_cover_the_layout_and_its_alignment`,
   `slices::slices_acquire_stays_inside_memory_and_the_map`, `slices::slices_alloc_*`; tests
   `huge_alloc_free_and_realloc_in_place`, `large_alignment_is_honoured`,
@@ -407,8 +417,14 @@ zeroing block; in `alloc_huge`, the `write_bytes` and `NonNull::new_unchecked`; 
   page); tests only.
 - Changes: 2026-09-02, the `heap_base > 0` assumption and the per-target ownership of the
   initial free range are now stated above (R-3, R-4); no code in these blocks changed.
+  2026-09-02, tuning-c: `alloc_generic` classifies first, then serves a request above the
+  direct table from the bin queue's first page when that page has a free block, and runs
+  `ensure_init`, the collection counter and `find_page` only otherwise (the `has_free` read
+  is a new unsafe block, the `pop` has the second source above); test
+  `requests_above_the_direct_table_pop_from_the_queue_head`, the harnesses named re-run.
 - Reviewer: adversarial-reviewer, 2026-09-02: accepted with two caveats (R-3, R-4), both
-  addressed in the text above on 2026-09-02; fresh review of the wording pending.
+  addressed in the text above on 2026-09-02; fresh review of the wording and of the tuning-c
+  change pending.
 
 ### HEAP-05: the queue operations and `page_at`
 

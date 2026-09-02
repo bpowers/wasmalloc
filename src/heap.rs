@@ -92,6 +92,8 @@ const RETIRE_MAX_PAGES: usize = 3;
 const MAX_CANDIDATES: usize = 4;
 /// Retired pages are collected every this many slow-path allocations.
 const GENERIC_COLLECT_PERIOD: u32 = 1000;
+/// The largest bin the direct table serves; larger bins are found through their queue head.
+const DIRECT_MAX_BIN: u8 = bins::bin(DIRECT_MAX_SIZE);
 
 /// The page every direct-table entry points at before its queue has a page. Its free list is
 /// empty, so [`page::pop`] returns `None` without writing, and the slow path takes over. It is
@@ -369,38 +371,65 @@ impl<M: Memory, const WORDS: usize> Heap<M, WORDS> {
     // Slow paths
     // ------------------------------------------------------------------------------------
 
+    /// The fast paths' miss handler: every request the direct table does not serve.
+    ///
+    /// A request above the table's range whose bin queue's first page has a free block is
+    /// served from that page with none of the bookkeeping below. This is what the table does
+    /// for the sizes it covers (heap invariant 3 makes it a cache of exactly these queue
+    /// heads), with the bin computed instead of looked up; on the simlin profile three quarters
+    /// of the entries here were such requests, each paying the counters, the candidate walk and
+    /// a countdown store for a block the queue head had ready
+    /// (`docs/research/simlin-profile.md`, section 4). Sizes the table covers arrive here only
+    /// with an empty head, so they skip the check. The check lives in this function rather than
+    /// in a small one of its own between the fast path and this one, because V8 inlines small
+    /// callees into `__rust_alloc` on its own accord and a shim that grows is a shim it inlines
+    /// into fewer callers; this function is well past V8's inlining size limit.
     #[cold]
     #[inline(never)]
     unsafe fn alloc_generic(&mut self, layout: Layout, zero: bool) -> Option<NonNull<u8>> {
-        self.ensure_init();
-        match bins::classify(layout) {
-            Class::Huge => self.alloc_huge(layout, zero, false),
-            Class::Bin(bin) => {
-                self.generic_count += 1;
-                if self.generic_count >= GENERIC_COLLECT_PERIOD {
-                    self.generic_count = 0;
-                    // SAFETY: heap invariants hold between operations.
-                    unsafe { self.collect_retired() };
-                }
+        let bin = match bins::classify(layout) {
+            Class::Huge => {
+                self.ensure_init();
+                return self.alloc_huge(layout, zero, false);
+            }
+            Class::Bin(bin) => bin,
+        };
+        let mut page = ptr::null_mut();
+        if bin > DIRECT_MAX_BIN {
+            let head = self.queues[queue_index(bin as usize)].first;
+            // SAFETY: a queue member is a live page of this heap (invariant 1); before the
+            // first allocation every queue is empty, so this reads no header before `ensure_init`.
+            if head != 0 && unsafe { page::has_free(self.page_at(head)) } {
+                page = self.page_at(head);
+            }
+        }
+        if page.is_null() {
+            self.ensure_init();
+            self.generic_count += 1;
+            if self.generic_count >= GENERIC_COLLECT_PERIOD {
+                self.generic_count = 0;
                 // SAFETY: heap invariants hold between operations.
-                let page = unsafe { self.find_page(bin) }?;
-                // SAFETY: find_page returns a page of this heap with a non-empty free list.
-                let block = unsafe { page::pop(page, &self.mem) };
-                debug_assert!(block.is_some());
-                let block = block?;
-                let p = self.mem.ptr(block);
-                // SAFETY: the block is `bin_size(bin) >= layout.size()` bytes we own.
-                unsafe {
-                    if zero {
-                        if (*page).free_is_zero {
-                            p.cast::<usize>().write(0);
-                        } else {
-                            p.write_bytes(0, layout.size());
-                        }
-                    }
-                    Some(NonNull::new_unchecked(p))
+                unsafe { self.collect_retired() };
+            }
+            // SAFETY: heap invariants hold between operations.
+            page = unsafe { self.find_page(bin) }?;
+        }
+        // SAFETY: `page` is a page of this heap of bin `bin` with a non-empty free list: the
+        // queue head checked above, or what `find_page` returns.
+        let block = unsafe { page::pop(page, &self.mem) };
+        debug_assert!(block.is_some());
+        let block = block?;
+        let p = self.mem.ptr(block);
+        // SAFETY: the block is `bin_size(bin) >= layout.size()` bytes we own.
+        unsafe {
+            if zero {
+                if (*page).free_is_zero {
+                    p.cast::<usize>().write(0);
+                } else {
+                    p.write_bytes(0, layout.size());
                 }
             }
+            Some(NonNull::new_unchecked(p))
         }
     }
 
@@ -1963,6 +1992,88 @@ mod tests {
         validate(h);
     }
 
+    /// Sizes above the direct table's range and up to the binned limit are served from the
+    /// head of their bin's queue without the generic path's bookkeeping once the queue has a
+    /// page with a free block; a queue head without one, or a request outside that range, still
+    /// goes through the page search, which counts its entries.
+    #[test]
+    fn requests_above_the_direct_table_pop_from_the_queue_head() {
+        let mut f = heap(256, 8, 0);
+        let h = &mut f.heap;
+        for size in [
+            DIRECT_MAX_SIZE + 1,
+            2000,
+            8192,
+            SMALL_MAX_OBJ_SIZE,
+            SMALL_MAX_OBJ_SIZE + 1,
+            MEDIUM_MAX_OBJ_SIZE,
+        ] {
+            let l = layout(size, 8);
+            let bin = bins::bin(size);
+            let kind = bins::kind_of_bin(bin);
+            unsafe {
+                // The first request of a bin has no page: generic path.
+                let before = h.generic_count;
+                let a = h.alloc(l).unwrap();
+                assert_eq!(h.generic_count, before + 1, "size {size}: fresh page");
+                let page = page::header_of(kind, a.as_ptr() as usize);
+                assert_eq!(h.queues[bin as usize].first, page);
+                // Every following request while that page has room is a queue-head pop.
+                let per_page = bins::blocks_per_page(kind, bins::bin_size(bin));
+                let mut blocks = std::vec![a];
+                for i in 1..per_page {
+                    let p = h.alloc(l).unwrap();
+                    assert_eq!(page::header_of(kind, p.as_ptr() as usize), page);
+                    // Lazy extension links at most 8 KiB of blocks at a time, so the generic
+                    // path runs when the list is empty but the page still has blocks.
+                    let extends = i.div_ceil((page::MAX_EXTEND_SIZE / bins::bin_size(bin)).max(1));
+                    assert!(
+                        h.generic_count <= before + 1 + extends as u32,
+                        "size {size} block {i}: generic path entered for a linked block"
+                    );
+                    blocks.push(p);
+                }
+                validate(h);
+                // The page is full: the next request parks it and takes a fresh page.
+                let count = h.generic_count;
+                let extra = h.alloc(l).unwrap();
+                assert_eq!(h.generic_count, count + 1);
+                assert_ne!(page::header_of(kind, extra.as_ptr() as usize), page);
+                validate(h);
+                // A free into the parked page brings it back to its bin queue behind the new
+                // one. The next request pops the queue head when it has a block; otherwise the
+                // generic path's candidate search may prefer the fuller old page (mimalloc's
+                // heuristic), so only the invariants are checked here, not the page.
+                h.dealloc(blocks.pop().unwrap(), l);
+                assert!(!page::in_full_queue(h.page_at(page)));
+                let again = h.alloc(l).unwrap();
+                validate(h);
+                h.dealloc(again, l);
+                h.dealloc(extra, l);
+                for p in blocks {
+                    h.dealloc(p, l);
+                }
+            }
+            validate(h);
+        }
+        // Over-aligned and huge requests never take the queue-head path.
+        unsafe {
+            let count = h.generic_count;
+            let big = layout(MEDIUM_MAX_OBJ_SIZE + 1, 8);
+            let p = h.alloc(big).unwrap();
+            assert_eq!(
+                h.generic_count, count,
+                "a run does not count as a binned entry"
+            );
+            h.dealloc(p, big);
+            let over = layout(2000, 2 * MAX_NATURAL_ALIGN);
+            let q = h.alloc(over).unwrap();
+            assert_eq!(q.as_ptr() as usize % (2 * MAX_NATURAL_ALIGN), 0);
+            h.dealloc(q, over);
+        }
+        validate(h);
+    }
+
     #[test]
     fn direct_table_tiles_and_starts_at_sentinel() {
         let f = heap(8, 2, 0);
@@ -2118,6 +2229,12 @@ mod verify {
         if rounded <= DIRECT_MAX_SIZE {
             let b = bins::bin(bins::direct_index(rounded) * WORD);
             assert!(bins::classify(layout) == Class::Bin(b));
+        }
+        // `alloc_generic` takes the queue-head path exactly for the binned sizes the direct
+        // table does not cover.
+        if let Class::Bin(b) = bins::classify(layout) {
+            assert!((b > DIRECT_MAX_BIN) == (rounded > DIRECT_MAX_SIZE));
+            assert!((b as usize) < QUEUE_COUNT && b as usize != FULL_QUEUE);
         }
     }
 
@@ -2437,6 +2554,32 @@ mod verify {
         assert!(h.free_slices() == 0);
         assert!(h.queues[BIN as usize].first == page.addr());
         check(&h, 1);
+    }
+
+    /// A request of a size above the direct table on a heap whose bin queue holds a page with a
+    /// free block is served by `alloc` from that page's list through the queue-head path of
+    /// `alloc_generic`, without its bookkeeping (the generic counter does not move): the heap
+    /// invariants hold and the block is the one the page's list headed. [`BIN`] has no direct
+    /// entries, so this is the path every such request takes.
+    #[kani::proof]
+    #[kani::unwind(2)]
+    fn an_allocation_above_the_direct_table_pops_the_queue_head() {
+        proof_heap!(h, false);
+        let page = prepared_page(&mut h);
+        let layout = Layout::from_size_align(BS, WORD).unwrap();
+        let generic = h.generic_count;
+        // SAFETY: non-zero size.
+        let got = unsafe { h.alloc(layout) };
+        let addr = block_of(&h, got.unwrap());
+        assert!(addr == block(&h, 0));
+        assert!(h.generic_count == generic);
+        // SAFETY: the page is live.
+        unsafe {
+            assert!((*page).used == 1 && (*page).capacity == 1);
+            assert!((*page).free == 0 && (*page).retire_expire == 0);
+        }
+        assert!(h.queues[BIN as usize].first == page.addr());
+        check_no_full(&h, 1);
     }
 
     /// Freeing a page's last block retires it: the queue's only page keeps its slice, its free

@@ -483,3 +483,29 @@ run, the code the bench executes). Baseline: main at afc0e2c (byte-identical to 
    14.9, and the TurboFan code of the `random_actions` loop (which inlines the fast paths)
    differs between those builds only in register assignment and spill slots, at 2385 to 3021
    instructions depending on what V8 chose to inline. Kept.
+
+2. **Queue-head service for 1 to 40 KiB requests** (profile rank 2). `alloc_generic` classifies
+   first and, for a bin above the direct table's range whose queue's first page has a free
+   block, pops that page with none of its bookkeeping (`ensure_init`, the collection counter,
+   the candidate walk, the countdown store); the direct table does the same for the sizes it
+   covers, since it caches exactly these queue heads. Counters on the simlin bundle: 147,159
+   of the 215,291 `alloc_generic` entries per compile take the new path, the periodic
+   collections fall from 215 to 68, page supply and `page::extend` counts are unchanged, and
+   the shims are byte-for-byte what change 1 left (`alloc_generic` itself 529 -> 504 wasm
+   instructions). A first version put the check in a separate `#[inline(never)]` function
+   between the fast path and `alloc_generic`, as the profile suggested, and lost: V8 inlines
+   any small callee into `__rust_alloc` on its own (TurboFan code 232 -> 372 bytes), under
+   `--no-liftoff` the grown shim was no longer inlined into the roofline's batch loop
+   (batch_lifo_32 +10 percent on both V8s), and simlin read -0.7 ms (IQR -9.7 to 3.1, n = 20).
+   `alloc_generic` is far past V8's inlining size limit, so the check is safe there and the
+   only cost is its call, which the request paid before. simlin compile against change 1: 1929
+   -> 1926 ms median, paired difference -2.2 ms (IQR -6.2 to 2.8, n = 40): the profile's 5 to
+   6 ms assumed the whole 35 ns of a generic entry was bookkeeping, but the queue head's
+   header line is cold for these sizes whichever path loads it. Roofline, change 1 -> change 2
+   (n24 TurboFan / n24 Liftoff / n22 TurboFan / wasmtime): alloc_free_32 1.249/4.39/2.60/1.12
+   -> 1.247/4.38/2.60/1.12, align16 unchanged, batch_lifo_32 1.60/5.41/3.08/1.63 ->
+   1.59/5.40/3.09/1.87 (wasmtime's address swing, see tuning-b), churn 6.69/10.84/7.41/6.26
+   -> 6.60/11.00/7.38/6.29, random_actions 15.57/20.98/15.10/14.60 ->
+   14.50/19.99/14.51/13.97, realloc_doubling 632/827/644/628 -> 640/810/623/609. Kept for the
+   4 to 7 percent on the workloads with requests in that range; the simlin gain is real but
+   at the resolution limit.
