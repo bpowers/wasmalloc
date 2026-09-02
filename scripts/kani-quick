@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # The Kani subset that runs in the merge gate: harnesses that finish in a few seconds each
-# (about 25 s total). Everything else stays in the full set (`scripts/kani`, about 4 minutes),
+# (about 30 s total). Everything else stays in the full set (`scripts/kani`, about 4 minutes),
 # which runs on demand and before a release.
 #
 # Add a harness here when it verifies in under 5 s at KANI_MEM=4G; move it out when it grows.
@@ -16,6 +16,10 @@ quick=(
   slices_alloc_small_page
   slices_alloc_medium_page
   slices_alloc_large_page
+  realloc_in_place_keeps_the_kind_and_fits
+  direct_table_tiles_and_matches_bin
+  huge_runs_cover_the_layout_and_its_alignment
+  dealloc_fast_path_agrees_with_classify
 )
 args=()
 for h in "${quick[@]}"; do args+=(--harness "$h"); done
