@@ -1,7 +1,7 @@
 //! The absolute floor: a bump pointer over a contiguous region obtained from
-//! memory.grow. `dealloc` is a no-op. `reset` rewinds the pointer to the start
-//! of the region so a harness can reuse memory between repetitions once every
-//! allocation has been released.
+//! memory.grow. `dealloc` is a no-op. `reset` rewinds the pointer so a harness
+//! can reuse memory between repetitions once every allocation has been
+//! released.
 //!
 //! The region is grown in large chunks so that memory.grow is rare enough not
 //! to show up in the per-operation cost; the harness measures memory.grow
@@ -16,11 +16,19 @@ const CHUNK: usize = 16 << 20;
 pub struct Bump {
     cur: Cell<usize>,
     end: Cell<usize>,
-    start: Cell<usize>,
+    // Rewind point for `reset`. It is captured on the first `reset` call, not
+    // at region creation, so that whatever the runtime allocated before the
+    // harness started measuring (thread bookkeeping, argument strings) is
+    // never handed out again. Everything a workload allocates after a reset
+    // must be dead by the next one; the drivers are written to guarantee that.
+    mark: Cell<usize>,
+    marked: Cell<bool>,
 }
 
 // Single-threaded wasm: there is exactly one thread, so a Cell-based static is
 // fine. This is the same assumption lol_alloc's AssumeSingleThreaded makes.
+// The native build exists only for sanity runs of the same single-threaded
+// driver.
 unsafe impl Sync for Bump {}
 
 impl Bump {
@@ -28,12 +36,17 @@ impl Bump {
         Bump {
             cur: Cell::new(0),
             end: Cell::new(0),
-            start: Cell::new(0),
+            mark: Cell::new(0),
+            marked: Cell::new(false),
         }
     }
 
     pub fn reset(&self) {
-        self.cur.set(self.start.get());
+        if !self.marked.get() {
+            self.mark.set(self.cur.get());
+            self.marked.set(true);
+        }
+        self.cur.set(self.mark.get());
     }
 
     #[inline(always)]
@@ -61,10 +74,13 @@ impl Bump {
         };
         if base != self.end.get() || self.end.get() == 0 {
             // Either the very first chunk, or something else grew memory in
-            // between (not the case in this harness, but stay correct):
-            // abandon the old region and start a fresh one.
-            self.start.set(base);
+            // between (the memory_grow workloads do). Abandon the old region
+            // and continue in the new one. Nothing allocated before the mark
+            // can live in the new region, so the mark moves with it.
             self.cur.set(base);
+            if self.marked.get() {
+                self.mark.set(base);
+            }
         }
         self.end.set(base + pages * super::WASM_PAGE);
         // Retry on the fast path; guaranteed to fit now.

@@ -47,7 +47,14 @@ minimization as goals (smaller is welcome, not required).
    guaranteed zero. There is no decommit and no unmap, so footprint control is entirely about
    reusing slices and pages. The "OS" is one `memory.grow` instruction.
 4. V8 is the primary engine. Fast paths must be tiny, straight-line, and inlinable into the
-   `__rg_alloc`/`__rg_dealloc` shims; slow paths are `#[cold] #[inline(never)]`.
+   `__rg_alloc`/`__rg_dealloc` shims; slow paths are `#[cold] #[inline(never)]`. Under V8's
+   Liftoff baseline tier there is no inlining at all, so each fast path must be one function
+   with no helper calls, and it must survive a consumer building at `opt-level = "z"` (simlin
+   does); the crate documents `[profile.release.package.wasmalloc] opt-level = 3`.
+5. The bar, measured under V8 TurboFan (`docs/research/landscape.md` B.5): std's dlmalloc at
+   about 44 ns and talc at about 22 ns per random small alloc or free, 5 to 6 ns on pure LIFO
+   churn. A size-class fast path of a handful of loads and stores should land in single-digit
+   nanoseconds for both LIFO and random order; the roofline harness pins the exact floor.
 
 ### Memory layout
 
@@ -64,9 +71,16 @@ minimization as goals (smaller is welcome, not required).
   small pages from fragmenting the runs medium and large pages need) is deferred until
   footprint tests show fragmentation; the heap's growing top edge is always available for
   aligned runs, so the failure mode is footprint, not correctness.
-- Growth policy: when no run of the needed length exists, grow by
-  `max(needed, quantum)` where `quantum` grows geometrically with the heap (bounded above);
-  exact constants come from the memory.grow cost measurements in `docs/research/`.
+- Growth policy: `memory.grow` costs 50 to 75 microseconds per call in V8 regardless of the
+  number of pages requested (about 100x wasmtime; measured in `docs/research/landscape.md`
+  C.8), so growth is geometric: grow by `max(needed, clamp(heap_size / 2, 1 MiB, 64 MiB))`,
+  rounded to whole slices, and reclaim the linker gap between `__heap_base` and the initial
+  `memory.size()` as the first free slices instead of paying a grow for the first page (std's
+  dlmalloc 0.2.11 wastes that gap). Growth must be sized from the rounded, aligned request
+  (talc 5.0.3 undersized growth and spun to the 4 GiB limit) and must tolerate `memory.grow`
+  returning `usize::MAX` (failure at the 4 GiB or host limit: return null so std reports OOM)
+  and non-contiguous results (something else grew memory in between): the returned page index
+  is the start of the new region, never an assumption of contiguity.
 
 ### Page kinds (derived from the block size class, hence from the Layout)
 
@@ -156,8 +170,15 @@ freeing tail slices and grow in place when the following slices are free.
 
 - `wasmalloc` (no_std): `bins` (pure math, verified), `slices` (bitmap and growth), `page`,
   `heap` (queues, `pages_direct`, retire), `alloc` (the `GlobalAlloc` impl and fast paths),
-  `backend` (a `Memory` trait implemented by `memory.grow` on wasm32 and by a 64 KiB- and
-  512 KiB-aligned simulated linear memory on the host for tests, Kani, Miri and fuzzing).
+  `backend` (a `Memory` trait implemented by `memory.grow` on wasm32 and by a 4 MiB-aligned
+  simulated linear memory on the host for tests, Kani, Miri and fuzzing). Addresses are
+  `usize` slice arithmetic derived from one base pointer with `wrapping_add`/`map_addr`
+  (`memory.grow` returns a page index, not a pointer), so Miri and Kani can follow provenance.
+  Edge cases the slice layer must handle: slice index 65535 (the last 64 KiB, where an end
+  address would wrap to 0) and `Layout` alignments up to 2^29.
+
+Note for benchmarking: on `wasm32-wasip1` std's default allocator is wasi-libc's C dlmalloc,
+not dlmalloc-rs; only `wasm32-unknown-unknown` measures the allocator browsers see.
 - `bench/`: the roofline harness grown into the benchmark suite (allocator selected by feature).
 - `fuzz/` and `verify/`: differential fuzzing against a model; Kani harnesses.
 - `docs/soundness-ledger.md`: the fallback for `unsafe` blocks that formal verification cannot

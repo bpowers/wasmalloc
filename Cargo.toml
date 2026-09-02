@@ -1,0 +1,37 @@
+[package]
+name = "wasmalloc"
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+description = "A fast mimalloc-v3-style global allocator for single-threaded wasm32"
+repository = "https://github.com/bpowers/wasm-clalloc"
+keywords = ["allocator", "wasm", "webassembly", "no_std", "mimalloc"]
+categories = ["memory-management", "no-std", "wasm"]
+publish = false
+
+[workspace]
+members = ["."]
+# bench/roofline keeps its own profiles and lockfile on purpose.
+exclude = ["bench/roofline"]
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+
+[dev-dependencies]
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = false
