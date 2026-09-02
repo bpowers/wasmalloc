@@ -21,7 +21,8 @@ Research reports: `docs/research/`. mimalloc v3.5.1 reference source: `~/src/mim
 - `third_party/` (gitignored) holds external checkouts used for real-workload testing: `simlin`
   and `resvg-wasm` (the user's wasm apps) and the node 24 tarball. Never commit anything there;
   hack branches inside those clones are fine.
-- Verification: Kani harnesses, Miri, differential fuzzing (see `docs/research/verification.md`).
+- Verification: Kani harnesses, Miri, differential fuzzing (see `docs/soundness-ledger.md`, the
+  `#[cfg(kani)]` modules in `src/`, and `fuzz/README.md`).
   Run Kani ONLY through `scripts/kani` (never bare `cargo kani`): it caps memory with a cgroup
   (default 6 GiB, `KANI_MEM`) and time (default 30 min, `KANI_TIMEOUT`). An uncapped CBMC run
   once took the whole machine down. Wrap any other memory-hungry tool (fuzzers, wasm-opt on

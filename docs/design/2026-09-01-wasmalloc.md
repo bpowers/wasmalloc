@@ -1,7 +1,18 @@
 # wasmalloc Design
 
 ## Summary
-<!-- TO BE WRITTEN after the research phase completes -->
+
+wasmalloc is a pure-Rust, `no_std`, single-threaded `#[global_allocator]` for wasm32 whose
+structure follows mimalloc v3: size-class bins, one intrusive free list per page, lazy page
+extension, page retirement, and 64 KiB slices managed over `memory.grow`. Three facts about the
+target reshape that design. Rust passes the `Layout` to `dealloc` and `realloc`, so the size class
+and the page kind are pure functions of the arguments: page headers are found by masking the
+address, alignment up to 4 KiB is satisfied by construction, and blocks above the medium limit are
+header-less runs of slices. Wasm memory is a flat, zero-filled, grow-only space of 64 KiB pages,
+so pages are placed at addresses that make the masks valid, fresh memory skips zeroing, and runs at
+the top of the heap grow in place by growing memory. There is exactly one thread, so nothing is
+atomic or thread-local. The allocator is generic over a `Memory` backend and runs on the host
+against a simulated linear memory for tests, fuzzing, Miri and Kani.
 
 ## Definition of Done
 
@@ -26,10 +37,36 @@ Out of scope: multi-threaded wasm, native production use, a C malloc API, and RS
 minimization as goals (smaller is welcome, not required).
 
 ## Acceptance Criteria
-<!-- TO BE WRITTEN -->
+
+- wasmalloc.AC1 Correctness: the model-based differential tester passes every profile against
+  the heap on the host; the wasm32 end-to-end test passes under wasmtime; Miri reports nothing on
+  the heap, page and backend tests; every Kani harness verifies; every `unsafe` block has a
+  passing proof or an accepted ledger entry.
+- wasmalloc.AC2 Speed: on the roofline harness's workloads under V8's optimizing tier, wasmalloc
+  is faster than std's dlmalloc on every workload except the realloc doubling chain, and faster
+  than talc on aggregate; the 32-byte alloc+free pair is within 2x of the free-list floor.
+- wasmalloc.AC3 Footprint: peak `memory.size` after each roofline workload is at most 2.2x the
+  default allocator's, so the crate is safe as a drop-in default.
+- wasmalloc.AC4 Integration: one `#[global_allocator]` line, no dependencies, stable Rust 1.85,
+  `wasm32-unknown-unknown`, `wasm32-wasip1` and `wasip2`; refuses to build with `atomics`.
+
+Status against these criteria is recorded in "Implementation status" below.
 
 ## Glossary
-<!-- TO BE WRITTEN -->
+
+- **Slice**: one 64 KiB wasm page, the unit of `memory.grow` and of the slice bitmap.
+- **Page**: an allocator page holding blocks of one size class, with its header at the start:
+  small (64 KiB, blocks up to 10 KiB) or medium (256 KiB, blocks up to 40 KiB). Aligned to its
+  own size so `ptr & !(size - 1)` finds the header.
+- **Run**: a header-less sequence of whole slices serving one block above the medium limit, or
+  any block with alignment above 4 KiB. Its length is recomputed from the Layout on free.
+- **Bin / size class**: one of 60 block sizes (8-byte steps to 64 bytes, then four per doubling).
+- **Direct table**: `pages_direct[(size + 7) / 8]`, the page to pop from for sizes up to 1 KiB.
+- **Retired page**: an empty page kept in its queue for a few collections in case the size class
+  is still active; released before memory grows.
+- **Full queue**: pages with no free and no unextended blocks, kept out of the search.
+- **Floor**: a deliberately minimal allocator in the benchmark harness that bounds what any
+  size-class fast path can achieve on an engine.
 
 ## Architecture (draft v0, written from the lead's reading of mimalloc v3.5.1; to be revised after research)
 
@@ -205,7 +242,7 @@ Everything in the architecture above is implemented on `main` and verified as fo
 | `backend` | `Memory` trait in slices; `WasmMemory`; `SimMemory` with non-contiguous growth and a 4 MiB-aligned host `Region` | tests; used by every other module's tests, Miri and Kani |
 | `slices` | free and known-zero bitmaps, lowest-first aligned run search with dedicated 1/4/8/64-slice scans, `acquire` with geometric growth (an eighth of the heap) sized from the current end, `alloc_tail` (bottom of the free tail) and `extend_with_growth` (in-place growth through `memory.grow`) for growing runs, last slice of a 4 GiB memory never used, no bounds-check panic paths | 25 tests incl. a model check; 12 Kani harnesses (4 in the quick gate) |
 | `page` | 36-byte in-band header (48 on the host), `pop`/`push`/`extend`, `header_of` mask | 20 tests; Miri clean under Stacked and Tree Borrows; 4 Kani harnesses over a proof-only memory; ledger PAGE-01..06 |
-| `heap` | bin queues, direct table with a read-only sentinel page, candidate search, full queue, retirement and collection with every retired page released before memory grows, header-less runs above 40 KiB, in-place realloc within a kind or a run (through memory growth at the top), moved runs placed at the top | 18 tests incl. randomised churn with content checks and a full invariant validator; no Kani harnesses yet; no ledger entries yet |
+| `heap` | bin queues, direct table with a read-only sentinel page, candidate search, full queue, retirement and collection with every retired page released before memory grows, header-less runs above 40 KiB, in-place realloc within a kind or a run (through memory growth at the top), moved runs placed at the top | 18 tests incl. randomised churn with content checks and a full invariant validator; 13 Kani harnesses (arithmetic ones in the quick gate, lifecycle ones over one-page models); ledger HEAP-01..09 |
 | `global` | `WasmAlloc`: `GlobalAlloc` over a static heap; refuses the `atomics` feature | end-to-end wasm32 test under wasmtime with std collections |
 | `testing` | model-based differential tester with six profiles, mutant tests, cargo-fuzz targets for System and the heap | all profiles pass against the heap; 208k fuzz runs clean on main, 249k more on tuning-b |
 
