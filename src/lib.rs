@@ -11,6 +11,10 @@
 //! - [`slices`]: the free-slice bitmap and the memory growth policy.
 //! - [`page`]: the in-band page header and block free-list operations.
 //! - [`heap`]: bin queues, the direct table, page lifecycle, and alloc/dealloc/realloc.
+//! - [`global`] (wasm32 only): [`WasmAlloc`], the `#[global_allocator]` over a static heap.
+//!
+//! Threads are not supported: the crate assumes wasm32 without the `atomics` target feature and
+//! refuses to build with it.
 
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
@@ -21,6 +25,14 @@ extern crate std;
 
 pub mod backend;
 pub mod bins;
+#[cfg(target_arch = "wasm32")]
+pub mod global;
 pub mod heap;
 pub mod page;
 pub mod slices;
+
+#[cfg(target_arch = "wasm32")]
+pub use global::WasmAlloc;
+
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+compile_error!("wasmalloc is single-threaded and does not support the wasm atomics feature");
