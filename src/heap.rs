@@ -31,7 +31,7 @@
 //! They are also all released before linear memory is grown, whatever their count: growth is
 //! permanent footprint on wasm, a released page is only a page initialisation away. That release
 //! walks every bin queue rather than the retired range and its window, so it does not depend on
-//! the countdown bookkeeping, which the fast paths do not maintain ([`Heap::release_empty_pages`]).
+//! the countdown bookkeeping, which the fast paths do not maintain (`Heap::release_empty_pages`).
 //!
 //! # Fast paths
 //!
