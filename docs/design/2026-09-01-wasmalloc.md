@@ -523,3 +523,55 @@ run, the code the bench executes). Baseline: main at afc0e2c (byte-identical to 
    (IQR -7.8 to 7.0, n = 20), that is nothing, as the profile predicted (under 0.1 ns per
    free). Roofline flat on every engine (largest move random_actions 14.54 -> 14.40 on n24
    TurboFan, within the run-to-run spread). Kept for the shorter shim.
+
+4. **Packed header state bytes: dropped** (profile rank 5 and roadmap item 2, evaluated as the
+   lead asked). V8 emits `movzx r, [m]; cmpb [m], 0` for every `load8_u; eqz`, two accesses per
+   byte tested, so `needs_transition` was tried as one 32-bit load of `kind`, `flags`,
+   `retire_expire` and a fourth byte, masked. With `free_is_zero` as the fourth byte, `push`'s
+   byte store into the word that `needs_transition` then loads whole is a store-to-load
+   forwarding stall on this core, the u16 counter's failure mode again (roofline 12.1):
+   alloc_free_32 1.248 -> 3.30 ns on n24 TurboFan and 1.12 -> 3.30 on wasmtime, batch_lifo_32
+   1.59 -> 3.79, churn +18 percent. With an explicit padding byte instead and `free_is_zero`
+   left in the word before: `__rust_dealloc` 59 -> 57 wasm instructions at `-Oz` (3 loads, and
+   LLVM turned the two tests into one `select`), TurboFan 228 bytes either way, the transition
+   test 10 instructions with 1 load instead of 5 with 2 on the common path (`used != 0`) or 8
+   with 4 when the free empties the page; roofline alloc_free_32 1.248 -> 1.112 on n24 TurboFan
+   (-11 percent) and batch_lifo_32 1.588 -> 1.544, node 22 -0.7 percent, wasmtime flat, and
+   n24 Liftoff alloc_free_32 4.38 -> 4.79 (+9 percent: Liftoff executes every extra wasm
+   operation); simlin compile -0.4 ms (IQR -2.4 to 1.1, n = 20). Dropped: the gain is confined
+   to the pair whose every free empties its page, Liftoff loses what TurboFan gains, the real
+   workload does not move, and it would reopen PAGE-01 to PAGE-05 for a new unsafe word read.
+   For roadmap item 2: a byte the fast path stores must not share a word the fast path loads.
+
+5. **Shim size, main -> this branch** (wasm instructions after `wasm-opt -O3` in the simlin
+   bundle; V8 TurboFan bytes from the tiered dump): `__rust_alloc` 63 -> 56 (216 -> 232 bytes,
+   because V8 now duplicates the cold call for a third branch; the hot path is the same
+   instruction sequence, and V8 inlines the alloc path into 67 callers instead of 64),
+   `__rust_dealloc` 68 -> 59 (248 -> 228; 100 -> 103 callers), `__rust_alloc_zeroed` 82 -> 77
+   (380 -> 352), `__rust_realloc` 493 -> 611 (1916 -> 1752 bytes). The realloc shim grew in
+   wasm because the two `classify` calls, `fits_in_place` and `huge_slices` are inlined into it
+   (four calls and three shadow-stack operations gone); V8 did not inline it before (it was
+   already far past the budget) and its executed path is shorter, which is what its self time
+   measures. In some builds LLVM leaves the body under the name `Heap::realloc` and inlines the
+   shim into the four callers instead; the call depth is the same either way. Worth it.
+
+Final state against main (baseline and final bundle interleaved, two runs, 20 paired
+iterations): compile 1928 -> 1926 ms median, paired difference -6.2 ms (IQR -12.5 to 1.0),
+matching the sum of the three pairwise deltas (-4.2, -2.2, +0.3); the whole pipeline -6.9 ms
+(IQR -19.5 to 11.2); peak memory.size unchanged at 4671 pages. Roofline, main -> final,
+median over every run (n24 TurboFan / n24 Liftoff / n22 TurboFan / wasmtime, ns per op):
+alloc_free_32 1.249/4.41/2.599/1.12 -> 1.248/4.38/2.592/1.12, alloc_free_32_align16
+1.248/4.40/2.601/1.122 -> 1.248/4.39/2.598/1.122, batch_lifo_32 1.596/5.41/3.077/1.86 ->
+1.593/5.41/3.079/1.87, churn 6.68/10.98/7.27/6.26 -> 6.61/10.94/7.33/6.25, random_actions
+14.88/21.46/14.86/14.38 -> 14.44/19.99/14.39/13.85, realloc_doubling 640/826/649/622 ->
+628/814/622/614. Proofs: the quick set (13) and the four named harnesses individually,
+including the new `an_allocation_above_the_direct_table_pops_the_queue_head` (34 s, 2.5 GB,
+so in the full set, not the quick one); 246,708 `model_heap` fuzz runs in 60 s, clean.
+
+Next: the realloc entry still classifies the old Layout with a rounding `select` and compares
+kinds through `fits_in_place` for every move (the executed path is about 65 instructions before
+the inlined alloc); a version that decides the common word-aligned growth from
+`bin_size(bin(old))` alone would trim it further. The `-Oz` build's `__rust_alloc` is still
+called out of line at 82 percent of simlin's allocation sites; a `#[inline(always)]` shim is
+not something this crate controls, so the remaining lever is V8's inlining budget, which
+favours exactly the smaller shims this pass produced.
