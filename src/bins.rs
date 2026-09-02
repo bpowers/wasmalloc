@@ -55,8 +55,11 @@ pub const LARGE_MAX_OBJ_SIZE: usize = 512 * 1024;
 /// slices, which are 64 KiB-aligned (or aligned to the request when it is larger still).
 pub const MAX_NATURAL_ALIGN: usize = 4096;
 
-/// Bytes reserved at the start of a page for its header. `block_start` never returns less.
-pub const PAGE_HEADER_RESERVE: usize = 32;
+/// Bytes reserved at the start of a page for its header: one cache line. The header itself is
+/// smaller, but queue links and the free-list head are `usize`, which is 8 bytes on the 64-bit
+/// test host, and the reserve is the same on every target so host tests exercise the exact page
+/// geometry that wasm32 uses.
+pub const PAGE_HEADER_RESERVE: usize = 64;
 
 /// Largest size served by the direct table (`pages_direct[direct_index(size)]`).
 pub const DIRECT_MAX_SIZE: usize = 1024;
@@ -354,7 +357,7 @@ mod tests {
         }
         assert_eq!(
             blocks_per_page(PageKind::Small, 8),
-            (SMALL_PAGE_SIZE - 32) / 8
+            (SMALL_PAGE_SIZE - PAGE_HEADER_RESERVE) / 8
         );
     }
 
