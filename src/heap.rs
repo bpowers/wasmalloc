@@ -304,18 +304,32 @@ impl<M: Memory, const WORDS: usize> Heap<M, WORDS> {
                     self.slices.shrink(start, old_n, new_n);
                     return Some(ptr);
                 }
-                if self
-                    .slices
-                    .try_extend(start, old_n, new_n - old_n)
-                    .is_some()
+                // In place through the free slices after the run and, when the run is at the
+                // top of the heap, through memory.grow; the copy below is the last resort.
+                if slices::extend_with_growth(
+                    &mut self.slices,
+                    &mut self.mem,
+                    start,
+                    old_n,
+                    new_n - old_n,
+                    &self.policy,
+                )
+                .is_some()
                 {
                     return Some(ptr);
                 }
             }
             _ => {}
         }
-        // SAFETY: new_layout has non-zero size (caller contract).
-        let new = unsafe { self.alloc(new_layout)? };
+        // The block moves. Every move into a run is a growth (a run only ever shrinks in place),
+        // that is, a buffer the program is growing, so the new run goes to the bottom of the
+        // free tail at the top of the heap, where the next growth extends it instead of copying
+        // it again. A lowest-fit run would land in a hole between pages and move at every step.
+        let new = match bins::classify(new_layout) {
+            Class::Huge => self.alloc_huge(new_layout, false, true)?,
+            // SAFETY: new_layout has non-zero size (caller contract).
+            Class::Bin(_) => unsafe { self.alloc(new_layout)? },
+        };
         // SAFETY: both blocks are valid for `min` bytes and distinct.
         unsafe {
             ptr::copy_nonoverlapping(ptr.as_ptr(), new.as_ptr(), layout.size().min(new_size));
@@ -333,7 +347,7 @@ impl<M: Memory, const WORDS: usize> Heap<M, WORDS> {
     unsafe fn alloc_generic(&mut self, layout: Layout, zero: bool) -> Option<NonNull<u8>> {
         self.ensure_init();
         match bins::classify(layout) {
-            Class::Huge => self.alloc_huge(layout, zero),
+            Class::Huge => self.alloc_huge(layout, zero, false),
             Class::Bin(bin) => {
                 self.generic_count += 1;
                 if self.generic_count >= GENERIC_COLLECT_PERIOD {
@@ -373,15 +387,19 @@ impl<M: Memory, const WORDS: usize> Heap<M, WORDS> {
         }
     }
 
-    fn alloc_huge(&mut self, layout: Layout, zero: bool) -> Option<NonNull<u8>> {
+    /// A header-less run for `layout`: the lowest fit, or with `top` the bottom of the free
+    /// tail when that is long enough (see [`SliceMap::alloc_tail`] and the `slices` module
+    /// documentation for why a growing buffer wants the top).
+    fn alloc_huge(&mut self, layout: Layout, zero: bool, top: bool) -> Option<NonNull<u8>> {
+        debug_assert!(self.initialized);
         let count = huge_slices(layout);
         // Alignments up to a slice are satisfied by slice alignment; larger ones align the run.
         let align = layout.align().div_ceil(SLICE_SIZE).max(1);
-        let mut run = slices::acquire(&mut self.slices, &mut self.mem, count, align, &self.policy);
+        let mut run = self.acquire_run(count, align, top);
         if run.is_none() {
             // SAFETY: heap invariants hold between operations.
             unsafe { self.collect_retired(true) };
-            run = slices::acquire(&mut self.slices, &mut self.mem, count, align, &self.policy);
+            run = self.acquire_run(count, align, false);
         }
         let run = run?;
         let addr = run.start * SLICE_SIZE;
@@ -392,6 +410,18 @@ impl<M: Memory, const WORDS: usize> Heap<M, WORDS> {
         }
         // SAFETY: slice addresses of owned memory are non-null.
         Some(unsafe { NonNull::new_unchecked(p) })
+    }
+
+    /// The lowest fit, growing memory if nothing fits; with `top`, the bottom of the free tail
+    /// first, when it is long enough, so no memory is grown for a run a hole could hold.
+    fn acquire_run(&mut self, count: usize, align: usize, top: bool) -> Option<slices::Run> {
+        if top {
+            let end = self.mem.size_slices();
+            if let Some(run) = self.slices.alloc_tail(count, align, end) {
+                return Some(run);
+            }
+        }
+        slices::acquire(&mut self.slices, &mut self.mem, count, align, &self.policy)
     }
 
     #[cold]
@@ -1120,6 +1150,109 @@ mod tests {
                 assert!(h.slices.is_free(start + s), "run released after the move");
             }
             h.dealloc(t, layout(tiny, 8));
+        }
+        validate(h);
+    }
+
+    #[test]
+    fn realloc_grows_a_top_run_through_memory_growth() {
+        let mut f = heap(256, 4, 0);
+        let h = &mut f.heap;
+        unsafe {
+            // Three of the four initial slices: the run reaches the end of memory with one
+            // free slice after it, which is not enough for the growth below.
+            let l = layout(3 * SLICE_SIZE, 8);
+            let p = h.alloc(l).unwrap();
+            let start = p.as_ptr() as usize / SLICE_SIZE;
+            assert_eq!(h.mem.size_slices(), start + 4);
+            fill(p, l.size(), 0x11);
+            let bigger = 10 * SLICE_SIZE;
+            let q = h.realloc(p, l, bigger).unwrap();
+            assert_eq!(q, p, "extended in place through memory growth");
+            check(q, l.size(), 0x11);
+            assert_eq!(
+                h.mem.size_slices(),
+                start + 10,
+                "grew by exactly the missing slices"
+            );
+            for s in 0..10 {
+                assert!(!h.slices.is_free(start + s));
+            }
+            fill(q, bigger, 0x12);
+            validate(h);
+
+            // Growth the region cannot provide moves nothing and fails cleanly.
+            let end = h.mem.size_slices();
+            assert!(h.realloc(q, layout(bigger, 8), 1000 * SLICE_SIZE).is_none());
+            assert_eq!(h.mem.size_slices(), end);
+            check(q, bigger, 0x12);
+            validate(h);
+
+            // Someone else grows memory first: the fresh region is not contiguous with the
+            // run, so the block moves; its contents survive and the region is not lost.
+            assert!(h.mem.skip_slices(1));
+            let free_before = h.free_slices();
+            let r = h.realloc(q, layout(bigger, 8), 12 * SLICE_SIZE).unwrap();
+            assert_ne!(r, q, "a non-contiguous region cannot extend the run");
+            check(r, bigger, 0x12);
+            assert!(h.mem.size_slices() > end + 1);
+            assert!(
+                !h.slices.is_free(end + 1),
+                "the skipped slice never enters the map"
+            );
+            assert!(
+                h.free_slices() >= free_before + 10,
+                "the old run is free again"
+            );
+            h.dealloc(r, layout(12 * SLICE_SIZE, 8));
+        }
+        validate(h);
+    }
+
+    #[test]
+    fn a_run_that_cannot_extend_moves_to_the_top_of_the_heap() {
+        let mut f = heap(256, 4, 0);
+        let h = &mut f.heap;
+        unsafe {
+            // Grow memory once so the top has room, then free it all.
+            let warm = layout(40 * SLICE_SIZE, 8);
+            let w = h.alloc(warm).unwrap();
+            h.dealloc(w, warm);
+            let end = h.mem.size_slices();
+            let two = layout(2 * SLICE_SIZE, 8);
+            // Over-aligned, so a run of one slice rather than a block in a medium page.
+            let one = layout(100, 2 * MAX_NATURAL_ALIGN);
+            // A run with another block right after it cannot extend in place.
+            let a = h.alloc(two).unwrap();
+            let b = h.alloc(one).unwrap();
+            assert_eq!(b.as_ptr() as usize, a.as_ptr() as usize + 2 * SLICE_SIZE);
+            fill(a, two.size(), 0x21);
+            fill(b, one.size(), 0x22);
+            let four = layout(4 * SLICE_SIZE, 8);
+            let a2 = h.realloc(a, two, four.size()).unwrap();
+            assert_ne!(a2, a);
+            check(a2, two.size(), 0x21);
+            check(b, one.size(), 0x22);
+            // The moved run sits at the bottom of the free tail, right after `b`, with the rest
+            // of the tail above it, and memory did not grow for it.
+            assert_eq!(a2.as_ptr() as usize, b.as_ptr() as usize + SLICE_SIZE);
+            assert_eq!(h.mem.size_slices(), end);
+            validate(h);
+            // From there it grows in place: through the tail first, then through memory.grow
+            // once the tail is used up (37 free slices above it, 46 needed, so 9 missing; the
+            // half-heap step of 22 is larger and wins).
+            fill(a2, four.size(), 0x23);
+            let big = layout(50 * SLICE_SIZE, 8);
+            let a3 = h.realloc(a2, four, big.size()).unwrap();
+            assert_eq!(a3, a2);
+            check(a3, four.size(), 0x23);
+            assert_eq!(h.mem.size_slices(), end + 22, "grew by the geometric step");
+            // The slices the block left behind are free and the lowest fit reuses them.
+            let c = h.alloc(two).unwrap();
+            assert_eq!(c, a);
+            h.dealloc(c, two);
+            h.dealloc(b, one);
+            h.dealloc(a3, big);
         }
         validate(h);
     }

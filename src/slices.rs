@@ -23,6 +23,17 @@
 //! between `__heap_base` and the initial `memory.size` is reclaimed via [`initial_free_range`]
 //! before the first grow.
 //!
+//! The exception is a run that is being grown by `realloc`. [`extend_with_growth`] extends a
+//! run in place through the free slices after it and, when the run reaches the end of memory,
+//! through `memory.grow` itself, so a buffer at the top of the heap grows without a copy. A run
+//! that cannot be extended is moved with [`SliceMap::alloc_tail`] to the bottom of the free
+//! tail, the free slices that reach the end of memory, so that it lands at the top with the
+//! rest of the tail above it and its next growths are in place; this is dlmalloc's top chunk.
+//! A slice map full of holes (retired pages waiting to be released) would otherwise put every
+//! doubling of a growing buffer into a new hole and copy it again at the next step. Placing
+//! the run at the highest fit instead, with nothing free above it, makes every growth a
+//! `memory.grow` of half the heap and runs memory to the 4 GiB limit within a few rounds.
+//!
 //! Invariants maintained by every method (checked by the tests and the Kani harnesses):
 //! - `zero` implies `free`;
 //! - every word below `hint` has no free bit;
@@ -180,6 +191,24 @@ impl<const WORDS: usize> SliceMap<WORDS> {
         })
     }
 
+    /// Take `count` free slices from the bottom of the free tail: the maximal run of free slices
+    /// that ends at the absolute slice index `below` (callers pass the end of memory). The run
+    /// starts at the lowest slice of the tail whose absolute index is a multiple of `align` (a
+    /// power of two, in slices), so whatever the tail holds beyond it stays free above the run.
+    /// `count >= 1`. Returns `None` when the tail is empty or too short for that; the map is
+    /// unchanged then. Nothing above the end of memory is ever free, so a `below` past the end
+    /// of the map is harmless.
+    pub fn alloc_tail(&mut self, count: usize, align: usize, below: usize) -> Option<Run> {
+        debug_assert!(count >= 1);
+        debug_assert!(align.is_power_of_two());
+        let rel = self.find_tail(count, align, below)?;
+        let zeroed = self.claim(rel, count);
+        Some(Run {
+            start: self.base + rel,
+            zeroed,
+        })
+    }
+
     /// Return `[start, start + count)`, which must be handed out, to the map. The memory is
     /// dirty now, so the slices lose their zero bits for good (until `memory.grow` gives fresh
     /// ones).
@@ -223,14 +252,20 @@ impl<const WORDS: usize> SliceMap<WORDS> {
 
     /// Whether slice `idx` is owned by the allocator and not handed out.
     pub fn is_free(&self, idx: usize) -> bool {
-        let rel = self.rel(idx, 1);
-        (self.free[rel / BITS] >> (rel % BITS)) & 1 == 1
+        self.bit_is_free(self.rel(idx, 1))
     }
 
     /// Whether slice `idx` is free and known to be all zero.
     pub fn is_zero(&self, idx: usize) -> bool {
         let rel = self.rel(idx, 1);
         (self.zero[rel / BITS] >> (rel % BITS)) & 1 == 1
+    }
+
+    /// Whether every slice of `[start, start + count)` is free; vacuously true for `count == 0`.
+    /// The range must lie inside the map.
+    pub fn run_is_free(&self, start: usize, count: usize) -> bool {
+        let rel = self.rel(start, count);
+        all_set(&self.free, rel, count)
     }
 
     /// Number of free slices.
@@ -348,6 +383,43 @@ impl<const WORDS: usize> SliceMap<WORDS> {
             Some(rel)
         } else {
             rel.checked_add(align - over)
+        }
+    }
+
+    /// Relative index of the lowest aligned start of `count` slices inside the free tail ending
+    /// at the absolute index `below`, if the tail is that long.
+    fn find_tail(&self, count: usize, align: usize, below: usize) -> Option<usize> {
+        let end = below.saturating_sub(self.base).min(Self::CAPACITY);
+        if end == 0 || !self.bit_is_free(end - 1) {
+            return None;
+        }
+        let lo = self.prev_clear(end - 1).map_or(0, |c| c + 1);
+        let start = self.align_up(lo, align)?;
+        (start <= end && end - start >= count).then_some(start)
+    }
+
+    #[inline]
+    fn bit_is_free(&self, rel: usize) -> bool {
+        (self.free[rel / BITS] >> (rel % BITS)) & 1 == 1
+    }
+
+    /// Highest non-free slice strictly below `pos` (`pos <= CAPACITY`).
+    #[inline]
+    fn prev_clear(&self, pos: usize) -> Option<usize> {
+        if pos == 0 {
+            return None;
+        }
+        let mut w = (pos - 1) / BITS;
+        let mut b = !self.free[w] & (u64::MAX >> (BITS - 1 - (pos - 1) % BITS));
+        loop {
+            if b != 0 {
+                return Some(w * BITS + (BITS - 1 - b.leading_zeros() as usize));
+            }
+            if w == 0 {
+                return None;
+            }
+            w -= 1;
+            b = !self.free[w];
         }
     }
 
@@ -498,6 +570,12 @@ impl GrowPolicy {
         min_grow: 16,
         max_grow: 1024,
     };
+
+    /// The growth step for a heap of `heap` slices: half of it, clamped to the policy's range.
+    #[inline]
+    pub fn step(&self, heap: usize) -> usize {
+        (heap / 2).max(self.min_grow).min(self.max_grow)
+    }
 }
 
 impl Default for GrowPolicy {
@@ -549,11 +627,7 @@ fn grow_and_alloc<const WORDS: usize, M: Memory>(
     if needed > room {
         return None;
     }
-    // Half the heap, not half of `end`: on the host the simulated memory sits at an arbitrary
-    // absolute slice index, and on wasm the two differ only by the map's rounded base.
-    let heap = end.saturating_sub(map.base());
-    let step = (heap / 2).max(policy.min_grow).min(policy.max_grow);
-    let want = needed.max(step).min(room);
+    let want = needed.max(growth_step(map, end, policy)).min(room);
     let (start, got) = match mem.grow(want) {
         Some(start) => (start, want),
         None if want > needed => (mem.grow(needed)?, needed),
@@ -577,6 +651,97 @@ fn grow_and_alloc<const WORDS: usize, M: Memory>(
         "a region sized for any start cannot fail to serve the request"
     );
     run
+}
+
+/// The geometric step for growing memory whose end is at absolute slice `end`. The heap size it
+/// is taken from runs from the map's base, not from slice 0: on the host the simulated memory
+/// sits at an arbitrary absolute slice index, and on wasm the two differ only by the map's
+/// rounded base.
+#[inline]
+fn growth_step<const WORDS: usize>(
+    map: &SliceMap<WORDS>,
+    end: usize,
+    policy: &GrowPolicy,
+) -> usize {
+    policy.step(end.saturating_sub(map.base()))
+}
+
+/// [`SliceMap::try_extend`], growing linear memory when the run is at the top of the heap.
+///
+/// Grows the handed-out run `[start, start + count)` by `extra >= 1` slices in place. When the
+/// slices right after it are free the map alone serves the request. Otherwise, if every slice
+/// from the run's end to the current end of memory is free (there may be none), memory is grown
+/// by what is missing or by the geometric step of `policy`, whichever is larger, the fresh
+/// region is added to the map and the tail is claimed, so a buffer at the top of the heap grows
+/// without a copy however often it is resized.
+///
+/// Returns whether the claimed tail was all zero, or `None` with the run unchanged when a taken
+/// slice lies between the run and the end of memory, when growth is refused or would pass
+/// [`SliceMap::usable_limit`], or when the fresh region did not start at the end of memory
+/// (something else grew memory in between; the region stays in the map for later requests and
+/// the caller moves the block instead).
+pub fn extend_with_growth<const WORDS: usize, M: Memory>(
+    map: &mut SliceMap<WORDS>,
+    mem: &mut M,
+    start: usize,
+    count: usize,
+    extra: usize,
+    policy: &GrowPolicy,
+) -> Option<bool> {
+    if let Some(zeroed) = map.try_extend(start, count, extra) {
+        return Some(zeroed);
+    }
+    grow_and_extend(map, mem, start, count, extra, policy)
+}
+
+#[cold]
+#[inline(never)]
+fn grow_and_extend<const WORDS: usize, M: Memory>(
+    map: &mut SliceMap<WORDS>,
+    mem: &mut M,
+    start: usize,
+    count: usize,
+    extra: usize,
+    policy: &GrowPolicy,
+) -> Option<bool> {
+    debug_assert!(count >= 1 && extra >= 1);
+    let tail = start + count;
+    let end = mem.size_slices();
+    let limit = map.usable_limit();
+    // A handed-out run lies inside memory and inside the map, so `tail <= end`; if the end of
+    // memory has passed the map (something else grew it), the slices up there are not the
+    // map's and cannot be free.
+    if end < tail || end > limit {
+        return None;
+    }
+    let have = end - tail;
+    // `try_extend` failed, so if the whole extension fits below the end of memory a taken slice
+    // is in the way; and only a run with nothing but free slices above it is at the top.
+    if have >= extra || !map.run_is_free(tail, have) {
+        return None;
+    }
+    let need = extra - have;
+    let room = limit - end;
+    if need > room {
+        return None;
+    }
+    let want = need.max(growth_step(map, end, policy)).min(room);
+    let (region, got) = match mem.grow(want) {
+        Some(region) => (region, want),
+        None if want > need => (mem.grow(need)?, need),
+        None => return None,
+    };
+    add_region(map, region, got);
+    if region != end {
+        return None;
+    }
+    // The tail up to `end` was free and the region continues it for at least `need` slices.
+    let extended = map.try_extend(start, count, extra);
+    debug_assert!(
+        extended.is_some(),
+        "a contiguous region must complete the tail"
+    );
+    extended
 }
 
 /// Record a grown region as free, zeroed slices. The part the map cannot hand out, if any (only
@@ -637,6 +802,21 @@ mod tests {
         (0..free.len().saturating_sub(count - 1))
             .filter(|&s| (base + s) % align == 0)
             .find(|&s| free[s..s + count].iter().all(|&f| f))
+    }
+
+    /// The specification of `alloc_tail`: the lowest aligned index in the maximal run of free
+    /// slices ending at `below`, provided `count` slices fit between it and `below`.
+    fn reference_find_tail(
+        free: &[bool],
+        base: usize,
+        count: usize,
+        align: usize,
+        below: usize,
+    ) -> Option<usize> {
+        let end = below.min(free.len());
+        let lo = (0..end).rev().take_while(|&i| free[i]).last()?;
+        let start = (lo..end).find(|&s| (base + s) % align == 0)?;
+        (end - start >= count).then_some(start)
     }
 
     /// A map whose bits match the model, built through the public API.
@@ -826,6 +1006,22 @@ mod tests {
                         assert_eq!(m.free_count(), template.free_count() - count);
                     }
                     check_invariants(&m);
+                    for below in [N + 9, N, N - 3, 130, 64, 7] {
+                        let expect = reference_find_tail(&free, 0, count, align, below);
+                        let mut m = template.clone();
+                        let got = m.alloc_tail(count, align, below);
+                        assert_eq!(
+                            got.map(|r| r.start),
+                            expect,
+                            "holes {a} {b}, count {count} align {align} below {below}"
+                        );
+                        if let Some(r) = got {
+                            assert_eq!(r.zeroed, zero[r.start..r.start + count].iter().all(|&z| z));
+                            assert!((r.start..r.start + count).all(|i| !m.is_free(i)));
+                            assert_eq!(m.free_count(), template.free_count() - count);
+                        }
+                        check_invariants(&m);
+                    }
                 }
             }
         }
@@ -910,6 +1106,80 @@ mod tests {
             })
         );
         assert_eq!(m.free_count(), 0);
+        check_invariants(&m);
+    }
+
+    #[test]
+    fn alloc_tail_takes_the_bottom_of_the_free_tail() {
+        let mut m = SliceMap::<W>::new();
+        m.init(192);
+        // Free: [192, 256) and [260, 300); the end of memory is 300.
+        m.add_free(192, 64, true);
+        m.add_free(260, 40, false);
+        // The tail is [260, 300): the run goes to its bottom and leaves the rest above.
+        assert_eq!(
+            m.alloc_tail(3, 1, 300),
+            Some(Run {
+                start: 260,
+                zeroed: false
+            })
+        );
+        // Alignment moves the start up inside the tail.
+        assert_eq!(
+            m.alloc_tail(3, 8, 300),
+            Some(Run {
+                start: 264,
+                zeroed: false
+            })
+        );
+        assert!(m.is_free(263));
+        // Too long for the 33-slice tail, whatever lies below: nothing.
+        assert_eq!(m.alloc_tail(40, 1, 300), None);
+        assert_eq!(m.alloc_tail(34, 1, 300), None);
+        assert_eq!(
+            m.alloc_tail(33, 1, 300),
+            Some(Run {
+                start: 267,
+                zeroed: false
+            })
+        );
+        assert_eq!(m.free_count(), 64 + 1);
+        // The slice below `below` must be free for a tail to exist at all.
+        assert_eq!(m.alloc_tail(1, 1, 298), None);
+        assert_eq!(m.alloc_tail(1, 1, 300), None);
+        // A `below` inside a run of free slices: the tail is the part of that run below it.
+        assert_eq!(
+            m.alloc_tail(10, 8, 250),
+            Some(Run {
+                start: 192,
+                zeroed: true
+            })
+        );
+        assert_eq!(
+            m.alloc_tail(10, 128, 250),
+            None,
+            "256 is the one multiple of 128 in the tail and it lies above `below`"
+        );
+        assert_eq!(
+            m.alloc_tail(1, 8, 250),
+            Some(Run {
+                start: 208,
+                zeroed: true
+            })
+        );
+        // A `below` past the end of the map, or at zero, is harmless: the tail then ends at the
+        // map's end, where nothing is free.
+        assert_eq!(m.alloc_tail(1, 1, usize::MAX), None);
+        assert_eq!(m.alloc_tail(1, 1, 0), None);
+        m.free(299, 1);
+        assert_eq!(m.alloc_tail(1, 1, usize::MAX), None);
+        assert_eq!(
+            m.alloc_tail(1, 1, 300),
+            Some(Run {
+                start: 299,
+                zeroed: false
+            })
+        );
         check_invariants(&m);
     }
 
@@ -1023,6 +1293,7 @@ mod tests {
 
     #[test]
     fn random_operations_match_a_boolean_model() {
+        const STEPS: usize = 8000;
         // Multiples of 128 and 256 fall inside the map but not at its first word.
         let base = 192;
         let mut rng = XorShift(0x9E37_79B9_7F4A_7C15);
@@ -1036,7 +1307,7 @@ mod tests {
         const ALIGNS: [usize; 9] = [1, 2, 4, 8, 16, 32, 64, 128, 256];
         let (mut hits, mut misses, mut extended, mut blocked) = (0, 0, 0, 0);
 
-        for step in 0..5000 {
+        for step in 0..STEPS {
             match rng.below(100) {
                 0..=39 => {
                     let count = if rng.coin() {
@@ -1050,13 +1321,28 @@ mod tests {
                         ALIGNS[rng.below(9)]
                     };
                     let align = if align.is_power_of_two() { align } else { 1 };
-                    let expect = reference_find(&free, base, count, align);
-                    assert_eq!(m.has_run(count, align), expect.is_some(), "step {step}");
-                    let got = m.alloc(count, align);
+                    // One allocation in four takes the bottom of the free tail below a random end.
+                    let high = rng.below(4) == 0;
+                    let below = rng.below(N + 8);
+                    let expect = if high {
+                        reference_find_tail(&free, base, count, align, below)
+                    } else {
+                        reference_find(&free, base, count, align)
+                    };
+                    assert_eq!(
+                        m.has_run(count, align),
+                        reference_find(&free, base, count, align).is_some(),
+                        "step {step}"
+                    );
+                    let got = if high {
+                        m.alloc_tail(count, align, base + below)
+                    } else {
+                        m.alloc(count, align)
+                    };
                     assert_eq!(
                         got.map(|r| r.start - base),
                         expect,
-                        "step {step}: alloc({count}, {align})"
+                        "step {step}: alloc({count}, {align}) high {high} below {below}"
                     );
                     match got {
                         Some(r) => {
@@ -1483,6 +1769,143 @@ mod tests {
     }
 
     #[test]
+    fn extend_with_growth_grows_memory_only_for_a_run_at_the_top() {
+        let mut r = Region::new(64, 4, 0);
+        let first = region_start(&r.mem, 4);
+        let mut m = SliceMap::<W>::new();
+        m.init(first);
+        m.add_free(first, 4, false);
+        let policy = GrowPolicy {
+            min_grow: 2,
+            max_grow: 64,
+        };
+        let run = acquire(&mut m, &mut r.mem, 3, 1, &policy).unwrap();
+        assert_eq!(run.start, first);
+        // One free slice sits between the run and the end of memory; the extension needs five,
+        // so memory grows by the four missing ones (the step, 2, is smaller).
+        assert_eq!(
+            extend_with_growth(&mut m, &mut r.mem, first, 3, 5, &policy),
+            Some(false),
+            "the dirty gap slice makes the tail dirty"
+        );
+        assert_eq!(r.mem.size_slices(), first + 8);
+        assert_eq!(m.free_count(), 0);
+        for i in 0..8 {
+            assert!(!m.is_free(first + i));
+        }
+        // A pure map extension needs no growth.
+        m.add_free(first + 8, 2, true);
+        assert_eq!(r.mem.grow(2), Some(first + 8));
+        assert_eq!(
+            extend_with_growth(&mut m, &mut r.mem, first, 8, 2, &policy),
+            Some(true)
+        );
+        assert_eq!(r.mem.size_slices(), first + 10);
+        // With the run at the top and nothing free after it, growth takes the geometric step
+        // when that exceeds the need, and the surplus stays in the map.
+        assert_eq!(
+            extend_with_growth(&mut m, &mut r.mem, first, 10, 1, &policy),
+            Some(true)
+        );
+        assert_eq!(r.mem.size_slices(), first + 15, "step of 5 (half of 10)");
+        assert_eq!(m.free_count(), 4);
+        // A block after the run blocks it, whatever lies above.
+        let other = m.alloc(1, 1).unwrap();
+        assert_eq!(other.start, first + 11);
+        assert_eq!(
+            extend_with_growth(&mut m, &mut r.mem, first, 11, 1, &policy),
+            None
+        );
+        assert_eq!(r.mem.size_slices(), first + 15);
+        assert_eq!(m.free_count(), 3);
+        m.free(first + 11, 1);
+        // Non-contiguous growth (someone else grows right before we do): the region is kept,
+        // the run is not extended, and the slices the other party took never enter the map.
+        let mut mem = Interposed {
+            mem: &mut r.mem,
+            skip: 2,
+            grows: 0,
+        };
+        assert_eq!(
+            extend_with_growth(&mut m, &mut mem, first, 11, 8, &policy),
+            None
+        );
+        assert_eq!(mem.grows, 1);
+        assert_eq!(
+            mem.size_slices(),
+            first + 17 + 7,
+            "grew by half the heap (7) for the missing four"
+        );
+        assert_eq!(m.free_count(), 4 + 7);
+        assert!(!m.is_free(first + 15) && !m.is_free(first + 16));
+        for i in first + 17..first + 24 {
+            assert!(m.is_free(i) && m.is_zero(i));
+        }
+        assert!(all_clear(&m.free, 0, 11), "the run is untouched");
+        // Those taken slices now sit between the run and the end of memory, so the run is no
+        // longer at the top and cannot grow through memory at all.
+        assert_eq!(
+            extend_with_growth(&mut m, &mut mem, first, 11, 8, &policy),
+            None
+        );
+        assert_eq!(mem.grows, 1, "no growth for a run that is not at the top");
+        check_invariants(&m);
+    }
+
+    #[test]
+    fn extend_with_growth_refuses_what_memory_or_the_map_cannot_give() {
+        // The region ends 6 slices after the run.
+        let mut r = Region::new(10, 4, 0);
+        let first = region_start(&r.mem, 4);
+        let mut m = SliceMap::<W>::new();
+        m.init(first);
+        m.add_free(first, 4, true);
+        let policy = GrowPolicy::DEFAULT;
+        let run = m.alloc(4, 1).unwrap();
+        assert_eq!(run.start, first);
+        assert_eq!(
+            extend_with_growth(&mut m, &mut r.mem, first, 4, 7, &policy),
+            None,
+            "the region has 6 slices left"
+        );
+        assert_eq!(r.mem.size_slices(), first + 4);
+        // The step (16) is refused, so the bare need is taken.
+        assert_eq!(
+            extend_with_growth(&mut m, &mut r.mem, first, 4, 6, &policy),
+            Some(true)
+        );
+        assert_eq!(r.mem.size_slices(), first + 10);
+        assert_eq!(m.free_count(), 0);
+        check_invariants(&m);
+
+        // Growth stops at the map's usable limit: a run ending at the last usable slice cannot
+        // grow, and one two slices below it grows by at most two.
+        let mut m = SliceMap::<W>::new();
+        m.init(MAX_SLICE_INDEX + 1 - N);
+        let mut mem = PaperMemory {
+            size: MAX_SLICE_INDEX - 2,
+            capacity: MAX_SLICE_INDEX + 1,
+        };
+        m.add_free(MAX_SLICE_INDEX - 6, 4, true);
+        assert_eq!(m.alloc(4, 1).map(|r| r.start), Some(MAX_SLICE_INDEX - 6));
+        assert_eq!(
+            extend_with_growth(&mut m, &mut mem, MAX_SLICE_INDEX - 6, 4, 3, &policy),
+            None
+        );
+        assert_eq!(mem.size, MAX_SLICE_INDEX - 2);
+        assert_eq!(
+            extend_with_growth(&mut m, &mut mem, MAX_SLICE_INDEX - 6, 4, 2, &policy),
+            Some(true)
+        );
+        assert_eq!(mem.size, MAX_SLICE_INDEX, "never grows onto the last slice");
+        assert_eq!(
+            extend_with_growth(&mut m, &mut mem, MAX_SLICE_INDEX - 6, 6, 1, &policy),
+            None
+        );
+        check_invariants(&m);
+    }
+
+    #[test]
     fn initial_free_range_starts_at_the_first_whole_slice() {
         assert_eq!(initial_free_range(0, 17), (0, 17));
         assert_eq!(initial_free_range(1, 17), (1, 16));
@@ -1789,6 +2212,52 @@ mod verify {
         );
     }
 
+    /// `alloc_tail(count, align, base + below)` against its specification on `before`: with
+    /// `end = min(below, N)` and `lo` the start of the maximal free run ending at `end`, the
+    /// result is the lowest aligned index at or above `lo` if `count` slices fit between it and
+    /// `end`, exactly its bits are cleared, and `zeroed` is right.
+    #[kani::proof]
+    #[kani::unwind(4)]
+    fn slices_alloc_tail_takes_the_bottom_of_the_free_tail() {
+        let before = any_map_with_runs(2);
+        let count: usize = kani::any();
+        let shift: u32 = kani::any();
+        let below: usize = kani::any();
+        kani::assume(count >= 1 && count <= 70 && shift <= 7 && below <= N + 2);
+        let align = 1usize << shift;
+        let end = if below < N { below } else { N };
+        // The tail's start: one arbitrary candidate `lo` is checked to be it.
+        let lo: usize = kani::any();
+        kani::assume(lo <= end);
+        kani::assume(all_in(&before.free, lo, end - lo));
+        kani::assume(lo == 0 || !bit(&before.free, lo - 1));
+        let over = (before.base + lo) & (align - 1);
+        let start = if over == 0 { lo } else { lo + align - over };
+        let expect = if end > lo && start <= end && end - start >= count {
+            Some(start)
+        } else {
+            None
+        };
+        let mut m = snapshot(&before);
+        let got = m.alloc_tail(count, align, before.base + below);
+        assert!(got.map(|r| r.start - before.base) == expect);
+        let s: usize = kani::any();
+        kani::assume(s < N);
+        match got {
+            Some(run) => {
+                let rel = run.start - before.base;
+                assert!(run.zeroed == all_in(&before.zero, rel, count));
+                let inside = s >= rel && s < rel + count;
+                assert!(bit(&m.free, s) == (bit(&before.free, s) && !inside));
+                assert!(bit(&m.zero, s) == (bit(&before.zero, s) && !inside));
+            }
+            None => {
+                assert!(same(&m.free, &before.free) && same(&m.zero, &before.zero));
+            }
+        }
+        invariants(&m);
+    }
+
     #[kani::proof]
     #[kani::unwind(6)]
     fn slices_try_extend_claims_exactly_the_tail() {
@@ -1905,6 +2374,81 @@ mod verify {
         fn ptr(&self, _addr: usize) -> *mut u8 {
             panic!("acquire must not touch memory")
         }
+    }
+
+    /// `extend_with_growth` on a handed-out run below the end of memory: it extends exactly the
+    /// tail, grows memory only when the run is at the top (every slice between the run and the
+    /// end of memory free) and the map alone cannot serve, never touches the run's own slices,
+    /// and keeps a non-contiguous region.
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn slices_extend_with_growth_extends_only_a_top_run() {
+        let mut m = any_map_with_runs(2);
+        let size: usize = kani::any();
+        let capacity: usize = kani::any();
+        let skip: usize = if kani::any() { 0 } else { 2 };
+        kani::assume(size >= m.base && size <= m.limit());
+        kani::assume(capacity >= size && capacity <= m.limit() + 8);
+        let used = size - m.base;
+        kani::assume(none_in(&m.free, used, N - used));
+        let start: usize = kani::any();
+        let count: usize = kani::any();
+        let extra: usize = kani::any();
+        kani::assume(count >= 1 && count <= 3 && extra >= 1 && extra <= 4);
+        kani::assume(start <= used && count <= used - start);
+        kani::assume(none_in(&m.free, start, count));
+        let before = snapshot(&m);
+        let tail = start + count;
+        let have = used - tail;
+        let at_top = all_in(&before.free, tail, have);
+        let fits_in_map = extra <= have && all_in(&before.free, tail, extra);
+        let mut mem = PaperMemory {
+            size,
+            capacity,
+            skip,
+            limit: m.usable_limit(),
+        };
+        let policy = GrowPolicy {
+            min_grow: kani::any::<usize>() % 4,
+            max_grow: kani::any::<usize>() % 4,
+        };
+        let base = m.base;
+        let got = extend_with_growth(&mut m, &mut mem, base + start, count, extra, &policy);
+        let grown = mem.size - base;
+        let s: usize = kani::any();
+        kani::assume(s < N);
+        let inside = s >= tail && s < tail + extra;
+        let fresh = s >= used && s < grown;
+        match got {
+            Some(zeroed) => {
+                assert!(none_in(&m.free, tail, extra));
+                assert!(tail + extra <= grown);
+                if fits_in_map {
+                    assert!(mem.size == size);
+                    assert!(zeroed == all_in(&before.zero, tail, extra));
+                } else {
+                    assert!(at_top && mem.size > size && grown >= tail + extra);
+                }
+                if inside {
+                    assert!(!bit(&m.free, s) && !bit(&m.zero, s));
+                } else if fresh {
+                    assert!(bit(&m.free, s) && bit(&m.zero, s));
+                } else {
+                    assert!(bit(&m.free, s) == bit(&before.free, s));
+                    assert!(bit(&m.zero, s) == bit(&before.zero, s));
+                }
+            }
+            None => {
+                assert!(!fits_in_map);
+                assert!(mem.size == size || at_top);
+                if s < used {
+                    assert!(bit(&m.free, s) == bit(&before.free, s));
+                    assert!(bit(&m.zero, s) == bit(&before.zero, s));
+                }
+            }
+        }
+        assert!(none_in(&m.free, start, count));
+        invariants(&m);
     }
 
     #[kani::proof]
