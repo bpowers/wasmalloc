@@ -185,3 +185,61 @@ not dlmalloc-rs; only `wasm32-unknown-unknown` measures the allocator browsers s
   reach. The default is a machine-checked proof (Kani harness or equivalent) per unsafe block;
   only blocks without one get a ledger entry with preconditions, pen-and-paper proof, and the
   adversarial reviewer's sign-off.
+
+## Implementation status (2026-09-02)
+
+Everything in the architecture above is implemented on `main` and verified as follows.
+
+| module | what landed | verification |
+|---|---|---|
+| `bins` | mimalloc's 60 bins with an 8-byte word, `classify(Layout)`, `block_start` alignment rule | exhaustive tests over every size; 4 Kani harnesses (tightness, monotonicity, waste bound, alignment by construction) |
+| `backend` | `Memory` trait in slices; `WasmMemory`; `SimMemory` with non-contiguous growth and a 4 MiB-aligned host `Region` | tests; used by every other module's tests, Miri and Kani |
+| `slices` | free and known-zero bitmaps, lowest-first aligned run search with dedicated 1/8/64-slice scans, `acquire` with geometric growth sized from the current end, last slice of a 4 GiB memory never used | 18 tests incl. a model check; 9 Kani harnesses (3 in the quick gate) |
+| `page` | 32-byte in-band header (48 on the host), `pop`/`push`/`extend`, `header_of` mask | 20 tests; Miri clean under Stacked and Tree Borrows; 4 Kani harnesses over a proof-only memory; ledger PAGE-01..06 |
+| `heap` | bin queues, direct table with a read-only sentinel page, candidate search, full queue, retirement and collection, header-less runs, in-place realloc within a kind or a run, OOM collect-and-retry | 14 tests incl. randomised churn with content checks and a full invariant validator; no Kani harnesses yet; no ledger entries yet |
+| `global` | `WasmAlloc`: `GlobalAlloc` over a static heap; refuses the `atomics` feature | end-to-end wasm32 test under wasmtime with std collections |
+| `testing` | model-based differential tester with six profiles, mutant tests, cargo-fuzz targets for System and the heap | all profiles pass against the heap; 208k fuzz runs clean |
+
+Deviations from the draft: the free list is a single LIFO list (mimalloc's `local_free` was
+dropped as planned); the first block of a page starts at 64 bytes, not 32, so the host and
+wasm32 share one geometry; large (4 MiB) pages are enabled.
+
+First measurements (node 22, V8 optimizing tier, median ns per operation) against the roofline
+harness's size-class floor and the incumbents: alloc+free of 32 bytes 3.73 (floor 1.78, talc
+11.8, dlmalloc 8.0); random churn with 10k live objects 7.1 (floor 3.5, talc 31.9, dlmalloc
+61.4). Where we lose: a 16 B to 1 MiB realloc chain costs 12.3 us against 0.08 us for talc,
+because size-class pages cannot grow in place while boundary-tag allocators extend the top chunk;
+and 256 KiB to 4 MiB alloc+touch+free is 25 percent slower than dlmalloc. The full matrix
+(engines, tiers, footprint) is being measured; see `docs/research/roofline.md` when it lands.
+
+## Roadmap and research directions
+
+The goal is not to reproduce mimalloc in Rust but to be the best allocator for this target. Ideas
+to try, each behind a benchmark and a proof, roughly in order of expected payoff:
+
+1. **Header-less runs above the medium limit.** Disable large pages so every block above 80 KiB
+   is a slice run, then grow runs in place: `try_extend` when the following slices are free, and
+   when the run sits at the end of the heap, grow linear memory and extend without copying. This
+   is how boundary-tag allocators win the realloc chain, and a growing `Vec<u8>` output buffer is
+   the most common large-allocation pattern in wasm programs.
+2. **Fold `free_is_zero` into the flags byte.** The dealloc fast path currently stores a byte on
+   every free; the flags byte is already loaded, so the clear can move to the slow path and run
+   once per page.
+3. **Shrink the fixed footprint of small heaps.** The batch profiles show peak footprint 18 to
+   29x peak live bytes when only 1 MiB is live: one 64 KiB page per touched bin, 512 KiB medium
+   pages for a single 20 KiB object, and retired pages kept for 16 collection rounds. Options:
+   a 256 KiB medium page (mimalloc's own 32-bit constant), faster release of retired pages while
+   the heap is small, and reclaiming the partial slice below the first page for metadata.
+4. **Bump allocation in fresh pages.** mimalloc found no gain natively (page.c:627); under V8
+   the tradeoff between a free-list pop and a bump-and-compare may differ. Measure.
+5. **Liftoff-tier and `opt-level = "z"` behaviour.** Consumers like simlin build at `-Oz`; V8
+   runs the first calls in Liftoff with no inlining. Measure both and keep the fast paths a
+   single straight-line function.
+6. **Zero-tracking beyond first use.** Fresh slices are zero; a freed run whose contents are
+   known zero (for example a buffer the program never wrote) is not detectable, but blocks freed
+   from `alloc_zeroed` pages that were never written could be. Probably not worth it; note it.
+7. **Per-chunk kind binning in the slice map** (mimalloc's `mi_bbitmap_t`) if singleton churn
+   is shown to fragment the aligned runs medium and large pages need.
+8. **Verification depth.** Kani harnesses for the heap's queue and direct-table invariants over
+   a tiny simulated memory, ledger entries for every unsafe block in `heap.rs` and `global.rs`,
+   and an adversarial review of all entries.
