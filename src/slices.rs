@@ -30,6 +30,11 @@
 //!   none is free afterwards, other bits are untouched, and no aligned run of the same length
 //!   exists at a lower address.
 //!
+//! Slice [`MAX_SLICE_INDEX`] (65535, the last 64 KiB of a 4 GiB memory) is never handed out: a
+//! run ending there would end at address 2^32, which overflows a wasm32 `usize` and is an
+//! address no allocated object may reach. [`SliceMap::add_free`] drops it and [`acquire`] never
+//! grows memory onto it, so nothing above this module has to know.
+//!
 //! No unsafe code: this module never touches memory, only bookkeeping about it.
 
 use crate::backend::{MAX_SLICE_INDEX, Memory};
@@ -119,11 +124,32 @@ impl<const WORDS: usize> SliceMap<WORDS> {
         self.base + Self::CAPACITY
     }
 
+    /// One past the highest slice the map may ever hand out: [`limit`](Self::limit), except that
+    /// a map spanning slice [`MAX_SLICE_INDEX`] stops short of it (see the module documentation).
+    /// A map lying entirely above that index, such as one over a simulated memory at a high host
+    /// address, is unaffected.
+    #[inline]
+    pub fn usable_limit(&self) -> usize {
+        if self.base <= MAX_SLICE_INDEX {
+            self.limit().min(MAX_SLICE_INDEX)
+        } else {
+            self.limit()
+        }
+    }
+
     /// Give `[start, start + count)` to the map as free slices. They must not be free already.
     /// `zeroed` says the memory is known to be all zero (fresh from `memory.grow`); the linker gap
-    /// at startup is not.
+    /// at startup is not. Slice [`MAX_SLICE_INDEX`] is dropped from the range, and an empty range
+    /// is a no-op.
     pub fn add_free(&mut self, start: usize, count: usize, zeroed: bool) {
-        debug_assert!(count >= 1);
+        let count = if start <= MAX_SLICE_INDEX {
+            count.min(MAX_SLICE_INDEX - start)
+        } else {
+            count
+        };
+        if count == 0 {
+            return;
+        }
         let rel = self.rel(start, count);
         self.release(rel, count);
         if zeroed {
@@ -480,9 +506,8 @@ impl Default for GrowPolicy {
 /// start elsewhere (something else grew memory in between, which the [`Memory`] contract allows)
 /// that slack is wrong, so memory is grown once more by `count + align - 1`, which fits an
 /// aligned run wherever it lands. Returns `None` when growth would push the end of memory past
-/// what the map or a 32-bit address space can describe, or when the engine refuses both the
-/// step and the bare request; slices that were grown along the way stay in the map for later
-/// requests.
+/// [`SliceMap::usable_limit`], or when the engine refuses both the step and the bare request;
+/// slices that were grown along the way stay in the map for later requests.
 pub fn acquire<const WORDS: usize, M: Memory>(
     map: &mut SliceMap<WORDS>,
     mem: &mut M,
@@ -507,7 +532,7 @@ fn grow_and_alloc<const WORDS: usize, M: Memory>(
 ) -> Option<Run> {
     debug_assert!(count >= 1);
     debug_assert!(align.is_power_of_two());
-    let limit = end_limit(map);
+    let limit = map.usable_limit();
     let end = mem.size_slices();
     // Fresh memory normally starts at the current end, so the request only needs the slack from
     // there to the next slice whose absolute index is aligned. `-end mod align` is that slack.
@@ -541,35 +566,19 @@ fn grow_and_alloc<const WORDS: usize, M: Memory>(
     add_region(map, start, worst);
     let run = map.alloc(count, align);
     debug_assert!(
-        run.is_some() || start + worst > map.limit(),
+        run.is_some() || start + worst > map.usable_limit(),
         "a region sized for any start cannot fail to serve the request"
     );
     run
 }
 
-/// Record a grown region as free, zeroed slices. The part the map cannot describe, if any (only
+/// Record a grown region as free, zeroed slices. The part the map cannot hand out, if any (only
 /// when something else grew memory first and pushed the region up), is lost.
 fn add_region<const WORDS: usize>(map: &mut SliceMap<WORDS>, start: usize, count: usize) {
-    let end = start.saturating_add(count).min(map.limit());
+    let end = start.saturating_add(count).min(map.usable_limit());
     if start < end {
         map.add_free(start, end - start, true);
     }
-}
-
-/// Highest end of memory `acquire` may grow to: what the map can describe, and on a 32-bit
-/// target also what the address space can hold. The last slice (index `MAX_SLICE_INDEX`) is
-/// deliberately never handed out: a page or run ending there would have an end address of 2^32,
-/// which overflows `usize` and which Rust forbids for any allocated object. The 64-bit test host
-/// has no such cap because simulated memories live at arbitrary host addresses.
-#[cfg(target_pointer_width = "32")]
-fn end_limit<const WORDS: usize>(map: &SliceMap<WORDS>) -> usize {
-    map.limit().min(MAX_SLICE_INDEX)
-}
-
-/// See the 32-bit version.
-#[cfg(not(target_pointer_width = "32"))]
-fn end_limit<const WORDS: usize>(map: &SliceMap<WORDS>) -> usize {
-    map.limit()
 }
 
 /// The linker gap: slices between `heap_base` and the initial end of memory, which the heap
@@ -1467,6 +1476,99 @@ mod tests {
         assert_eq!(initial_free_range(16 * SLICE_SIZE + 100, 17), (17, 0));
         assert_eq!(initial_free_range(40 * SLICE_SIZE, 17), (40, 0));
     }
+
+    /// A memory that grows on paper only, placed anywhere in the slice index space.
+    struct PaperMemory {
+        size: usize,
+        capacity: usize,
+    }
+
+    // SAFETY: never hands out a pointer, so nothing about memory validity can be violated; the
+    // tests using it only exercise the map's bookkeeping.
+    unsafe impl Memory for PaperMemory {
+        fn heap_base(&self) -> usize {
+            0
+        }
+
+        fn size_slices(&self) -> usize {
+            self.size
+        }
+
+        fn grow(&mut self, slices: usize) -> Option<usize> {
+            let end = self.size.checked_add(slices)?;
+            if end > self.capacity {
+                return None;
+            }
+            self.size = end;
+            Some(end - slices)
+        }
+
+        fn ptr(&self, _addr: usize) -> *mut u8 {
+            unreachable!("the paper memory has no bytes")
+        }
+    }
+
+    #[test]
+    fn the_last_slice_of_the_address_space_is_never_usable() {
+        // A map whose top word ends exactly at the end of a 4 GiB memory.
+        let mut m = SliceMap::<W>::new();
+        m.init(MAX_SLICE_INDEX + 1 - N);
+        assert_eq!(m.limit(), MAX_SLICE_INDEX + 1);
+        assert_eq!(m.usable_limit(), MAX_SLICE_INDEX);
+        m.add_free(m.base(), N, true);
+        assert_eq!(m.free_count(), N - 1);
+        assert!(m.is_free(MAX_SLICE_INDEX - 1) && !m.is_free(MAX_SLICE_INDEX));
+        m.add_free(MAX_SLICE_INDEX, 1, false);
+        assert_eq!(
+            m.free_count(),
+            N - 1,
+            "adding only the last slice is a no-op"
+        );
+        for _ in 0..3 {
+            assert!(m.alloc(64, 64).is_some());
+        }
+        assert_eq!(m.alloc(64, 64), None, "the top word is one slice short");
+        let tail = m.alloc(63, 1).unwrap();
+        assert_eq!(tail.start, MAX_SLICE_INDEX - 63);
+        assert_eq!(m.try_extend(tail.start, 63, 1), None);
+        assert_eq!(m.free_count(), 0);
+        check_invariants(&m);
+
+        // Growth stops at the last usable slice even when memory could reach 4 GiB.
+        let mut m = SliceMap::<W>::new();
+        m.init(MAX_SLICE_INDEX + 1 - N);
+        let mut mem = PaperMemory {
+            size: MAX_SLICE_INDEX - 5,
+            capacity: MAX_SLICE_INDEX + 1,
+        };
+        let policy = GrowPolicy::DEFAULT;
+        let run = acquire(&mut m, &mut mem, 1, 1, &policy).unwrap();
+        assert_eq!(run.start, MAX_SLICE_INDEX - 5);
+        assert_eq!(
+            mem.size, MAX_SLICE_INDEX,
+            "the step is cut to the usable room"
+        );
+        assert_eq!(acquire(&mut m, &mut mem, 8, 8, &policy), None);
+        for i in 1..5 {
+            assert_eq!(
+                acquire(&mut m, &mut mem, 1, 1, &policy).map(|r| r.start),
+                Some(MAX_SLICE_INDEX - 5 + i)
+            );
+        }
+        assert_eq!(acquire(&mut m, &mut mem, 1, 1, &policy), None);
+        assert_eq!(
+            mem.size, MAX_SLICE_INDEX,
+            "memory never grows onto the last slice"
+        );
+        check_invariants(&m);
+
+        // A map entirely above the index (a simulated memory at a high host address) has no hole.
+        let mut m = SliceMap::<W>::new();
+        m.init(MAX_SLICE_INDEX + 1);
+        assert_eq!(m.usable_limit(), m.limit());
+        m.add_free(m.base(), N, true);
+        assert_eq!(m.free_count(), N);
+    }
 }
 
 #[cfg(kani)]
@@ -1806,7 +1908,7 @@ mod verify {
             size,
             capacity,
             skip,
-            limit: m.limit(),
+            limit: m.usable_limit(),
         };
         let (count, align) = match kani::any::<u8>() % 3 {
             0 => (1, 1),

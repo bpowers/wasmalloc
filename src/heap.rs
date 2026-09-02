@@ -437,10 +437,6 @@ impl<M: Memory, const WORDS: usize> Heap<M, WORDS> {
         // The linker leaves a gap between the heap base and the end of the initial memory; use
         // it before paying for a memory.grow. Its contents are not guaranteed zero.
         let (first, count) = slices::initial_free_range(heap_base, self.mem.size_slices());
-        // The last slice of a 4 GiB memory is never used (see slices::end_limit); the initial
-        // memory can only reach it if the module was instantiated with a 4 GiB memory.
-        #[cfg(target_pointer_width = "32")]
-        let count = count.min(crate::backend::MAX_SLICE_INDEX.saturating_sub(first));
         if count > 0 {
             self.slices.add_free(first, count, false);
         }
