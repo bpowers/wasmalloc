@@ -65,16 +65,19 @@ minimization as goals (smaller is welcome, not required).
 - A bitmap indexed by absolute slice number (`addr >> 16`; 65536 bits, 8 KiB, static) records
   free slices; a companion bitmap records slices known to be zero (never handed out since
   `memory.grow`). This is mimalloc's `slices_free` / `slices_dirty` pair without atomics.
-  Run search must honour alignment: 1 slice anywhere (lowest first), 8-slice runs at 8-slice
-  boundaries (a whole byte), 64-slice runs at 64-slice boundaries (a whole `u64` word),
-  singleton runs first-fit. mimalloc v3's per-chunk kind binning (`mi_bbitmap_t`, which keeps
+  Run search must honour alignment: 1 slice anywhere (lowest first), 4-slice medium pages at
+  4-slice boundaries (a whole nibble), 8-slice runs at 8-slice boundaries (a whole byte),
+  64-slice runs at 64-slice boundaries (a whole `u64` word), singleton runs first-fit. mimalloc v3's per-chunk kind binning (`mi_bbitmap_t`, which keeps
   small pages from fragmenting the runs medium and large pages need) is deferred until
   footprint tests show fragmentation; the heap's growing top edge is always available for
   aligned runs, so the failure mode is footprint, not correctness.
 - Growth policy: `memory.grow` costs 50 to 75 microseconds per call in V8 regardless of the
   number of pages requested (about 100x wasmtime; measured in `docs/research/landscape.md`
-  C.8), so growth is geometric: grow by `max(needed, clamp(heap_size / 2, 1 MiB, 64 MiB))`,
-  rounded to whole slices, and reclaim the linker gap between `__heap_base` and the initial
+  C.8), so growth is geometric: grow by `max(needed, clamp(heap_size / 8, 1 MiB, 64 MiB))`
+  (an eighth, not a half: the half-heap step overshot the peak by up to 50 percent, tuning log
+  2026-09-02), rounded to whole slices, and before growing at all release every retired page
+  (a grow is footprint for good; a released page is one page initialisation away). Reclaim the
+  linker gap between `__heap_base` and the initial
   `memory.size()` as the first free slices instead of paying a grow for the first page (std's
   dlmalloc 0.2.11 wastes that gap). Growth must be sized from the rounded, aligned request
   (talc 5.0.3 undersized growth and spun to the 4 GiB limit) and must tolerate `memory.grow`
@@ -166,7 +169,11 @@ and always memsets; this is one of the places we can beat it.
 realloc: block size is a pure function of the Layout, so shrink and grow-in-place decisions
 need no header access; in-place is allowed only when the page kind is unchanged (the next
 `dealloc` will recompute the kind from the new Layout). Singleton runs shrink in place by
-freeing tail slices and grow in place when the following slices are free.
+freeing tail slices and grow in place when the following slices are free or, when the run
+reaches the end of memory, by growing linear memory (`slices::extend_with_growth`). A block
+that must move into a run goes to the bottom of the free tail at the top of the heap
+(`SliceMap::alloc_tail`, dlmalloc's top chunk) so that its next growth is in place; the lowest
+fit would put every doubling of a growing buffer into a new hole and copy it again.
 
 ### Crate structure
 
@@ -196,17 +203,18 @@ Everything in the architecture above is implemented on `main` and verified as fo
 |---|---|---|
 | `bins` | mimalloc's 60 bins with an 8-byte word, `classify(Layout)`, `block_start` alignment rule | exhaustive tests over every size; 4 Kani harnesses (tightness, monotonicity, waste bound, alignment by construction) |
 | `backend` | `Memory` trait in slices; `WasmMemory`; `SimMemory` with non-contiguous growth and a 4 MiB-aligned host `Region` | tests; used by every other module's tests, Miri and Kani |
-| `slices` | free and known-zero bitmaps, lowest-first aligned run search with dedicated 1/8/64-slice scans, `acquire` with geometric growth sized from the current end, last slice of a 4 GiB memory never used | 18 tests incl. a model check; 9 Kani harnesses (3 in the quick gate) |
+| `slices` | free and known-zero bitmaps, lowest-first aligned run search with dedicated 1/4/8/64-slice scans, `acquire` with geometric growth (an eighth of the heap) sized from the current end, `alloc_tail` (bottom of the free tail) and `extend_with_growth` (in-place growth through `memory.grow`) for growing runs, last slice of a 4 GiB memory never used, no bounds-check panic paths | 25 tests incl. a model check; 12 Kani harnesses (4 in the quick gate) |
 | `page` | 36-byte in-band header (48 on the host), `pop`/`push`/`extend`, `header_of` mask | 20 tests; Miri clean under Stacked and Tree Borrows; 4 Kani harnesses over a proof-only memory; ledger PAGE-01..06 |
-| `heap` | bin queues, direct table with a read-only sentinel page, candidate search, full queue, retirement and collection, header-less runs, in-place realloc within a kind or a run, OOM collect-and-retry | 14 tests incl. randomised churn with content checks and a full invariant validator; no Kani harnesses yet; no ledger entries yet |
+| `heap` | bin queues, direct table with a read-only sentinel page, candidate search, full queue, retirement and collection with every retired page released before memory grows, header-less runs above 40 KiB, in-place realloc within a kind or a run (through memory growth at the top), moved runs placed at the top | 18 tests incl. randomised churn with content checks and a full invariant validator; no Kani harnesses yet; no ledger entries yet |
 | `global` | `WasmAlloc`: `GlobalAlloc` over a static heap; refuses the `atomics` feature | end-to-end wasm32 test under wasmtime with std collections |
-| `testing` | model-based differential tester with six profiles, mutant tests, cargo-fuzz targets for System and the heap | all profiles pass against the heap; 208k fuzz runs clean |
+| `testing` | model-based differential tester with six profiles, mutant tests, cargo-fuzz targets for System and the heap | all profiles pass against the heap; 208k fuzz runs clean on main, 249k more on tuning-b |
 
 Deviations from the draft: the free list is a single LIFO list (mimalloc's `local_free` was
 dropped as planned); the first block of a page starts at 64 bytes, not 32, so the host and
-wasm32 share one geometry; large (4 MiB) pages are enabled; the block counters in the page
-header are `u32`, not `u16`, because a 16-bit store followed by a 16-bit load of `used` is a
-slow store-to-load forward on current x86 cores (`docs/research/roofline.md` section 12.1).
+wasm32 share one geometry; large (4 MiB) pages are compiled but off, and the medium page is
+256 KiB with a 40 KiB limit (tuning log); the block counters in the page header are `u32`, not
+`u16`, because a 16-bit store followed by a 16-bit load of `used` is a slow store-to-load
+forward on current x86 cores (`docs/research/roofline.md` section 12.1).
 
 Measurements (median ns per operation; full matrix in `docs/research/roofline.md`, tuning
 deltas in the tuning-a commits). After the first tuning pass (u32 counters, inline retire test,
@@ -214,31 +222,35 @@ aligned frees on the fast path, `inline(always)`), the 32-byte alloc+free pair c
 V8 15.2 (floor 0.55, dlmalloc 4.11, talc 8.92), 1.10 on wasmtime (floor 0.71), 2.50 on node 22
 (floor 1.80, dlmalloc 7.99, talc 12.35); the aligned-16 pair costs the same as the unaligned one;
 random churn over 10k live objects is 6.4 on V8 15.2 (floor 3.2, talc 26, dlmalloc 56);
-talc-style random actions 14.6 (talc 20.1, dlmalloc 40.6). Where we still lose: a 16 B to 1 MiB
-realloc chain costs 12 us against under 0.1 us for the boundary-tag allocators, because
-size-class pages cannot grow in place; and footprint in pages is 2 to 8x dlmalloc's (one page
-per touched bin, 512 KiB medium and 4 MiB large pages, a half-heap growth step). Note that our
-pages are extended 8 KiB at a time, so `memory.size` overstates our resident memory relative to
-dlmalloc, which touches everything it hands out.
+talc-style random actions 14.6 (talc 20.1, dlmalloc 40.6). After the second tuning pass
+(tuning log, 2026-09-02) the 16 B to 1 MiB realloc chain costs 0.63 us on V8 15.2 and 0.64 on
+node 22 (was 12 us; dlmalloc 0.04 and 0.07, talc 0.05 and 0.09), the rest being the copies
+below the 40 KiB medium limit, and footprint is 1.0x dlmalloc's on the 1 MiB Vec growth (68
+pages against 54, was 288), 1.27x on churn (132 against 104, was 181) and 2.1x on random
+actions (68 against 32, was 81), the last being one 64 KiB page per touched bin, which needs a
+design change to go below. Note that our pages are extended 8 KiB at a time, so `memory.size`
+overstates our resident memory relative to dlmalloc, which touches everything it hands out.
 
 ## Roadmap and research directions
 
 The goal is not to reproduce mimalloc in Rust but to be the best allocator for this target. Ideas
 to try, each behind a benchmark and a proof, roughly in order of expected payoff:
 
-1. **Header-less runs above the medium limit.** Disable large pages so every block above 80 KiB
-   is a slice run, then grow runs in place: `try_extend` when the following slices are free, and
-   when the run sits at the end of the heap, grow linear memory and extend without copying. This
-   is how boundary-tag allocators win the realloc chain, and a growing `Vec<u8>` output buffer is
-   the most common large-allocation pattern in wasm programs.
+1. **Header-less runs above the medium limit.** Done (tuning log, 2026-09-02): large pages are
+   off, runs grow in place through the free slices after them and through `memory.grow` at the
+   top of the heap, and a run that must move goes to the bottom of the free tail. What is left
+   of the chain's cost is the copies inside pages, 10 KiB per small-page block and 40 KiB per
+   medium block, which `Vec` doubling amortises.
 2. **Fold `free_is_zero` into the flags byte.** The dealloc fast path currently stores a byte on
    every free; the flags byte is already loaded, so the clear can move to the slow path and run
    once per page.
-3. **Shrink the fixed footprint of small heaps.** The batch profiles show peak footprint 18 to
-   29x peak live bytes when only 1 MiB is live: one 64 KiB page per touched bin, 512 KiB medium
-   pages for a single 20 KiB object, and retired pages kept for 16 collection rounds. Options:
-   a 256 KiB medium page (mimalloc's own 32-bit constant), faster release of retired pages while
-   the heap is small, and reclaiming the partial slice below the first page for metadata.
+3. **Shrink the fixed footprint of small heaps.** Mostly done (tuning log, 2026-09-02): the
+   256 KiB medium page, the eighth-heap growth step and releasing retired pages before growth
+   took the batch profiles from 18 to 29x peak live bytes to 3.7 to 4.6x. What remains is one
+   64 KiB page per touched bin (37 pages before any object is counted in random_actions);
+   carving the first page of several bins from one slice would need the page header address to
+   stay derivable from the Layout, a design change. Reclaiming the partial slice below the
+   first page for metadata is still open.
 4. **Bump allocation in fresh pages.** mimalloc found no gain natively (page.c:627); under V8
    the tradeoff between a free-list pop and a bump-and-compare may differ. Measure.
 5. **Liftoff-tier and `opt-level = "z"` behaviour.** Consumers like simlin build at `-Oz`; V8
@@ -258,3 +270,82 @@ to try, each behind a benchmark and a proof, roughly in order of expected payoff
 9. **Verification depth.** Kani harnesses for the heap's queue and direct-table invariants over
    a tiny simulated memory, ledger entries for every unsafe block in `heap.rs` and `global.rs`,
    and an adversarial review of all entries.
+
+## Tuning log
+
+Each entry: date, change, before -> after (median ns per operation on node 22 opt / node 22
+Liftoff / d8 V8 15.2 opt / wasmtime; footprint in `memory.size` pages after the workload in a
+fresh process; `memory.grow` calls in that first call from the harness's `wasmalloc_count`
+variant), decision. Full tables are in the commit messages on branch `tuning-b`.
+
+### 2026-09-02, tuning-b (footprint and realloc)
+
+Baseline on `main` after tuning-a: alloc_free_32 2.50/3.66/1.13/1.09 ns (36 pages),
+batch_lifo_32 2.99/4.82/2.42/1.81 (36), churn 7.21/10.1/6.77/6.22 (181 pages, 5 grows),
+random_actions 15.1/20.1/14.6/14.1 (81, 3), vec_push_growth 399/1116/400/522 us (288, 5),
+realloc_doubling 12.2/13.4/12.4/12.2 us (288, 5), large_alloc_free 2.24/1.95/2.18/2.47 us
+(288, 3). dlmalloc's footprints: 21/21/104/32/54/54/149.
+
+1. **Large pages off** (`bins::LARGE_PAGES = false`; sizes above the medium limit are runs).
+   Footprint 288 -> 81 on vec_push_growth and realloc_doubling, 288 -> 132 on large_alloc_free;
+   realloc_doubling only 12.2 -> 11.2 us, because the matrix runs it after churn, whose retired
+   pages leave the slice map full of holes, and the lowest fit put every doubling into a hole
+   and copied it again at the next step (alone in a fresh process it was 3.4 us). Kept.
+2. **Runs grow in place through `memory.grow`, moved runs go to the top**
+   (`slices::extend_with_growth`, `SliceMap::alloc_tail`). realloc_doubling 11.2 -> 1.19 us,
+   1.37 Liftoff, 1.19 d8, 1.15 wasmtime; footprint unchanged; vec_push_growth 397 -> 387 us
+   on node. Placing the moved run at the *highest* fit was tried first and is a trap: with
+   nothing free above it every growth is a `memory.grow` of half the heap, 73 grows and
+   65535 pages within one call. The bottom of the free tail (dlmalloc's top chunk) keeps the
+   tail above the run. Kept. Observation: vec_push_growth on wasmtime swings between 380 and
+   590 us for the same code depending on the buffer's address (a Cranelift push loop into a
+   1 MiB `Vec` at twelve addresses spans 460 to 589 us with std's own allocator), so its
+   wasmtime column is not an allocator measurement.
+3. **Growth step an eighth of the heap** (`GrowPolicy::step_divisor = 8`, was a hard-coded
+   half). churn 181 -> 132 pages (grows 5 -> 7), random_actions 81 -> 68 (3 -> 3), the Vec
+   workloads 81 -> 84 (3 -> 4, step rounding); timings flat. The extra calls are in the first
+   call of each workload and cost under 0.3 ms in total even at 60 us per call on node 22.
+   Kept.
+4. **Retired pages released before any `memory.grow`; forced collection scans past pages in
+   use.** Roofline footprints unchanged (no workload changes its bin mix); model tester peak
+   footprint over peak live: mixed 1.43/1.36/1.40 -> 1.34/1.15/1.40, batches 6.43/7.39/6.85
+   -> 5.71/6.57/6.85, align_heavy 2.01/1.95/1.62 -> 1.94/1.96/1.47. batch_lifo_32 on d8
+   2.41 -> 1.69 (three reruns) with `find_page` inlined into `alloc_generic` after the OOM
+   retry it subsumed was removed; random_actions 15.0 -> 14.5 on node. Studied and rejected:
+   freeing an empty page at once when a sibling has room (no peak-footprint effect once pages
+   are released before growth; would churn pages in bins around a page boundary) and
+   refreshing the countdown on re-retire (a collection already un-retires a page in use).
+   Kept.
+5. **256 KiB medium pages, 40 KiB medium limit, nibble scan** (mimalloc's 32-bit constant).
+   vec_push_growth and realloc_doubling 84 -> 68 pages, realloc_doubling 1.18 -> 0.64 us
+   (0.79/0.63/0.61) because 64 KiB is now a run the 128 KiB step extends; churn and
+   random_actions footprint unchanged (they have no medium blocks); model tester batches
+   5.71/6.57/6.85 -> 3.65 to 4.07/4.43/4.55, small_churn 1.38/1.47/1.51 -> 1.29/1.39/1.42,
+   others within 0.2. Cost: a wasmtime microbenchmark of 1024 medium allocations then 1024
+   FIFO frees per round pays 12.7 -> 14.0 ns per pair at 16 KiB, 13.4 -> 14.8 at 24 KiB,
+   14.5 -> 15.5 at 32 KiB, 15.1 -> 14.9 at 40 KiB: a page initialisation every 15 blocks
+   instead of every 31, not the search (the nibble scan and the general first-fit search
+   measured within 0.3 ns). No roofline workload moved. Kept as a footprint knob that one
+   constant flips back.
+6. **No bounds-check panic paths in the allocator's functions** (bitmap helpers test the word
+   index, queue indices are masked over 64 queues, the direct table is written in an index
+   loop, the step divisor is clamped). Module panic call sites 29 -> 6 (the harness's std and
+   `page::extend`'s `MAX_EXTEND_SIZE / block_size`, an unsafe block under ledger PAGE-04 left
+   for a reviewed change); `__rust_realloc` 3 -> 0; raw module 47903 -> 47208 bytes, after
+   wasm-opt -O3 20871 -> 20558. Timings unchanged (churn read 8.30 once on node and 7.00,
+   7.25, 6.97 in three alternating reruns against 7.10 for the previous build). Kept.
+
+Final state against the baseline: alloc_free_32 2.51/3.68/1.13/1.09 (36 pages),
+batch_lifo_32 2.99/4.83/1.66 to 1.88/1.57 to 1.81 (36), churn 7.0/9.8/6.47/6.05 (132, 7
+grows), random_actions 14.5/19.5/14.2/14.1 (68, 3), vec_push_growth 386/1106/392/560 us
+(68, 3), realloc_doubling 0.64/0.78/0.62/0.61 us (68, 3), large_alloc_free
+2.04/2.26/2.08/2.38 us (132, 3). Model tester peak footprint over peak live, main -> tuning-b:
+lifo and fifo batches 18.1 to 29.1 -> 3.7 to 4.6, small_churn 1.56 to 2.12 -> 1.29 to 1.42,
+align_heavy 2.35 to 3.13 -> 1.40 to 2.03, mixed 1.32 to 1.39 -> 1.23 to 1.37, large_heavy
+1.31 to 1.52 -> 1.23 to 1.42. Proofs: 20 Kani harnesses (311 s for the full set, 2.5 GB
+peak), 249k model_heap fuzz runs in 60 s clean.
+
+Next: the per-bin page cost (random_actions at 2.1x dlmalloc), the `page::extend` division
+(with a PAGE-04 review), a zero-initialised heap static (roadmap 8), heap Kani harnesses and
+ledger entries (roadmap 9), and `alloc_zeroed` for runs extended through `memory.grow`, whose
+fresh slices are known zero but are not yet reported as such to a zeroing realloc.

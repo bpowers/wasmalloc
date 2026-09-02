@@ -1,6 +1,6 @@
 # Soundness ledger
 
-Last updated: 2026-09-01
+Last updated: 2026-09-02
 
 The default for every `unsafe` block in this crate is a machine-checked proof: a Kani harness
 over a simulated memory backend that exercises the block's preconditions, or an equivalent.
@@ -153,6 +153,28 @@ Blocks in `is_full`, `all_free`, `has_free`, `is_expandable`, `in_full_queue`,
 - Machine checks: `validate_rejects_corrupt_pages` drives every error path; it is the invariant
   oracle for the Kani operation-sequence harnesses and the randomised test. Miri as above.
 - Reviewer: pending adversarial review. Date: 2026-09-01.
+
+## heap
+
+No entries yet (design document, roadmap item 9). Blocks touched on branch `tuning-b`
+(2026-09-02), all calls into `collect_retired` or existing page operations with their
+preconditions unchanged, listed so the future review knows where the code moved:
+
+- `Heap::acquire_run` now holds the `unsafe { self.collect_retired(true) }` call that
+  `alloc_generic` and `alloc_huge` made in their OOM retries (removed); precondition: heap
+  invariants hold between operations, which every caller (`fresh_page`, `alloc_huge`, both
+  reached only between operations) satisfies.
+- `Heap::collect_retired` no longer breaks at a page with `retire_expire == 0`; it still reads
+  and frees only pages reached through queue links, live pages of this heap by invariant 1.
+- `Heap::realloc`'s move into a run calls `alloc_huge` (safe) and then the same
+  `copy_nonoverlapping` and `dealloc` block as before.
+- Queue indexing goes through `queue_index` (a mask; debug-asserted in range), so `queues[..]`
+  cannot index out of bounds even if a header's `bin` byte were corrupt.
+- Reviewer: pending adversarial review.
+
+`slices` has no unsafe code. The bitmap helpers there gained explicit `w < WORDS` tests
+(2026-09-02) so that the release build carries no bounds-check panic path; they are safe code
+and are covered by the twelve slices Kani harnesses.
 
 Not listed: the unsafe blocks inside `#[cfg(test)]` test code and the proof-only `PageModel`
 backend under `#[cfg(kani)]`, which never ship.
