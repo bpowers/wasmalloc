@@ -554,12 +554,20 @@ impl<M: Memory, const WORDS: usize> Heap<M, WORDS> {
                     candidate = page;
                     limit = MAX_CANDIDATES as isize;
                 } else {
+                    // mimalloc frees an all-free candidate at this point
+                    // (mi_page_queue_find_free_ex): besides `free` its pages have a deferred
+                    // `local_free` list and a cross-thread `thread_free` list, so a page whose
+                    // `free` list is empty can still be empty of live blocks. Here the only list
+                    // is `free`, and a candidate reaching this comparison was chosen with an
+                    // empty one (an available page ends the walk, and the walk changes no list),
+                    // so `used == capacity` by page invariant 4; `capacity >= 1` for every queue
+                    // member because `fresh_page` extends a page before anything else can see
+                    // it and nothing lowers `capacity`. The candidate cannot be empty (review
+                    // finding R-5).
                     // SAFETY: both are live pages of this heap.
                     unsafe {
-                        if page::all_free(candidate) {
-                            self.free_page(candidate, qi);
-                            candidate = page;
-                        } else if (*page).used >= (*candidate).used && !mostly_used(page) {
+                        debug_assert!(!page::all_free(candidate));
+                        if (*page).used >= (*candidate).used && !mostly_used(page) {
                             candidate = page;
                         }
                     }

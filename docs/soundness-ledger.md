@@ -434,10 +434,10 @@ Blocks in `push_front`, `push_back`, `remove`, `move_to_front`, `move_to_full`, 
 ### HEAP-06: `find_page` and `fresh_page`, the page search and supply
 
 Blocks: in `find_page`, the header reads of the current member, the `retire_expire` store and
-`move_to_full` for a full member, the candidate comparison with `all_free`/`free_page`/`mostly_used`,
-the `extend` of the candidate, the `collect_retired()`, and `move_to_front` with the
-`retire_expire` store; in `fresh_page`, `page::init` and the `push_front` and `extend` of the
-new page.
+`move_to_full` for a full member, the candidate comparison with `mostly_used` (behind a debug
+assertion that the candidate is not empty), the `extend` of the candidate, the
+`collect_retired()`, and `move_to_front` with the `retire_expire` store; in `fresh_page`,
+`page::init` and the `push_front` and `extend` of the new page.
 
 - Preconditions: heap invariants hold; `bin` in `1..=MAX_BIN` (it comes from `classify`).
 - Invariants relied on: heap invariant 1 for the walk; page invariants of every member; the
@@ -448,10 +448,13 @@ new page.
   heap-owned byte of a live header, is cleared: a page with every block out is not retired, and
   the countdown a direct-table drain leaves behind would otherwise survive the round trip
   through the full queue and make the free that empties the page skip `retire` (HEAP-07, R-2).
-  `free_page(candidate, qi)` is
-  applied to an earlier member, just read to be empty, still a member because nothing has
-  removed it since it was chosen; it may be the current member's predecessor, in which case
-  `remove` rewrites the current member's `prev`, which the loop does not use. After the walk the
+  A candidate that reaches
+  the comparison with a later member was chosen at a member with an empty free list (an
+  available member ends the walk) and the walk changes no page's list, so `used == capacity`
+  (page invariant 4); `capacity >= 1` for every queue member because `fresh_page` extends a page
+  before it is visible and nothing lowers `capacity`; hence the candidate is never empty, which
+  a debug assertion states, and mimalloc's release of an empty candidate has no counterpart
+  here (R-5). After the walk the
   candidate is a member with a free block or an unextended one; `extend` on it meets PAGE-04
   and, when the list was empty, succeeds because `capacity < reserved` held when it was chosen
   and nothing changes `capacity` but `extend`. `move_to_front` takes a member; the
@@ -474,11 +477,14 @@ new page.
   `a_forced_collection_reaches_a_retired_page_behind_a_page_in_use`,
   `every_bin_allocates_aligned_distinct_blocks_and_recovers_its_page`, the churn test, the model
   tester and the fuzz targets. Miri as above.
-- Not machine-checked by Kani: the candidate comparison with two or more members in one queue
-  (including `free_page` of an empty earlier candidate); tests only.
-- Reviewer: adversarial-reviewer, 2026-09-02: accepted. Caveat: the `free_page(candidate, qi)`
-  branch the sketch treats as live is unreachable: a candidate that survives the walk has an empty
-  free list, so `used == capacity >= 1` and `all_free` is false (R-5).
+- Not machine-checked by Kani: the candidate comparison with two or more members in one queue;
+  tests only.
+- Changes: 2026-09-02, `find_page` clears the countdown of a page it parks (R-2, HEAP-07) and
+  no longer carries the unreachable release of an empty candidate, replaced by the argument
+  above and a debug assertion (R-5).
+- Reviewer: adversarial-reviewer, 2026-09-02: accepted with a caveat (R-5: the release of an
+  empty candidate the sketch treated as live is unreachable), addressed on 2026-09-02 by
+  removing the branch; together with the park reset this awaits a fresh look.
 
 ### HEAP-07: retirement and release (`dealloc_transition`, `retire`, `collect_retired`, `release_empty_pages`, `free_page`)
 
