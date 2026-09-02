@@ -75,4 +75,5 @@ fn zeroed_and_aligned_allocations() {
     struct PageAligned([u8; 16]);
     let p = Box::new(PageAligned([7; 16]));
     assert_eq!(p.as_ref() as *const PageAligned as usize % 8192, 0);
+    assert!(p.0.iter().all(|&x| x == 7));
 }

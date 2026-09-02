@@ -36,7 +36,7 @@ All from the repo root (or a worktree root). `wasmtime` lives in `~/.wasmtime/bi
 PATH first: `export PATH="$HOME/.wasmtime/bin:$PATH"`.
 
 - Gate (must pass before asking for a merge; about a minute):
-  `cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test && cargo test --target wasm32-wasip1 && cargo build --release --target wasm32-unknown-unknown && scripts/kani-quick`
+  `cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo clippy --target wasm32-wasip1 --all-targets -- -D warnings && cargo test && cargo test --target wasm32-wasip1 && cargo build --release --target wasm32-unknown-unknown && scripts/kani-quick`
 - Full Kani set (about 10 minutes, on demand and before a release): `scripts/kani-full`, which
   runs every harness in its own capped scope (one `cargo kani` over all of them accumulates
   CBMC residue and gets OOM-killed). One harness: `scripts/kani --harness <name>` (never bare
