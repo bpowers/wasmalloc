@@ -38,8 +38,8 @@ header-less runs of pages that grow in place. There is one thread, so nothing is
 nothing is thread-local. The fast paths compile to a handful of loads and stores and are
 inlined into the `__rust_alloc` and `__rust_dealloc` shims even at `opt-level = "z"`.
 
-**Safe.** Every `unsafe` block is either covered by a machine-checked proof (33 Kani harnesses
-run in the merge gate and before each release) or carries an entry in the
+**Safe.** Every `unsafe` block is either covered by a machine-checked proof (33 Kani harnesses;
+the fast ones run in the merge gate, all of them before a release) or carries an entry in the
 [soundness ledger](docs/soundness-ledger.md) with its preconditions, invariants and a written
 proof, adversarially reviewed by someone who did not write the code. The whole allocator runs
 natively against a simulated linear memory, which is how it is fuzzed (a model-based
