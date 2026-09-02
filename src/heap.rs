@@ -201,16 +201,7 @@ impl<M: Memory, const WORDS: usize> Heap<M, WORDS> {
     /// `layout.size()` must be non-zero (the `GlobalAlloc` contract).
     #[inline(always)]
     pub unsafe fn alloc(&mut self, layout: Layout) -> Option<NonNull<u8>> {
-        let mut size = layout.size();
-        let align = layout.align();
-        if align > WORD {
-            if align > MAX_NATURAL_ALIGN {
-                // SAFETY: same contract as this function.
-                return unsafe { self.alloc_generic(layout, false) };
-            }
-            // Same rounding as bins::classify: the bin of the rounded size is aligned to `align`.
-            size = (size + align - 1) & !(align - 1);
-        }
+        let size = direct_size(layout);
         if size <= DIRECT_MAX_SIZE {
             let page = self.direct[bins::direct_index(size)];
             // SAFETY: direct entries are the read-only sentinel (empty list, pop returns None
@@ -232,15 +223,7 @@ impl<M: Memory, const WORDS: usize> Heap<M, WORDS> {
     /// As for [`alloc`](Self::alloc).
     #[inline(always)]
     pub unsafe fn alloc_zeroed(&mut self, layout: Layout) -> Option<NonNull<u8>> {
-        let mut size = layout.size();
-        let align = layout.align();
-        if align > WORD {
-            if align > MAX_NATURAL_ALIGN {
-                // SAFETY: same contract as this function.
-                return unsafe { self.alloc_generic(layout, true) };
-            }
-            size = (size + align - 1) & !(align - 1);
-        }
+        let size = direct_size(layout);
         if size <= DIRECT_MAX_SIZE {
             let page = self.direct[bins::direct_index(size)];
             // SAFETY: as in `alloc`.
@@ -315,9 +298,22 @@ impl<M: Memory, const WORDS: usize> Heap<M, WORDS> {
         layout: Layout,
         new_size: usize,
     ) -> Option<NonNull<u8>> {
+        let align = layout.align();
+        // Both sizes within the direct table's range at word alignment: the same direct slot
+        // means the same bin (Kani `direct_table_tiles_and_matches_bin`), so the block already
+        // serves the new size. Decided on the two sizes alone, before either Layout is
+        // classified; nothing below is reached for such a pair.
+        if align <= WORD
+            && layout.size() <= DIRECT_MAX_SIZE
+            && new_size <= DIRECT_MAX_SIZE
+            && bins::direct_index(layout.size()) == bins::direct_index(new_size)
+        {
+            return Some(ptr);
+        }
         // SAFETY: caller guarantees the rounded size fits; the alignment is unchanged.
-        let new_layout = unsafe { Layout::from_size_align_unchecked(new_size, layout.align()) };
-        match (bins::classify(layout), bins::classify(new_layout)) {
+        let new_layout = unsafe { Layout::from_size_align_unchecked(new_size, align) };
+        let new_class = bins::classify(new_layout);
+        match (bins::classify(layout), new_class) {
             // Same block if it fits. Shrinking in place is only allowed within the same page
             // kind (the next dealloc recomputes the kind from the new Layout) and, as in
             // mimalloc, only while the block stays at least half used.
@@ -356,7 +352,7 @@ impl<M: Memory, const WORDS: usize> Heap<M, WORDS> {
         // that is, a buffer the program is growing, so the new run goes to the bottom of the
         // free tail at the top of the heap, where the next growth extends it instead of copying
         // it again. A lowest-fit run would land in a hole between pages and move at every step.
-        let new = match bins::classify(new_layout) {
+        let new = match new_class {
             Class::Huge => self.alloc_huge(new_layout, false, true)?,
             // SAFETY: new_layout has non-zero size (caller contract).
             Class::Bin(_) => unsafe { self.alloc(new_layout)? },
@@ -930,13 +926,37 @@ unsafe fn needs_transition(page: *const Page) -> bool {
     unsafe { ((*page).used == 0 && (*page).retire_expire == 0) || (*page).flags != 0 }
 }
 
+/// The size the allocation fast paths index the direct table with: the request's size rounded
+/// up to its alignment, as `bins::classify` rounds it, so the bin of the rounded size is aligned
+/// to `align`; or `usize::MAX` for an alignment above [`MAX_NATURAL_ALIGN`], which no page
+/// serves. Folding the over-aligned case into the size test, instead of an early return, leaves
+/// the fast path with exactly one call of `alloc_generic`: at `opt-level = "z"` a second return
+/// path became a second copy of the call and its epilogue in `__rust_alloc` (20 bytes of x86 in
+/// V8's code), and every byte of the shim counts against V8's inlining budget.
+#[inline(always)]
+fn direct_size(layout: Layout) -> usize {
+    let size = layout.size();
+    let align = layout.align();
+    if align <= WORD {
+        size
+    } else if align <= MAX_NATURAL_ALIGN {
+        // Layout guarantees the rounded size fits isize, so this cannot overflow.
+        (size + align - 1) & !(align - 1)
+    } else {
+        usize::MAX
+    }
+}
+
 /// Whether a block of bin `old` keeps serving a request of `new_size` bytes that classifies as
 /// bin `new` (the in-place decision of [`Heap::realloc`], kept pure so a proof can quantify over
 /// every pair of Layouts). Growing never fits: bins are tight, so `new > old` means the request
 /// exceeds the block. Shrinking stays in place only within the page kind, because the next
 /// `dealloc` recomputes the kind from the new Layout and masks the address with it, and, as in
 /// mimalloc, only while the block stays at least half used.
-#[inline]
+///
+/// `#[inline(always)]`, like [`huge_slices`] and the `bins` arithmetic: at `opt-level = "z"`
+/// these were out-of-line calls on every `realloc` (`docs/research/simlin-profile.md`, 6).
+#[inline(always)]
 fn fits_in_place(old: u8, new: u8, new_size: usize) -> bool {
     new == old
         || (new < old
@@ -945,7 +965,7 @@ fn fits_in_place(old: u8, new: u8, new_size: usize) -> bool {
 }
 
 /// Number of slices a header-less run for `layout` occupies.
-#[inline]
+#[inline(always)]
 fn huge_slices(layout: Layout) -> usize {
     layout.size().div_ceil(SLICE_SIZE).max(1)
 }
@@ -1994,6 +2014,18 @@ mod verify {
             return;
         };
         kani::assume(old_size >= 1 && new_size >= 1);
+        // The shortcut at the top of `realloc` returns the block on the two sizes alone; it must
+        // agree with the classification the general path would have made.
+        if align <= WORD
+            && old_size <= DIRECT_MAX_SIZE
+            && new_size <= DIRECT_MAX_SIZE
+            && bins::direct_index(old_size) == bins::direct_index(new_size)
+        {
+            let (Class::Bin(o), Class::Bin(n)) = (bins::classify(old), bins::classify(new)) else {
+                panic!("a direct-table size classifies as a bin");
+            };
+            assert!(o == n && fits_in_place(o, n, new_size));
+        }
         if let (Class::Bin(o), Class::Bin(n)) = (bins::classify(old), bins::classify(new)) {
             if fits_in_place(o, n, new_size) {
                 let rounded = (new_size + align - 1) & !(align - 1);

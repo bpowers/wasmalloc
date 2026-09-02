@@ -168,7 +168,7 @@ pub enum Class {
 
 /// Round `size` up to a multiple of the power of two `align`. Caller guarantees `align` is a
 /// power of two and `size + align` does not overflow.
-#[inline]
+#[inline(always)]
 const fn round_up_pow2(size: usize, align: usize) -> usize {
     debug_assert!(align.is_power_of_two());
     (size + align - 1) & !(align - 1)
@@ -176,7 +176,14 @@ const fn round_up_pow2(size: usize, align: usize) -> usize {
 
 /// Bin for a block of `size` bytes: `1..=MAX_BIN`, or [`BIN_HUGE`] above [`LARGE_MAX_OBJ_SIZE`].
 /// Size 0 maps to bin 1.
-#[inline]
+///
+/// The bin arithmetic (this function, [`bin_size`], [`kind_of_bin`], [`direct_index`] and
+/// [`classify`]) is `#[inline(always)]`: a consumer building at `opt-level = "z"` otherwise gets
+/// these as out-of-line calls in `realloc`, with `classify`'s two-byte result returned through a
+/// slot on the shadow stack (`docs/research/simlin-profile.md`, section 6). Each is a handful of
+/// instructions, so inlining them costs nothing where the optimizer would have inlined them
+/// anyway.
+#[inline(always)]
 pub const fn bin(size: usize) -> u8 {
     if size <= 8 * WORD {
         if size <= WORD {
@@ -197,7 +204,7 @@ pub const fn bin(size: usize) -> u8 {
 }
 
 /// Block size of a bin in bytes. `bin` must be in `1..=MAX_BIN`.
-#[inline]
+#[inline(always)]
 pub const fn bin_size(bin: u8) -> usize {
     debug_assert!(bin >= 1 && bin <= MAX_BIN);
     if bin <= 8 {
@@ -213,7 +220,7 @@ pub const fn bin_size(bin: u8) -> usize {
 }
 
 /// Page kind holding blocks of `bin`. `bin` must be in `1..=MAX_BIN`.
-#[inline]
+#[inline(always)]
 pub const fn kind_of_bin(bin: u8) -> PageKind {
     debug_assert!(bin >= 1 && bin <= MAX_BIN);
     if bin <= SMALL_MAX_BIN {
@@ -226,7 +233,7 @@ pub const fn kind_of_bin(bin: u8) -> PageKind {
 }
 
 /// Index into the direct table for sizes up to [`DIRECT_MAX_SIZE`].
-#[inline]
+#[inline(always)]
 pub const fn direct_index(size: usize) -> usize {
     debug_assert!(size <= DIRECT_MAX_SIZE);
     size.div_ceil(WORD)
@@ -240,7 +247,7 @@ pub const fn direct_index(size: usize) -> usize {
 /// well-formed type layouts, whose size is already a multiple of their alignment) and binned;
 /// the alignment property documented at the top of the module then guarantees the block is
 /// aligned.
-#[inline]
+#[inline(always)]
 pub const fn classify(layout: Layout) -> Class {
     let align = layout.align();
     if align > MAX_NATURAL_ALIGN {

@@ -437,3 +437,49 @@ fresh slices are known zero but are not yet reported as such to a zeroing reallo
    counted differently): 14 -> 11 in the module, all remaining in the harness's std, 2 -> 0 in
    `wasmalloc::` functions; "attempt to divide by zero" gone from the data segments; raw module
    47932 -> 47617 bytes, 21418 -> 21186 after `wasm-opt -O3`. Kept.
+
+### 2026-09-02, tuning-c (the simlin profile's ranked list)
+
+Implements the ranked changes of `docs/research/simlin-profile.md` section 8, each measured at
+two levels before it was kept. Roofline: `bench/roofline` at `opt-level = 3` with fat LTO, the
+six workloads alloc_free_32, alloc_free_32_align16, batch_lifo_32, churn, random_actions and
+realloc_doubling, on node 24 (V8 13.6, `--no-liftoff` and `--liftoff-only`), node 22 (V8 12.4,
+`--no-liftoff`) and wasmtime, pinned to CPUs 12-15, three to seven alternating runs per variant,
+median of medians (ns per operation). simlin: the C-LEARN compile stage (`clearn-alloc.mjs`,
+LTM on) on node 24, the baseline and the candidate bundle interleaved in one process, 10
+iterations after 2 warm-ups, two runs with the bundle order swapped, reported as the median of
+the 20 per-iteration paired differences. The bundles are built exactly as simlin's
+`build.sh` does (`-Oz`, fat LTO, `wasm-opt -O3`); a second build keeps the name section for
+instruction counts (`wasm-tools print`) and V8 machine code (`--print-wasm-code` on the tiered
+run, the code the bench executes). Baseline: main at afc0e2c (byte-identical to the wasmalloc
+0.1.0 release simlin ships).
+
+1. **Lean `realloc` entry** (profile rank 1). `bins::bin`, `bin_size`, `kind_of_bin`,
+   `direct_index`, `classify`, `fits_in_place` and `huge_slices` are `#[inline(always)]` (at
+   `-Oz` LLVM compiled `classify` out of line and returned its two-byte `Class` through a slot
+   on the shadow stack, twice per `realloc`); `realloc` returns the block before classifying
+   anything when `align <= WORD`, both sizes are at most `DIRECT_MAX_SIZE` and their direct
+   indices agree (one direct index means one bin, Kani `direct_table_tiles_and_matches_bin`;
+   the harness `realloc_in_place_keeps_the_kind_and_fits` now also asserts the shortcut agrees
+   with `fits_in_place`); and the alloc fast paths take their size from one function,
+   `direct_size`, which maps an over-aligned request to `usize::MAX` instead of returning early.
+   The last point was forced by the first version of this change, which left `__rust_alloc`
+   with two copies of the `alloc_generic` call and its epilogue at `-Oz` (20 bytes more of V8
+   code) and measured 25 ms slower on simlin. Shims, wasm instructions after `wasm-opt -O3` in
+   the simlin bundle: `__rust_alloc` 63 -> 56, `__rust_dealloc` 68 -> 68, `__rust_realloc`
+   493 -> 622 with two `classify` calls and three shadow-stack operations -> none,
+   `__rust_alloc_zeroed` 82 -> 77; V8 TurboFan code: `__rust_realloc` 1916 -> 1752 bytes,
+   `__rust_alloc` 216 -> 232 (V8 duplicates the cold call for a third branch; the hot path is
+   instruction-for-instruction the same), and the alloc path is inlined into 67 callers instead
+   of 64. simlin compile: 1934 -> 1927 ms median, paired difference -4.2 ms (IQR -9.1 to -1.6,
+   n = 20). Roofline, base -> change (n24 TurboFan / n24 Liftoff / n22 TurboFan / wasmtime):
+   alloc_free_32 1.249/4.41/2.599/1.12 -> 1.248/4.39/2.599/1.12 (one wasmtime baseline run
+   read 1.30, the address-dependent swing noted in the tuning-b entry), alloc_free_32_align16
+   1.248/4.40/2.601/1.122 -> 1.248/4.39/2.599/1.122, batch_lifo_32 1.596/5.41/3.077/1.86 ->
+   1.589/5.42/3.078/1.61, churn 6.68/10.98/7.27/6.26 -> 6.73/10.99/7.29/6.25, random_actions
+   14.88/21.46/14.86/14.38 -> 15.59/20.95/15.06/14.63, realloc_doubling 640/826/649/622 ->
+   631/825/642/628. The random_actions step on n24 (+4.8 percent) is not the change's
+   arithmetic: removing either the shortcut or `direct_size` alone puts the workload back at
+   14.9, and the TurboFan code of the `random_actions` loop (which inlines the fast paths)
+   differs between those builds only in register assignment and spill slots, at 2385 to 3021
+   instructions depending on what V8 chose to inline. Kept.

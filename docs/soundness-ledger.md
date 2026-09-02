@@ -211,8 +211,12 @@ the returned block, the zeroing block in `alloc_zeroed`, and the calls into `all
 - Invariants relied on: heap invariant 3 (every direct entry is the first page of the queue of
   `bin(i * WORD)` or the sentinel); heap invariant 2 and the page invariants for that page;
   `EMPTY_PAGE.free == 0`; `bins::classify`'s alignment-by-construction property.
-- Proof sketch. Rounding: `size + align - 1` cannot overflow because `Layout` guarantees the
-  rounded size fits `isize` and `align <= MAX_NATURAL_ALIGN`. Index: `direct_index(size) <
+- Proof sketch. Size: `direct_size(layout)` is `layout.size()` for `align <= WORD`, the size
+  rounded up to `align` for `WORD < align <= MAX_NATURAL_ALIGN` (the rounding `bins::classify`
+  does; `size + align - 1` cannot overflow because `Layout` guarantees the rounded size fits
+  `isize` and `align <= MAX_NATURAL_ALIGN`), and `usize::MAX` for a larger alignment, which
+  fails the `<= DIRECT_MAX_SIZE` test so that such a request reaches `alloc_generic` without a
+  second return path (it classifies as `Huge` there, HEAP-04). Index: `direct_index(size) <
   DIRECT_ENTRIES` for every `size <= DIRECT_MAX_SIZE`, and `bin(direct_index(size) * WORD) ==
   bin(size) == classify(layout)`'s bin, so the entry belongs to the request's bin (Kani
   `direct_table_tiles_and_matches_bin`, `dealloc_fast_path_agrees_with_classify`). The entry is
@@ -249,7 +253,11 @@ the returned block, the zeroing block in `alloc_zeroed`, and the calls into `all
   entries; sizes up to 1 KiB reach it only in tests), and `alloc_zeroed`'s `write_bytes` on a
   dirty page (the model stores one word per block); both rest on the arithmetic above and on
   the tests.
-- Reviewer: adversarial-reviewer, 2026-09-02: accepted.
+- Changes: 2026-09-02, tuning-c: the two fast paths take their size from `direct_size` (safe
+  code) instead of rounding inline with an early return for over-aligned requests; the unsafe
+  blocks are unchanged and reached under the same condition (`size <= DIRECT_MAX_SIZE` after
+  rounding, never for `align > MAX_NATURAL_ALIGN`). The three arithmetic harnesses re-run.
+- Reviewer: adversarial-reviewer, 2026-09-02: accepted; the tuning-c change awaits a fresh look.
 
 ### HEAP-02: `Heap::dealloc`, the small-page fast path, and `dealloc_generic`
 
@@ -310,7 +318,13 @@ Blocks: `Layout::from_size_align_unchecked`, the `self.alloc(new_layout)` for a 
   to `layout.align()` does not overflow `isize` (the `GlobalAlloc::realloc` contract).
 - Invariants relied on: `fits_in_place`'s guarantee (below); page invariant 4 and heap invariant
   4 (live blocks and handed-out runs are disjoint from everything the allocator can hand out).
-- Proof sketch. The unchecked Layout meets `from_size_align`'s requirements exactly by the
+- Proof sketch. The shortcut before any classification returns `ptr` when `align <= WORD`,
+  both sizes are at most `DIRECT_MAX_SIZE` and `direct_index` agrees on them: sizes with one
+  direct index have one bin (Kani `direct_table_tiles_and_matches_bin`: `bin(direct_index(s) *
+  WORD) == bin(s)`), `classify` with `align <= WORD` is `Bin(bin(size))`, and
+  `fits_in_place(b, b, new_size)` holds, so this is exactly the decision the general path takes
+  for such a pair (asserted for every such pair in `realloc_in_place_keeps_the_kind_and_fits`).
+  The unchecked Layout meets `from_size_align`'s requirements exactly by the
   contract (the alignment is a Layout's, hence a power of two). In place within a page:
   `fits_in_place(old, new, new_size)` implies `kind_of_bin(old) == kind_of_bin(new)` and
   `bin_size(old) >= round_up(new_size, align)` (Kani `realloc_in_place_keeps_the_kind_and_fits`,
@@ -338,7 +352,12 @@ Blocks: `Layout::from_size_align_unchecked`, the `self.alloc(new_layout)` for a 
   (content checks across every move). Miri as above.
 - Not machine-checked by Kani: the copy on a move (the model has no block bodies); tests and
   the model tester check contents.
-- Reviewer: adversarial-reviewer, 2026-09-02: accepted.
+- Changes: 2026-09-02, tuning-c: the direct-index shortcut above (safe code before the unsafe
+  blocks), the new Layout classified once and reused for the move, and `#[inline(always)]` on
+  `bins::classify`, `fits_in_place` and `huge_slices` (no semantic change; at `opt-level = "z"`
+  they were out-of-line calls with an sret round trip through the shadow stack, see
+  `docs/research/simlin-profile.md` section 6). The unsafe blocks are unchanged.
+- Reviewer: adversarial-reviewer, 2026-09-02: accepted; the tuning-c change awaits a fresh look.
 
 ### HEAP-04: `alloc_generic`, `alloc_huge` and `acquire_run`, the slow-path hand-out
 
