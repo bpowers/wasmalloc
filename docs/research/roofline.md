@@ -71,10 +71,20 @@ allocators), the workload's setup, the timed call, the teardown. Warm up until t
 last three calls agree within 10 percent (3 to 12 calls, up to 30 while V8 still
 reports Liftoff code for the function), then 7 timed calls; report median and
 minimum ns per op with the median cost of an empty JS-to-wasm call subtracted from
-each timed call. The workload loops are `#[inline(always)]` into the exported
-functions so that V8's per-function tier applies to the code that runs; the first
-version of the harness measured a wrapper that stayed in Liftoff while the loop
-body tiered up.
+each timed call.
+
+The workload loops are `#[inline(always)]` into the exported functions. V8 tiers
+up and reports the compilation tier per function, and its tiering budget is
+charged to the function whose code executes. In the first version of the harness
+most loop bodies were separate functions called from a thin export; the body
+tiered up after a few calls while the export, called a few dozen times, stayed in
+Liftoff, so `%IsLiftoffFunction(export)` said "Liftoff" for code that was running
+optimized. The default-tiering tables committed with that version (the
+size-class floor only, commit 1082415) marked batch, churn, Vec growth and the
+memory-grow workloads "L" for this reason; their timings were in fact optimizing-
+tier timings and agree with `--no-liftoff` to within noise. Every table in this
+document and in the current REPORT.md was measured with the inlined loops, so an
+"L" now means what it says.
 
 Engine runs are pinned to four cores (`taskset -c 4-7`) and wrapped in
 `scripts/memlimit`. The matrix took four minutes; the load average stayed below 1

@@ -64,9 +64,9 @@ cargo build --release --target wasm32-wasip1 --bin roofline-wasi --features wasm
 cargo build --release --bin roofline-wasi --features sizeclass && target/release/roofline-wasi
 ```
 
-`memlimit` reports the run's peak memory from the systemd journal on hosts
-whose journal records it; run-all.sh sets `MEMLIMIT_QUIET=1` because on hosts
-without that journal line the report step fails the whole command.
+`memlimit` prints one line per run with the command's exit status and, where the
+systemd journal recorded it, the run's peak memory; set `MEMLIMIT_QUIET=1` to
+silence it.
 
 `--allow-natives-syntax` only enables the per-function tier query
 (`%IsLiftoffFunction`); on V8 use `--no-liftoff` for optimizing-tier numbers and

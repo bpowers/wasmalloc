@@ -29,11 +29,6 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo="$(cd "$here/../.." && pwd)"
 cd "$here"
 
-# memlimit's peak-memory report reads the scope's accounting line back from the
-# systemd journal; on hosts whose journal has no such line the read fails and
-# the wrapper exits 1 after a successful command. The report is not needed here.
-export MEMLIMIT_QUIET=1
-
 NODE="${NODE:-node}"
 D8="${D8:-$HOME/.jsvu/bin/v8-15.2.124}"
 JSC="${JSC:-$HOME/.jsvu/bin/jsc}"
