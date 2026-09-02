@@ -1,10 +1,15 @@
 // Driver for bare engine shells. Run from this directory so load() finds harness.js:
 //   d8  [v8 flags]  run-shell.js -- [--json] [--reps N] path/to/roofline.wasm
 //   jsc [jsc flags] run-shell.js -- [--json] [--reps N] path/to/roofline.wasm
+// Pass --allow-natives-syntax to d8 to get each workload's compilation tier.
+// Neither shell exposes its own command-line flags to scripts, so pass
+// --flags "..." (and, for jsc, --engine-version "...") to record them.
 load('harness.js');
 
-const isD8 = typeof readbuffer === 'function' || (typeof version === 'function' && typeof read === 'function');
-const isJsc = typeof preciseTime === 'function';
+// jsc's shell also defines version() and read(), so test for it first;
+// preciseTime() and readFile() are jsc-only, readbuffer() is d8-only.
+const isJsc = typeof preciseTime === 'function' && typeof readFile === 'function';
+const isD8 = !isJsc && typeof readbuffer === 'function';
 if (!isD8 && !isJsc) throw new Error('unrecognized shell (expected d8 or jsc)');
 
 function makeTierOf() {
@@ -34,6 +39,7 @@ const env = isD8
       version: 'JavaScriptCore',
       flags: null,
       args: Array.from(arguments),
+      // jsc's performance.now() returns 0 in the shell; preciseTime() is seconds.
       now: () => preciseTime() * 1000,
       print: print,
       readWasm: (p) => readFile(p, 'binary'),

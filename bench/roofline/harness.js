@@ -2,11 +2,19 @@
 // JavaScriptCore) and mirrored by src/bin/roofline-wasi.rs. Classic script:
 // it only assigns globalThis.Roofline so it can be loaded everywhere.
 //
-// Protocol per workload: warm up until two consecutive calls agree within 10
+// Protocol per workload: warm up until the last three calls agree within 10
 // percent (at least MIN_WARM calls, at most MAX_WARM), then time REPS calls
 // and report median and min ns per op. Every timed call is preceded by
 // reset() (rewinds the floor allocators; no-op otherwise) and the workload's
 // setup, and followed by its teardown; only the workload call itself is timed.
+//
+// Tiering: on V8 with --allow-natives-syntax the driver can tell whether a
+// function is still running Liftoff (baseline) code. Under dynamic tiering the
+// first calls of a workload run in Liftoff and its steady state is the
+// optimized tier, so warm-up keeps going while the function is in Liftoff
+// (up to MAX_WARM_TIERUP calls) unless --tier-hint liftoff says Liftoff is the
+// tier under test. Functions that never execute enough code to exhaust V8's
+// tiering budget stay in Liftoff and are reported as such.
 (function () {
   'use strict';
 
@@ -27,10 +35,30 @@
   const REPS = 7;
   const MIN_WARM = 3;
   const MAX_WARM = 12;
+  const MAX_WARM_TIERUP = 30;
+  const STABLE_RATIO = 1.1;
   const NOOP_CALLS = 1000000;
+  // Tier-up probe: give up after this many calls.
+  const PROBE_MAX_CALLS = 20000000;
+
+  const USAGE =
+    'usage: [--json] [--reps N] [--scale F] [--only a,b] [--tier-hint liftoff|any] ' +
+    '[--flags text] [--engine-version text] [--note text] [--tierup N [--tierup-fn name]] file.wasm';
 
   function parseArgs(argv) {
-    const opts = { json: false, reps: REPS, scale: 1, only: null, wasm: null, note: null };
+    const opts = {
+      json: false,
+      reps: REPS,
+      scale: 1,
+      only: null,
+      wasm: null,
+      note: null,
+      flags: null,
+      engineVersion: null,
+      tierHint: 'any',
+      tierup: null,
+      tierupFn: 'alloc_free_32',
+    };
     for (let i = 0; i < argv.length; i++) {
       const a = argv[i];
       if (a === '--json') opts.json = true;
@@ -38,10 +66,17 @@
       else if (a === '--scale') opts.scale = parseFloat(argv[++i]);
       else if (a === '--only') opts.only = argv[++i].split(',');
       else if (a === '--note') opts.note = argv[++i];
-      else if (a.startsWith('--')) throw new Error('unknown option ' + a);
+      else if (a === '--flags') opts.flags = argv[++i];
+      else if (a === '--engine-version') opts.engineVersion = argv[++i];
+      else if (a === '--tier-hint') opts.tierHint = argv[++i];
+      else if (a === '--tierup') opts.tierup = parseInt(argv[++i], 10);
+      else if (a === '--tierup-fn') opts.tierupFn = argv[++i];
+      else if (a.startsWith('--')) throw new Error('unknown option ' + a + '\n' + USAGE);
       else opts.wasm = a;
     }
-    if (!opts.wasm) throw new Error('usage: [--json] [--reps N] [--scale F] [--only a,b] [--note text] file.wasm');
+    if (!opts.wasm) throw new Error(USAGE);
+    if (!(opts.reps > 0) || !(opts.scale > 0)) throw new Error(USAGE);
+    if (opts.tierHint !== 'liftoff' && opts.tierHint !== 'any') throw new Error(USAGE);
     return opts;
   }
 
@@ -98,18 +133,25 @@
       return (t1 - t0) * 1e6;
     };
 
-    let prev = call();
-    let warm = 1;
+    const times = [];
+    const tiers = [];
     for (;;) {
-      const cur = call();
-      warm++;
-      const stable = Math.abs(cur - prev) / Math.max(prev, 1) < 0.1;
-      prev = cur;
-      if ((warm >= MIN_WARM && stable) || warm >= MAX_WARM) break;
+      times.push(call());
+      tiers.push(env.tierOf(fn));
+      const warm = times.length;
+      const last = times.slice(-3);
+      const stable =
+        warm >= MIN_WARM && Math.max.apply(null, last) / Math.max(Math.min.apply(null, last), 1) < STABLE_RATIO;
+      const waitingForTierUp = tiers[warm - 1] === 'liftoff' && opts.tierHint !== 'liftoff';
+      const cap = waitingForTierUp ? MAX_WARM_TIERUP : MAX_WARM;
+      if ((stable && !waitingForTierUp) || warm >= cap) break;
     }
+    const liftoffWarmupCalls = tiers.filter((t) => t === 'liftoff').length;
 
+    const tierBefore = env.tierOf(fn);
     const samples = [];
     for (let r = 0; r < opts.reps; r++) samples.push((call() - callNs) / ops);
+    const tier = env.tierOf(fn);
     samples.sort((a, b) => a - b);
     return {
       workload: wl.name,
@@ -118,8 +160,63 @@
       opsPerCall: ops,
       medianNsPerOp: median(samples),
       minNsPerOp: samples[0],
-      warmupCalls: warm,
-      tier: env.tierOf(fn),
+      warmupCalls: times.length,
+      liftoffWarmupCalls,
+      firstCallNsPerOp: (times[0] - callNs) / ops,
+      tier,
+      tierStable: tierBefore === tier,
+      checksum: checksum >>> 0,
+    };
+  }
+
+  // How many calls of fn(n) does the engine take before it stops running the
+  // Liftoff code? Reports calls and total iterations at the first call that
+  // observed optimized code, with the per-op time before and after. Run each n
+  // in a fresh process: V8 caches compiled modules by wire bytes, so a fresh
+  // WebAssembly.Module in the same process may already be tiered up.
+  function probeTierUp(exports, opts, env) {
+    const fn = exports[opts.tierupFn];
+    if (typeof fn !== 'function') throw new Error('missing export ' + opts.tierupFn);
+    const n = opts.tierup;
+    let calls = 0;
+    let checksum = 0;
+    let liftoffNs = null;
+    let tierUpCall = null;
+    const t0 = env.now();
+    while (calls < PROBE_MAX_CALLS) {
+      exports.reset();
+      checksum ^= fn(n);
+      calls++;
+      if (env.tierOf(fn) !== 'liftoff') {
+        tierUpCall = calls;
+        break;
+      }
+      if (calls === 1000) liftoffNs = ((env.now() - t0) * 1e6) / (1000 * n);
+    }
+    const tierAfter = env.tierOf(fn);
+    // Steady-state cost after tier-up, same loop shape (includes reset() and the
+    // tier query per call, so this is comparable to liftoffNs, not to the main
+    // benchmark figures).
+    let optimizedNs = null;
+    if (tierAfter !== 'liftoff') {
+      const reps = Math.max(1000, Math.min(1000000, Math.round(20000000 / Math.max(n, 1))));
+      const t1 = env.now();
+      for (let i = 0; i < reps; i++) {
+        exports.reset();
+        checksum ^= fn(n);
+        env.tierOf(fn);
+      }
+      optimizedNs = ((env.now() - t1) * 1e6) / (reps * n);
+    }
+    return {
+      fn: opts.tierupFn,
+      n,
+      callsUntilTierUp: tierUpCall,
+      itersUntilTierUp: tierUpCall === null ? null : tierUpCall * n,
+      gaveUpAfterCalls: tierUpCall === null ? calls : null,
+      tierAfter,
+      liftoffNsPerOp: liftoffNs,
+      optimizedNsPerOp: optimizedNs,
       checksum: checksum >>> 0,
     };
   }
@@ -128,24 +225,33 @@
     const opts = parseArgs(env.args);
     const exports = instantiate(env.readWasm(opts.wasm));
     const variant = variantName(exports);
+    const header = {
+      engine: env.engine,
+      engineVersion: opts.engineVersion || env.version,
+      flags: opts.flags !== null ? opts.flags : env.flags,
+      note: opts.note,
+      wasm: opts.wasm,
+      variant,
+    };
+    let report;
+    if (opts.tierup !== null) {
+      report = Object.assign(header, { tierup: probeTierUp(exports, opts, env) });
+      env.print(JSON.stringify(report, null, 2));
+      return report;
+    }
     const callOverhead = measureCallOverhead(exports, env);
     const results = [];
     for (const wl of WORKLOADS) {
       if (opts.only && !opts.only.includes(wl.name)) continue;
       results.push(measure(exports, wl, opts, env, callOverhead.median));
     }
-    const report = {
-      engine: env.engine,
-      engineVersion: env.version,
-      flags: env.flags,
-      note: opts.note,
-      wasm: opts.wasm,
-      variant,
+    report = Object.assign(header, {
       reps: opts.reps,
       scale: opts.scale,
+      tierHint: opts.tierHint,
       callOverheadNs: callOverhead,
       results,
-    };
+    });
     if (opts.json) {
       env.print(JSON.stringify(report, null, 2));
     } else {
@@ -168,7 +274,14 @@
       `js->wasm call: median ${report.callOverheadNs.median.toFixed(2)} ns, min ${report.callOverheadNs.min.toFixed(2)} ns (${report.callOverheadNs.tier})`
     );
     lines.push(
-      pad('workload', 20) + pad('ops/call', 12, true) + pad('median ns/op', 14, true) + pad('min ns/op', 12, true) + pad('warm', 6, true) + '  tier'
+      pad('workload', 20) +
+        pad('ops/call', 12, true) +
+        pad('median ns/op', 14, true) +
+        pad('min ns/op', 12, true) +
+        pad('first', 10, true) +
+        pad('warm', 6, true) +
+        pad('lift', 6, true) +
+        '  tier'
     );
     for (const r of report.results) {
       lines.push(
@@ -176,9 +289,12 @@
           pad(r.opsPerCall, 12, true) +
           pad(r.medianNsPerOp.toFixed(2), 14, true) +
           pad(r.minNsPerOp.toFixed(2), 12, true) +
+          pad(r.firstCallNsPerOp.toFixed(1), 10, true) +
           pad(r.warmupCalls, 6, true) +
+          pad(r.liftoffWarmupCalls, 6, true) +
           '  ' +
-          r.tier
+          r.tier +
+          (r.tierStable ? '' : ' (changed during reps)')
       );
     }
     return lines.join('\n');

@@ -23,7 +23,9 @@ function makeTierOf() {
 const env = {
   engine: 'node',
   version: `node ${process.versions.node} / V8 ${process.versions.v8}`,
-  flags: process.execArgv.join(' '),
+  // --allow-natives-syntax only enables the tier query; it is not an engine
+  // configuration worth recording.
+  flags: process.execArgv.filter((f) => f !== '--allow-natives-syntax').join(' ') || '(default)',
   args: process.argv.slice(2),
   now: () => performance.now(),
   print: (s) => process.stdout.write(s + '\n'),

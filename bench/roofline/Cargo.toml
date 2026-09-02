@@ -5,6 +5,10 @@ edition = "2021"
 publish = false
 description = "Allocation-cost roofline harness for single-threaded wasm32"
 
+# Standalone: this crate defines its own build profiles, which cargo only honours
+# in a workspace root, so it must not join the repository workspace.
+[workspace]
+
 [lib]
 crate-type = ["cdylib", "rlib"]
 

@@ -16,21 +16,48 @@ pub fn grow_pages(pages: usize) -> Option<usize> {
     }
 }
 
-/// Non-wasm hosts (native sanity runs of the same driver) get a stand-in that
-/// hands out fresh 64 KiB-aligned regions from the system allocator. It goes
-/// to `System` directly rather than through `std::alloc::alloc`, because the
+/// Non-wasm hosts (native sanity runs of the same driver) get a stand-in for
+/// linear memory: one large lazily-committed region from the system allocator,
+/// handed out sequentially, so that like wasm's `memory.grow` successive grows
+/// are contiguous and pages touched once stay resident and get reused after a
+/// `reset`. Anything beyond the reserve comes from a fresh region. This goes to
+/// `System` directly rather than through `std::alloc::alloc`, because the
 /// `#[global_allocator]` on this target may be one of the floors, whose refill
 /// path is exactly what calls us.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn grow_pages(pages: usize) -> Option<usize> {
+    use core::cell::Cell;
     use std::alloc::{GlobalAlloc, Layout, System};
-    let layout = Layout::from_size_align(pages * WASM_PAGE, WASM_PAGE).ok()?;
-    let p = unsafe { System.alloc(layout) };
-    if p.is_null() {
-        None
-    } else {
-        Some(p as usize)
+
+    const RESERVE: usize = 2 << 30;
+    thread_local! {
+        static NEXT: Cell<usize> = const { Cell::new(0) };
+        static END: Cell<usize> = const { Cell::new(0) };
     }
+
+    let bytes = pages * WASM_PAGE;
+    let region = |size: usize| -> Option<usize> {
+        let layout = Layout::from_size_align(size, WASM_PAGE).ok()?;
+        let p = unsafe { System.alloc(layout) };
+        if p.is_null() {
+            None
+        } else {
+            Some(p as usize)
+        }
+    };
+    let next = NEXT.with(Cell::get);
+    let end = END.with(Cell::get);
+    if next == 0 || next + bytes > end {
+        if bytes > RESERVE {
+            return region(bytes);
+        }
+        let base = region(RESERVE)?;
+        NEXT.with(|c| c.set(base + bytes));
+        END.with(|c| c.set(base + RESERVE));
+        return Some(base);
+    }
+    NEXT.with(|c| c.set(next + bytes));
+    Some(next)
 }
 
 macro_rules! count_enabled {

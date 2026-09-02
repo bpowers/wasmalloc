@@ -1,0 +1,104 @@
+{
+  "engine": "native",
+  "target": "native",
+  "variant": "sizeclass",
+  "allocator": "64 size classes of 16 B up to 1024 B, class from Layout on free",
+  "reps": 7,
+  "scale": 1,
+  "callOverheadNs": null,
+  "results": [
+    {
+      "workload": "alloc_free_32",
+      "unit": "alloc+free pair",
+      "n": 2000000,
+      "opsPerCall": 2000000,
+      "medianNsPerOp": 0.396,
+      "minNsPerOp": 0.391,
+      "warmupCalls": 3,
+      "tier": "n/a"
+    },
+    {
+      "workload": "batch_lifo_32",
+      "unit": "alloc+free pair",
+      "n": 2000,
+      "opsPerCall": 2000000,
+      "medianNsPerOp": 0.841,
+      "minNsPerOp": 0.839,
+      "warmupCalls": 3,
+      "tier": "n/a"
+    },
+    {
+      "workload": "batch_fifo_32",
+      "unit": "alloc+free pair",
+      "n": 2000,
+      "opsPerCall": 2000000,
+      "medianNsPerOp": 0.84,
+      "minNsPerOp": 0.838,
+      "warmupCalls": 3,
+      "tier": "n/a"
+    },
+    {
+      "workload": "churn",
+      "unit": "free+alloc step",
+      "n": 200000,
+      "opsPerCall": 200000,
+      "medianNsPerOp": 2.743,
+      "minNsPerOp": 2.728,
+      "warmupCalls": 4,
+      "tier": "n/a"
+    },
+    {
+      "workload": "vec_push_growth",
+      "unit": "1 MiB Vec<u8> growth",
+      "n": 20,
+      "opsPerCall": 20,
+      "medianNsPerOp": 358313.35,
+      "minNsPerOp": 344029.4,
+      "warmupCalls": 4,
+      "tier": "n/a"
+    },
+    {
+      "workload": "realloc_doubling",
+      "unit": "16 B to 1 MiB realloc chain",
+      "n": 100,
+      "opsPerCall": 100,
+      "medianNsPerOp": 60381.01,
+      "minNsPerOp": 59447.51,
+      "warmupCalls": 4,
+      "tier": "n/a"
+    },
+    {
+      "workload": "large_alloc_free",
+      "unit": "alloc+touch+free, 256K-4M",
+      "n": 50,
+      "opsPerCall": 50,
+      "medianNsPerOp": 2475.18,
+      "minNsPerOp": 2443.2,
+      "warmupCalls": 10,
+      "tier": "n/a"
+    },
+    {
+      "workload": "memory_grow_only",
+      "unit": "memory.grow 1 MiB, untouched",
+      "n": 16,
+      "opsPerCall": 16,
+      "medianNsPerOp": 1.25,
+      "minNsPerOp": 0.625,
+      "warmupCalls": 5,
+      "tier": "n/a"
+    },
+    {
+      "workload": "memory_grow_touch",
+      "unit": "memory.grow 1 MiB + touch",
+      "n": 16,
+      "opsPerCall": 16,
+      "medianNsPerOp": 167107.625,
+      "minNsPerOp": 158446.938,
+      "warmupCalls": 3,
+      "tier": "n/a"
+    }
+  ],
+  "checksum": 750580705,
+  "engineVersion": "x86_64 Linux 7.1.7-200.fc44.x86_64",
+  "flags": "(none)"
+}

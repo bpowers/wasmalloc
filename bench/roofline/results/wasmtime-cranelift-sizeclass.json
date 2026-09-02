@@ -1,0 +1,104 @@
+{
+  "engine": "wasmtime",
+  "target": "wasm32-wasip1",
+  "variant": "sizeclass",
+  "allocator": "64 size classes of 16 B up to 1024 B, class from Layout on free",
+  "reps": 7,
+  "scale": 1,
+  "callOverheadNs": null,
+  "results": [
+    {
+      "workload": "alloc_free_32",
+      "unit": "alloc+free pair",
+      "n": 2000000,
+      "opsPerCall": 2000000,
+      "medianNsPerOp": 0.546,
+      "minNsPerOp": 0.539,
+      "warmupCalls": 3,
+      "tier": "n/a"
+    },
+    {
+      "workload": "batch_lifo_32",
+      "unit": "alloc+free pair",
+      "n": 2000,
+      "opsPerCall": 2000000,
+      "medianNsPerOp": 1.043,
+      "minNsPerOp": 1.042,
+      "warmupCalls": 3,
+      "tier": "n/a"
+    },
+    {
+      "workload": "batch_fifo_32",
+      "unit": "alloc+free pair",
+      "n": 2000,
+      "opsPerCall": 2000000,
+      "medianNsPerOp": 1.076,
+      "minNsPerOp": 1.075,
+      "warmupCalls": 3,
+      "tier": "n/a"
+    },
+    {
+      "workload": "churn",
+      "unit": "free+alloc step",
+      "n": 200000,
+      "opsPerCall": 200000,
+      "medianNsPerOp": 3.181,
+      "minNsPerOp": 3.167,
+      "warmupCalls": 4,
+      "tier": "n/a"
+    },
+    {
+      "workload": "vec_push_growth",
+      "unit": "1 MiB Vec<u8> growth",
+      "n": 20,
+      "opsPerCall": 20,
+      "medianNsPerOp": 533160.3,
+      "minNsPerOp": 454321.55,
+      "warmupCalls": 6,
+      "tier": "n/a"
+    },
+    {
+      "workload": "realloc_doubling",
+      "unit": "16 B to 1 MiB realloc chain",
+      "n": 100,
+      "opsPerCall": 100,
+      "medianNsPerOp": 60143.81,
+      "minNsPerOp": 59223.31,
+      "warmupCalls": 4,
+      "tier": "n/a"
+    },
+    {
+      "workload": "large_alloc_free",
+      "unit": "alloc+touch+free, 256K-4M",
+      "n": 50,
+      "opsPerCall": 50,
+      "medianNsPerOp": 2599.18,
+      "minNsPerOp": 2456.6,
+      "warmupCalls": 7,
+      "tier": "n/a"
+    },
+    {
+      "workload": "memory_grow_only",
+      "unit": "memory.grow 1 MiB, untouched",
+      "n": 16,
+      "opsPerCall": 16,
+      "medianNsPerOp": 275,
+      "minNsPerOp": 273.75,
+      "warmupCalls": 4,
+      "tier": "n/a"
+    },
+    {
+      "workload": "memory_grow_touch",
+      "unit": "memory.grow 1 MiB + touch",
+      "n": 16,
+      "opsPerCall": 16,
+      "medianNsPerOp": 166859.438,
+      "minNsPerOp": 166113.25,
+      "warmupCalls": 3,
+      "tier": "n/a"
+    }
+  ],
+  "checksum": 2727586193,
+  "engineVersion": "wasmtime 48.0.1 (7bac2c277 2026-08-24)",
+  "flags": "(default: cranelift)"
+}
