@@ -87,19 +87,21 @@ minimization as goals (smaller is welcome, not required).
 | kind      | page size and alignment                | block sizes                     | header        | page lookup at dealloc                 |
 |-----------|----------------------------------------|---------------------------------|---------------|----------------------------------------|
 | small     | 1 slice (64 KiB), 64 KiB-aligned       | 8 B .. 10240 B                  | at page start | `ptr & !(64 KiB - 1)`                  |
-| medium    | 8 slices (512 KiB), 512 KiB-aligned    | 10240 B .. 81920 B              | at page start | `ptr & !(512 KiB - 1)`                 |
-| large     | 64 slices (4 MiB), 4 MiB-aligned       | 81920 B .. 512 KiB              | at page start | `ptr & !(4 MiB - 1)`                   |
-| singleton | `ceil(size / 64 KiB)` slices, 64 KiB-aligned (or aligned to `align` when `align > 64 KiB`) | > 512 KiB, or any size with `align > 4 KiB` | none | `ptr` is the run start; slice count is recomputed from the Layout |
+| medium    | 4 slices (256 KiB), 256 KiB-aligned    | 10240 B .. 40960 B              | at page start | `ptr & !(256 KiB - 1)`                 |
+| large (off) | 64 slices (4 MiB), 4 MiB-aligned     | 40960 B .. 512 KiB when `bins::LARGE_PAGES` | at page start | `ptr & !(4 MiB - 1)`         |
+| singleton | `ceil(size / 64 KiB)` slices, 64 KiB-aligned (or aligned to `align` when `align > 64 KiB`) | > 40960 B, or any size with `align > 4 KiB` | none | `ptr` is the run start; slice count is recomputed from the Layout |
 
-These are mimalloc's 64-bit constants (`MI_SMALL_PAGE_SIZE`, `MI_MEDIUM_PAGE_SIZE`,
-`MI_LARGE_PAGE_SIZE` and the corresponding `*_MAX_OBJ_SIZE` bounds, with the medium bound
-snapped down to the 81920-byte bin). mimalloc on 32-bit halves everything to save address
-space; wasm32 has a flat 4 GiB space and a 64 KiB grow unit, so the 64-bit values fit better.
-Large pages are enabled by default but controlled by one constant: mimalloc's own source
-questions them (random sizes between 64 KiB and 512 KiB can leave many partially used 4 MiB
-pages), and mimalloc v3.5.1 does not actually align large pages to 4 MiB, so our slice
-allocator must search for aligned runs (a large page is exactly one 64-bit word of the slice
-bitmap, which makes that search trivial).
+The small page and the large page are mimalloc's 64-bit constants (`MI_SMALL_PAGE_SIZE`,
+`MI_LARGE_PAGE_SIZE` and the corresponding `*_MAX_OBJ_SIZE` bounds); the medium page is
+mimalloc's 32-bit one (256 KiB, its bound snapped down to the 40960-byte bin), because in a
+small heap every touched bin costs a whole page and the 512 KiB page measured as pure footprint
+(tuning log, 2026-09-02). Large pages are compiled but off (`bins::LARGE_PAGES = false`):
+everything above the medium limit is a header-less run, which can grow in place and costs its
+own size instead of a 4 MiB page holding one block. mimalloc's own source questions large pages
+(random sizes between 64 KiB and 512 KiB can leave many partially used 4 MiB pages), and mimalloc
+v3.5.1 does not actually align large pages to 4 MiB, so with the constant on our slice allocator
+searches for aligned runs (a large page is exactly one 64-bit word of the slice bitmap, which
+makes that search trivial).
 
 Singleton runs carry no header at all. The Layout at `dealloc` and `realloc` gives the run
 length, and the slice bitmaps carry the free and known-zero state, so a header would only

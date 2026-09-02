@@ -34,19 +34,24 @@ pub const MIN_BLOCK_SIZE: usize = WORD;
 /// One wasm page: the unit of `memory.grow` and of our slice bitmap.
 pub const SLICE_SIZE: usize = 64 * 1024;
 
-/// Page sizes per kind. These are mimalloc's 64-bit constants; every page is aligned to its own
-/// size so that `ptr & !(size - 1)` finds its header.
+/// Page sizes per kind; every page is aligned to its own size so that `ptr & !(size - 1)` finds
+/// its header. Small and large pages are mimalloc's 64-bit sizes. The medium page is mimalloc's
+/// 32-bit size (256 KiB) rather than the 64-bit 512 KiB: a page holds one block per touched bin
+/// in a small heap, and halving it took the model tester's batch profiles from 6.6x to 4.4x peak
+/// live bytes and the 1 MiB Vec growth from 84 to 68 pages, at a cost of 1 to 2 ns per medium
+/// alloc+free pair in a page-acquiring pattern (see the tuning log in the design document).
 pub const SMALL_PAGE_SIZE: usize = SLICE_SIZE;
 /// See [`SMALL_PAGE_SIZE`].
-pub const MEDIUM_PAGE_SIZE: usize = 8 * SLICE_SIZE;
+pub const MEDIUM_PAGE_SIZE: usize = 4 * SLICE_SIZE;
 /// See [`SMALL_PAGE_SIZE`].
 pub const LARGE_PAGE_SIZE: usize = 64 * SLICE_SIZE;
 
 /// Largest block served from each page kind. Each is exactly a bin size (asserted below), chosen
-/// so a page holds at least six blocks: mimalloc's `(page - 4 KiB) / 6` snapped down to a bin.
+/// so a page holds at least six blocks: mimalloc's `(page - 4 KiB) / 6` snapped down to a bin
+/// (10 KiB for the 64 KiB page, 40 KiB for the 256 KiB page).
 pub const SMALL_MAX_OBJ_SIZE: usize = 10 * 1024;
 /// See [`SMALL_MAX_OBJ_SIZE`].
-pub const MEDIUM_MAX_OBJ_SIZE: usize = 80 * 1024;
+pub const MEDIUM_MAX_OBJ_SIZE: usize = 40 * 1024;
 /// See [`SMALL_MAX_OBJ_SIZE`]. The bin table ends here; whether the bins above the medium limit
 /// are ever used is [`LARGE_PAGES`].
 pub const LARGE_MAX_OBJ_SIZE: usize = 512 * 1024;
@@ -128,7 +133,7 @@ const _: () = {
 pub enum PageKind {
     /// 64 KiB page, blocks up to [`SMALL_MAX_OBJ_SIZE`].
     Small,
-    /// 512 KiB page, blocks up to [`MEDIUM_MAX_OBJ_SIZE`].
+    /// 256 KiB page, blocks up to [`MEDIUM_MAX_OBJ_SIZE`].
     Medium,
     /// 4 MiB page, blocks up to [`LARGE_MAX_OBJ_SIZE`].
     Large,

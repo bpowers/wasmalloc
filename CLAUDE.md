@@ -81,9 +81,10 @@ PATH first: `export PATH="$HOME/.wasmtime/bin:$PATH"`.
 
 ## Design invariants (see the design doc for the reasoning)
 
-- Page kind and page header address are pure functions of the `Layout`: small pages are
-  64 KiB-aligned, medium 512 KiB-aligned, large 4 MiB-aligned; singleton runs have no header.
-  No page map on any hot path.
+- Page kind and page header address are pure functions of the `Layout`: small pages (64 KiB,
+  blocks to 10 KiB) are 64 KiB-aligned, medium pages (256 KiB, blocks to 40 KiB) 256 KiB-aligned;
+  everything larger is a header-less singleton run of whole slices (4 MiB large pages exist
+  behind `bins::LARGE_PAGES`, off). No page map on any hot path.
 - Alignment up to 4 KiB is satisfied by construction (round size up to a multiple of align,
   bin it, and start blocks at an offset aligned to the largest power of two dividing the bin
   size). No interior pointers.

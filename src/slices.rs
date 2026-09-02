@@ -1,7 +1,7 @@
 //! The free-slice bitmap and the `memory.grow` policy.
 //!
 //! Everything above the [`Memory`] backend gets its memory here, in whole 64 KiB slices: one
-//! slice per small page, eight per medium page, sixty-four per large page, and an arbitrary run
+//! slice per small page, four per medium page, sixty-four per large page, and an arbitrary run
 //! for a singleton. A [`SliceMap`] records which slices the allocator owns and has not handed
 //! out (`free`) and which of those still hold the zeros `memory.grow` gave them (`zero`, always a
 //! subset of `free`). It is mimalloc's `slices_free` / `slices_dirty` pair (arena.c, bitmap.c)
@@ -11,8 +11,9 @@
 //! converts. Alignment is always on the absolute index, because page headers are found by
 //! masking absolute addresses. `base` is rounded down to a multiple of 64 so that one word of
 //! the bitmap is exactly a 64-slice-aligned (4 MiB-aligned) stretch of memory. That makes the
-//! three page sizes trivial to find: a small page is any set bit, a medium page is any all-ones
-//! byte, a large page is any all-ones word. Other requests go through a general first-fit scan
+//! page sizes trivial to find: a small page is any set bit, a medium page is any all-ones
+//! nibble, a large page is any all-ones word (and an 8-slice run any all-ones byte). Other
+//! requests go through a general first-fit scan
 //! over maximal runs of free slices, which is correct for any count and any power-of-two
 //! alignment and only needs to be fast enough for singleton allocations.
 //!
@@ -301,13 +302,16 @@ impl<const WORDS: usize> SliceMap<WORDS> {
         }
     }
 
-    /// Relative index of the lowest aligned run of `count` free slices. The three page sizes get
-    /// dedicated word scans; everything else takes the general first-fit scan.
+    /// Relative index of the lowest aligned run of `count` free slices. The page sizes (and the
+    /// 8-slice run) get dedicated word scans; everything else takes the general first-fit scan.
     #[inline]
     fn find(&self, count: usize, align: usize) -> Option<usize> {
         if count == align {
             if count == 1 {
                 return self.find_single();
+            }
+            if count == 4 {
+                return self.find_nibble();
             }
             if count == 8 {
                 return self.find_byte();
@@ -326,6 +330,19 @@ impl<const WORDS: usize> SliceMap<WORDS> {
             let b = self.free[w];
             if b != 0 {
                 return Some(w * BITS + b.trailing_zeros() as usize);
+            }
+        }
+        None
+    }
+
+    /// Lowest 4-aligned run of 4 free slices: an all-ones nibble of a word (`base` is a multiple
+    /// of 64).
+    #[inline]
+    fn find_nibble(&self) -> Option<usize> {
+        for w in self.hint..WORDS {
+            let x = full_nibbles(self.free[w]);
+            if x != 0 {
+                return Some(w * BITS + x.trailing_zeros() as usize);
             }
         }
         None
@@ -502,6 +519,15 @@ const fn full_bytes(b: u64) -> u64 {
     let x = x & (x >> 2);
     let x = x & (x >> 1);
     x & 0x0101_0101_0101_0101
+}
+
+/// Bit `4k` of the result is set exactly when nibble `k` of `b` is all ones; the same fold as
+/// [`full_bytes`] over two steps.
+#[inline]
+const fn full_nibbles(b: u64) -> u64 {
+    let x = b & (b >> 2);
+    let x = x & (x >> 1);
+    x & 0x1111_1111_1111_1111
 }
 
 /// The words a relative range touches, in order, each with the mask of its bits in the range.
@@ -902,6 +928,30 @@ mod tests {
     }
 
     #[test]
+    fn full_nibbles_and_bytes_pick_exactly_the_all_ones_groups() {
+        for k in 0..16 {
+            let nibble = 0xFu64 << (4 * k);
+            assert_eq!(full_nibbles(nibble), 1 << (4 * k));
+            assert_eq!(full_nibbles(nibble & !(1 << (4 * k + 2))), 0);
+            assert_eq!(
+                full_nibbles(!nibble),
+                0x1111_1111_1111_1111 & !(1 << (4 * k))
+            );
+        }
+        for k in 0..8 {
+            let byte = 0xFFu64 << (8 * k);
+            assert_eq!(full_bytes(byte), 1 << (8 * k));
+            assert_eq!(full_bytes(byte & !(1 << (8 * k + 5))), 0);
+            assert_eq!(full_nibbles(byte), 0x11 << (8 * k));
+        }
+        assert_eq!(full_nibbles(u64::MAX), 0x1111_1111_1111_1111);
+        assert_eq!(full_bytes(u64::MAX), 0x0101_0101_0101_0101);
+        assert_eq!(full_nibbles(0), 0);
+        assert_eq!(full_nibbles(0x7777_7777_7777_7777), 0);
+        assert_eq!(full_nibbles(0xF0F0_0FF0_0000_00F0), 0x1010_0110_0000_0010);
+    }
+
+    #[test]
     fn init_rounds_the_base_down_to_a_word() {
         let mut m = SliceMap::<W>::new();
         m.init(100);
@@ -980,8 +1030,9 @@ mod tests {
     /// the three page shapes and a few general ones.
     #[test]
     fn searches_match_the_reference_for_every_pair_of_holes() {
-        const SHAPES: [(usize, usize); 8] = [
+        const SHAPES: [(usize, usize); 9] = [
             (1, 1),
+            (4, 4),
             (8, 8),
             (64, 64),
             (2, 2),
@@ -1314,7 +1365,7 @@ mod tests {
         let mut live: Vec<(usize, usize)> = Vec::new();
         let mut m = SliceMap::<W>::new();
         m.init(base);
-        const COUNTS: [usize; 3] = [1, 8, 64];
+        const COUNTS: [usize; 4] = [1, 4, 8, 64];
         const ALIGNS: [usize; 9] = [1, 2, 4, 8, 16, 32, 64, 128, 256];
         let (mut hits, mut misses, mut extended, mut blocked) = (0, 0, 0, 0);
 
@@ -1322,7 +1373,7 @@ mod tests {
             match rng.below(100) {
                 0..=39 => {
                     let count = if rng.coin() {
-                        COUNTS[rng.below(3)]
+                        COUNTS[rng.below(4)]
                     } else {
                         1 + rng.below(70)
                     };
@@ -2186,9 +2237,17 @@ mod verify {
         check_alloc(any_map(), 1, 1);
     }
 
+    /// The medium page: four slices, nibble-aligned.
     #[kani::proof]
     #[kani::unwind(4)]
     fn slices_alloc_medium_page() {
+        check_alloc(any_map(), 4, 4);
+    }
+
+    /// The 8-slice run, an all-ones byte (no page uses it; over-aligned requests can).
+    #[kani::proof]
+    #[kani::unwind(4)]
+    fn slices_alloc_byte_run() {
         check_alloc(any_map(), 8, 8);
     }
 
@@ -2221,7 +2280,7 @@ mod verify {
     fn slices_free_then_alloc_round_trips() {
         let (count, align) = match kani::any::<u8>() % 3 {
             0 => (1, 1),
-            1 => (8, 8),
+            1 => (4, 4),
             _ => (64, 64),
         };
         let before = any_map();
@@ -2335,7 +2394,7 @@ mod verify {
         let handed_out = none_in(&m.free, start, count);
         match kani::any::<u8>() % 5 {
             0 => {
-                let n = if kani::any() { 1 } else { 8 };
+                let n = if kani::any() { 1 } else { 4 };
                 let _ = m.alloc(n, n);
             }
             1 => {

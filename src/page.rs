@@ -1,6 +1,6 @@
 //! The in-band page header and the block free list it owns.
 //!
-//! A *page* is a naturally aligned run of slices (64 KiB, 512 KiB or 4 MiB, see [`PageKind`])
+//! A *page* is a naturally aligned run of slices (64 KiB, 256 KiB or 4 MiB, see [`PageKind`])
 //! carved into equal `block_size` blocks. The header occupies the first
 //! [`PAGE_HEADER_RESERVE`] bytes, blocks start at `block_start`, and because a page is aligned
 //! to its own size, [`header_of`] finds the header from any block address with one mask. That
