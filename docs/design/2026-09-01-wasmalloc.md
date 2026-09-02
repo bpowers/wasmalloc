@@ -302,7 +302,11 @@ to try, each behind a benchmark and a proof, roughly in order of expected payoff
    from `alloc_zeroed` pages that were never written could be. Probably not worth it; note it.
 7. **Per-chunk kind binning in the slice map** (mimalloc's `mi_bbitmap_t`) if singleton churn
    is shown to fragment the aligned runs medium and large pages need.
-8. **A one-entry hot-block cache per direct index (churn at 2x the floor).** The rerun in
+8. **A one-entry hot-block cache per direct index (churn at 2x the floor); deprioritised.**
+   The simlin profile (`docs/research/simlin-profile.md`) found that 99.3 percent of that
+   workload's allocations already pop the most recently freed block of their class, so the cache
+   would buy 0 to 15 ms of a 1900 ms compile there; it still targets random-free patterns and
+   must be proved on the roofline churn workload before it earns a place. The rerun in
    `docs/research/roofline.md` section 14 shows churn over 10k live objects at 2x the free-list
    floor on every engine while the hot pair is within 1.4 to 2x. The mechanism: a freed block
    goes onto its own page's list, so the next allocation of that size pops a different, cold
