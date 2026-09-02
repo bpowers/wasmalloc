@@ -726,13 +726,16 @@ below argue that the implementations meet it.
 
 - Compiled only under `cfg(test)` or the `testing` feature; never part of a
   `#[global_allocator]` build.
-- Proof sketch: `HostRegion::new` allocates with a non-zero Layout and panics on null; `Drop`
-  frees with the same Layout exactly once. `simulate` hands the region to `from_region` with
+- Proof sketch: `HostRegion::new` refuses zero slices with an assertion (R-7), so the Layout it
+  allocates with is non-zero, and panics on null; `Drop` frees with the same Layout exactly
+  once. `simulate` hands the region to `from_region` with
   the caller promising exclusivity and that the memory dies first; `Region` enforces both by
   owning exactly one `SimMemory` and declaring it before the region so it drops first.
 - Machine checks: every test that uses `Region` or `SimHeap`, under Miri as above.
-- Reviewer: adversarial-reviewer, 2026-09-02: accepted. Caveat: `HostRegion::new(0)` would hand a
-  zero-size Layout to `alloc`; no caller does, but the constructor should refuse it (R-7).
+- Changes: 2026-09-02, `HostRegion::new` asserts `total_slices >= 1` (R-7); test
+  `a_host_region_refuses_zero_slices`.
+- Reviewer: adversarial-reviewer, 2026-09-02: accepted with a caveat (R-7), addressed on
+  2026-09-02 by the assertion.
 
 ## slices
 
@@ -805,3 +808,12 @@ across bins and kinds with frees at the shrunk Layout, runs aligned to 2^16 thro
 memory too small to serve with refusals interleaved with live blocks, a heap base in the last
 slice, and a page reused through the direct table), all passing. Kani harness names, test
 names and Miri claims cited by the entries were checked to exist and to cover what they say.
+
+Resolutions (branch `review-fixes`, 2026-09-02): R-1 fixed in `WasmMemory::heap_base`
+(BACKEND-02 rewritten; `tests/wasi_libc_gap.rs` with `build.rs` makes the collision part of the
+default wasi test run); R-2 fixed by the countdown reset on park, the refreshing `retire` and
+`Heap::release_empty_pages` (HEAP-07, HEAP-06, HEAP-02, HEAP-05, HEAP-09; the reproducer is no
+longer ignored); R-3 and R-4 stated in HEAP-04; R-5 removed from `find_page` (HEAP-06); R-6
+reworded in GLOBAL-02; R-7 guarded in `HostRegion::new` (BACKEND-04); the PAGE-04 caveat applied
+(PAGE-04, and PAGE-01 for the same division in `init`). Every entry touched says so under
+"Changes" and awaits the reviewer's fresh look.

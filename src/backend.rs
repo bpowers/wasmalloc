@@ -259,11 +259,14 @@ pub mod testing {
     }
 
     impl HostRegion {
-        /// A region of `total_slices` slices. Panics if the host cannot provide it.
+        /// A region of `total_slices` slices, at least one. Panics if the host cannot provide
+        /// it.
         pub fn new(total_slices: usize) -> Self {
+            // `alloc` with a zero-size Layout is undefined behaviour (review finding R-7).
+            assert!(total_slices >= 1, "a host region holds at least one slice");
             let layout =
                 Layout::from_size_align(total_slices * SLICE_SIZE, LARGE_PAGE_SIZE).unwrap();
-            // SAFETY: the layout has a non-zero size.
+            // SAFETY: the layout has a non-zero size, asserted above.
             let ptr = unsafe { alloc(layout) };
             assert!(!ptr.is_null(), "failed to allocate test region");
             HostRegion { ptr, layout }
@@ -359,6 +362,12 @@ mod tests {
         assert_eq!(r.mem.grow(100), None);
         assert_eq!(r.mem.grow(9).unwrap(), base_slice + 7);
         assert_eq!(r.mem.grow(1), None);
+    }
+
+    #[test]
+    #[should_panic(expected = "at least one slice")]
+    fn a_host_region_refuses_zero_slices() {
+        let _ = super::testing::HostRegion::new(0);
     }
 
     #[test]
