@@ -275,12 +275,11 @@ to try, each behind a benchmark and a proof, roughly in order of expected payoff
    or below the floor and churn close to it, at the cost of 129 words of state and one branch.
    Needs the model tester, a Kani harness for the used-count invariant with cached blocks, and
    Liftoff measurements.
-9. **Zero-initialised heap static.** The static heap is a 17.7 KB data segment because the
-   direct table holds sentinel pointers and a few fields are non-zero. A fully zero initial
-   state (null direct entries with a null test in `alloc`) measured free on the optimizing tiers
-   and +0.3 ns in Liftoff and cuts the raw module from 46 KB to 29 KB; wasm-opt already
-   removes the zeros. Alternative without the extra test: keep the 16 KiB slice map in its own
-   zero static. Decide once the fast path has settled.
+9. **Zero-initialised heap static: decided against.** The 17.7 KB data segment is almost all
+   zero bitmaps, compresses to a few bytes under the gzip or zstd every wasm delivery uses, and
+   wasm-opt's memory packing removes it outright; at runtime the pages it initialises are the
+   allocator's own state and are touched anyway, so the incremental cost is about 17 KB of
+   retained module bytes. Not worth a null test on the allocation fast path (+0.3 ns in Liftoff).
 10. **Verification depth.** Kani harnesses for the heap's queue and direct-table invariants over
    a tiny simulated memory, ledger entries for every unsafe block in `heap.rs` and `global.rs`,
    and an adversarial review of all entries.
