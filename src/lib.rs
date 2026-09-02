@@ -8,8 +8,9 @@
 //! Module map (each module's doc comment explains its contract):
 //! - [`bins`]: size classes and page geometry, pure arithmetic.
 //! - [`backend`]: the [`backend::Memory`] trait over linear memory (wasm or simulated).
-//! - [`slices`]: the free-slice bitmap and the `memory.grow` policy.
-//! - [`page`]: the in-band page header and the block free list (pop, push, lazy extend).
+//! - [`slices`]: the free-slice bitmap and the memory growth policy.
+//! - [`page`]: the in-band page header and block free-list operations.
+//! - [`heap`]: bin queues, the direct table, page lifecycle, and alloc/dealloc/realloc.
 
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
@@ -20,5 +21,6 @@ extern crate std;
 
 pub mod backend;
 pub mod bins;
+pub mod heap;
 pub mod page;
 pub mod slices;
