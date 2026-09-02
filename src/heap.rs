@@ -308,12 +308,7 @@ impl<M: Memory, const WORDS: usize> Heap<M, WORDS> {
             // Same block if it fits. Shrinking in place is only allowed within the same page
             // kind (the next dealloc recomputes the kind from the new Layout) and, as in
             // mimalloc, only while the block stays at least half used.
-            (Class::Bin(old), Class::Bin(new))
-                if new == old
-                    || (new < old
-                        && bins::kind_of_bin(new) == bins::kind_of_bin(old)
-                        && new_size >= bins::bin_size(old) / 2) =>
-            {
+            (Class::Bin(old), Class::Bin(new)) if fits_in_place(old, new, new_size) => {
                 return Some(ptr);
             }
             (Class::Huge, Class::Huge) => {
@@ -836,6 +831,20 @@ unsafe fn needs_transition(page: *const Page) -> bool {
     unsafe { ((*page).used == 0 && (*page).retire_expire == 0) || (*page).flags != 0 }
 }
 
+/// Whether a block of bin `old` keeps serving a request of `new_size` bytes that classifies as
+/// bin `new` (the in-place decision of [`Heap::realloc`], kept pure so a proof can quantify over
+/// every pair of Layouts). Growing never fits: bins are tight, so `new > old` means the request
+/// exceeds the block. Shrinking stays in place only within the page kind, because the next
+/// `dealloc` recomputes the kind from the new Layout and masks the address with it, and, as in
+/// mimalloc, only while the block stays at least half used.
+#[inline]
+fn fits_in_place(old: u8, new: u8, new_size: usize) -> bool {
+    new == old
+        || (new < old
+            && bins::kind_of_bin(new) == bins::kind_of_bin(old)
+            && new_size >= bins::bin_size(old) / 2)
+}
+
 /// Number of slices a header-less run for `layout` occupies.
 #[inline]
 fn huge_slices(layout: Layout) -> usize {
@@ -882,6 +891,120 @@ const _: () = {
     assert!(bins::bin(DIRECT_MAX_SIZE) == b - 1);
 };
 
+/// The heap invariants listed in the module documentation, as checks that return an error
+/// naming the first violation. Test and proof infrastructure: never part of the allocator.
+#[cfg(any(test, kani))]
+impl<M: Memory, const WORDS: usize> Heap<M, WORDS> {
+    /// Invariants 1, 2 and 4 for queue `qi`: every member is a valid page of the right bin (or
+    /// a flagged, roomless page in the full queue), the links and the count agree, and the
+    /// page's slices are not free in the map.
+    ///
+    /// The walk follows `next` links, so it relies on the invariant it checks (queue members are
+    /// live pages); it stops after `count + 1` members, so a cycle is reported, not looped on.
+    pub(crate) fn validate_queue(&self, qi: usize) -> Result<(), &'static str> {
+        self.validate_queue_inner(qi, true)
+    }
+
+    /// [`validate_queue`](Self::validate_queue) without the slice-map check, for proofs whose
+    /// pages are host objects outside any slice map.
+    #[cfg(kani)]
+    pub(crate) fn validate_queue_links(&self, qi: usize) -> Result<(), &'static str> {
+        self.validate_queue_inner(qi, false)
+    }
+
+    fn validate_queue_inner(&self, qi: usize, slices: bool) -> Result<(), &'static str> {
+        let q = self.queues[queue_index(qi)];
+        let mut cur = q.first;
+        let mut prev = 0;
+        let mut n = 0;
+        while cur != 0 {
+            if n > q.count {
+                return Err("queue longer than its count (cycle or lost page)");
+            }
+            let page = self.page_at(cur);
+            // SAFETY: queue members are live pages of this heap (invariant 1, under test).
+            unsafe {
+                if (*page).prev != prev {
+                    return Err("prev link does not point at the previous member");
+                }
+                let kind = page::kind(page);
+                if cur % kind.page_size() != 0 {
+                    return Err("page address is not aligned to its kind");
+                }
+                page::validate(page, &self.mem)?;
+                if qi == FULL_QUEUE {
+                    if !page::in_full_queue(page) {
+                        return Err("full-queue member is not flagged full");
+                    }
+                    if page::has_free(page) || page::is_expandable(page) {
+                        return Err("full-queue member still has room");
+                    }
+                } else {
+                    if (*page).bin as usize != qi {
+                        return Err("page sits in the queue of another bin");
+                    }
+                    if page::in_full_queue(page) {
+                        return Err("bin-queue member is flagged full");
+                    }
+                }
+                if slices {
+                    let first_slice = cur / SLICE_SIZE;
+                    let mut s = 0;
+                    while s < kind.page_size() / SLICE_SIZE {
+                        if self.slices.is_free(first_slice + s) {
+                            return Err("a slice of a live page is free in the map");
+                        }
+                        s += 1;
+                    }
+                }
+                prev = cur;
+                cur = (*page).next;
+            }
+            n += 1;
+        }
+        if q.last != prev {
+            return Err("last does not point at the final member");
+        }
+        if q.count != n {
+            return Err("count does not match the members");
+        }
+        Ok(())
+    }
+
+    /// Invariant 3 for direct entry `i`: it is the first page of the queue of `bin(i * WORD)`,
+    /// or the sentinel when that queue is empty.
+    pub(crate) fn validate_direct_entry(&self, i: usize) -> Result<(), &'static str> {
+        let b = bins::bin(i * WORD) as usize;
+        let first = self.queues[queue_index(b)].first;
+        let expect = if first == 0 {
+            sentinel()
+        } else {
+            self.page_at(first)
+        };
+        if self.direct[i] != expect {
+            return Err("direct entry does not point at its queue's first page");
+        }
+        Ok(())
+    }
+
+    /// Every invariant, every queue and every direct entry. The proofs check one symbolic
+    /// queue or entry at a time instead, so this is for tests.
+    #[cfg(test)]
+    pub(crate) fn validate(&self) -> Result<(), &'static str> {
+        let mut qi = 0;
+        while qi < QUEUE_COUNT {
+            self.validate_queue(qi)?;
+            qi += 1;
+        }
+        let mut i = 0;
+        while i < DIRECT_ENTRIES {
+            self.validate_direct_entry(i)?;
+            i += 1;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::undocumented_unsafe_blocks)]
 mod tests {
@@ -891,6 +1014,7 @@ mod tests {
         LARGE_MAX_OBJ_SIZE, LARGE_PAGE_SIZE, MAX_BINNED_BIN, MAX_BINNED_OBJ_SIZE,
         MEDIUM_MAX_OBJ_SIZE, bin_size,
     };
+    use core::mem::size_of;
     use std::alloc::{alloc, dealloc};
     use std::vec::Vec;
 
@@ -934,52 +1058,18 @@ mod tests {
         }
     }
 
-    /// Check every heap invariant listed in the module documentation.
+    /// Check every heap invariant listed in the module documentation, naming the queue or
+    /// entry that fails.
     fn validate(h: &TestHeap) {
         for qi in 0..QUEUE_COUNT {
-            let q = h.queues[qi];
-            let mut cur = q.first;
-            let mut prev = 0;
-            let mut n = 0;
-            while cur != 0 {
-                let page = h.page_at(cur);
-                // SAFETY: queue members are live pages.
-                unsafe {
-                    assert_eq!((*page).prev, prev, "prev link broken in queue {qi}");
-                    let kind = page::kind(page);
-                    assert_eq!(cur % kind.page_size(), 0, "page {cur:#x} misaligned");
-                    page::validate(page, &h.mem).unwrap_or_else(|e| panic!("queue {qi}: {e}"));
-                    if qi == FULL_QUEUE {
-                        assert!(page::in_full_queue(page));
-                        assert!(!page::has_free(page) && !page::is_expandable(page));
-                    } else {
-                        assert_eq!((*page).bin as usize, qi);
-                        assert!(!page::in_full_queue(page));
-                    }
-                    for s in 0..kind.page_size() / SLICE_SIZE {
-                        assert!(
-                            !h.slices.is_free(cur / SLICE_SIZE + s),
-                            "page slice marked free"
-                        );
-                    }
-                    prev = cur;
-                    cur = (*page).next;
-                }
-                n += 1;
-            }
-            assert_eq!(q.last, prev, "last link broken in queue {qi}");
-            assert_eq!(q.count, n, "count wrong in queue {qi}");
+            h.validate_queue(qi)
+                .unwrap_or_else(|e| panic!("queue {qi}: {e}"));
         }
         for i in 0..DIRECT_ENTRIES {
-            let b = bins::bin(i * WORD) as usize;
-            let first = h.queues[b].first;
-            let expect = if first == 0 {
-                sentinel()
-            } else {
-                h.page_at(first)
-            };
-            assert_eq!(h.direct[i], expect, "direct entry {i} (bin {b})");
+            h.validate_direct_entry(i)
+                .unwrap_or_else(|e| panic!("direct entry {i}: {e}"));
         }
+        h.validate().unwrap();
     }
 
     fn layout(size: usize, align: usize) -> Layout {
@@ -990,9 +1080,21 @@ mod tests {
         unsafe { p.as_ptr().write_bytes(byte, size) };
     }
 
+    /// Every byte of the block is `byte`. Whole words where the block allows it: under Miri
+    /// each read is an interpreted operation, and the tests check megabytes.
     unsafe fn check(p: NonNull<u8>, size: usize, byte: u8) {
-        for i in 0..size {
+        let word = usize::from_ne_bytes([byte; size_of::<usize>()]);
+        let mut i = 0;
+        while i + size_of::<usize>() <= size {
+            // SAFETY: inside the block, which the caller owns; blocks are word aligned.
+            let w = unsafe { p.as_ptr().add(i).cast::<usize>().read_unaligned() };
+            assert_eq!(w, word, "word at {i} corrupted");
+            i += size_of::<usize>();
+        }
+        while i < size {
+            // SAFETY: inside the block.
             assert_eq!(unsafe { *p.as_ptr().add(i) }, byte, "byte {i} corrupted");
+            i += 1;
         }
     }
 
@@ -1528,7 +1630,9 @@ mod tests {
             state
         };
         let mut live: Vec<(NonNull<u8>, Layout, u8)> = Vec::new();
-        for step in 0..20_000 {
+        // Miri interprets every access, so it gets a shorter run over the same distribution.
+        let steps = if cfg!(miri) { 1_500 } else { 20_000 };
+        for step in 0..steps {
             let r = next();
             let op = r % 100;
             if op < 45 || live.is_empty() {
@@ -1600,5 +1704,832 @@ mod tests {
         assert_eq!(direct_range(1), (0, 1));
         assert_eq!(direct_range(2), (2, 2));
         assert_eq!(direct_range(9), (9, 10));
+    }
+}
+
+#[cfg(kani)]
+mod verify {
+    //! Bounded proofs for the heap.
+    //!
+    //! The arithmetic harnesses quantify over every Layout (or every direct index) and cost a
+    //! few seconds. The structural harnesses run the real heap over [`HeapModel`], a linear
+    //! memory of a few small pages that stores only the words the heap may touch, for two or
+    //! three symbolic operations and check the module's invariants after each; see
+    //! `page::verify` for why a flat buffer is not an option and `slices::verify` for the
+    //! unwind discipline (one bound for every loop, so quantify over one symbolic index rather
+    //! than looping, and keep every loop short).
+    use super::*;
+    use crate::bins::{MAX_BINNED_BIN, bin_size, kind_of_bin};
+    use crate::page::header_of;
+
+    // --------------------------------------------------------------------------------------
+    // Arithmetic: decisions that depend only on the Layout
+    // --------------------------------------------------------------------------------------
+
+    /// `realloc` returns the same binned block only when the new Layout classifies into the
+    /// same page kind and the block is large enough for the new size rounded up to the
+    /// alignment, so the later `dealloc` with the new Layout masks to the right header and the
+    /// block holds every byte the caller may use.
+    #[kani::proof]
+    fn realloc_in_place_keeps_the_kind_and_fits() {
+        let old_size: usize = kani::any();
+        let new_size: usize = kani::any();
+        let shift: u32 = kani::any();
+        kani::assume(shift <= 12);
+        let align = 1usize << shift;
+        let Ok(old) = Layout::from_size_align(old_size, align) else {
+            return;
+        };
+        let Ok(new) = Layout::from_size_align(new_size, align) else {
+            return;
+        };
+        kani::assume(old_size >= 1 && new_size >= 1);
+        if let (Class::Bin(o), Class::Bin(n)) = (bins::classify(old), bins::classify(new)) {
+            if fits_in_place(o, n, new_size) {
+                let rounded = (new_size + align - 1) & !(align - 1);
+                assert!(kind_of_bin(o) == kind_of_bin(n));
+                assert!(bin_size(o) >= new_size);
+                assert!(bin_size(o) >= rounded);
+                // dealloc's fast-path test on the new Layout picks the page's actual kind.
+                assert!((rounded <= SMALL_MAX_OBJ_SIZE) == (kind_of_bin(o) == PageKind::Small));
+            } else {
+                // A move: the new block comes from alloc, which classifies the new Layout the
+                // same way, so nothing here depends on the old block.
+                assert!(n != o);
+            }
+        }
+    }
+
+    /// The direct table tiles `0..DIRECT_ENTRIES` with the ranges of consecutive bins, each
+    /// entry belongs to exactly the bin of its size, and the fast path's index lands in the
+    /// entry of the request's bin.
+    #[kani::proof]
+    fn direct_table_tiles_and_matches_bin() {
+        let i: usize = kani::any();
+        kani::assume(i < DIRECT_ENTRIES);
+        let b = bins::bin(i * WORD);
+        assert!(b >= 1 && b <= bins::bin(DIRECT_MAX_SIZE));
+        let (lo, hi) = direct_range(b);
+        assert!(lo <= i && i <= hi && hi < DIRECT_ENTRIES);
+        let other: u8 = kani::any();
+        kani::assume(other >= 1 && other <= MAX_BIN && other != b);
+        let (lo2, hi2) = direct_range(other);
+        assert!(lo2 > hi2 || i < lo2 || i > hi2);
+
+        let size: usize = kani::any();
+        kani::assume(size <= DIRECT_MAX_SIZE);
+        let idx = bins::direct_index(size);
+        assert!(idx < DIRECT_ENTRIES);
+        assert!(bins::bin(idx * WORD) == bins::bin(size));
+    }
+
+    /// A header-less run covers its Layout: at least one slice, enough bytes, and a start that
+    /// is aligned for the Layout whenever it is aligned to `alloc_huge`'s run alignment.
+    #[kani::proof]
+    fn huge_runs_cover_the_layout_and_its_alignment() {
+        let size: usize = kani::any();
+        let shift: u32 = kani::any();
+        kani::assume(shift < usize::BITS - 1);
+        let align = 1usize << shift;
+        let Ok(layout) = Layout::from_size_align(size, align) else {
+            return;
+        };
+        kani::assume(size >= 1);
+        let n = huge_slices(layout);
+        assert!(n >= 1);
+        assert!(n * SLICE_SIZE >= size);
+        let run_align = layout.align().div_ceil(SLICE_SIZE).max(1);
+        assert!(run_align.is_power_of_two());
+        let start: usize = kani::any();
+        kani::assume(start <= crate::backend::MAX_SLICE_INDEX);
+        kani::assume(start & (run_align - 1) == 0);
+        assert!((start * SLICE_SIZE) & (align - 1) == 0);
+    }
+
+    /// The `dealloc` fast path decides "small page" from the size rounded up to the alignment;
+    /// that agrees with `classify`, which `alloc` used, for every Layout that reaches the test,
+    /// and `alloc`'s direct-table index picks the same bin as `classify`.
+    #[kani::proof]
+    fn dealloc_fast_path_agrees_with_classify() {
+        let size: usize = kani::any();
+        let shift: u32 = kani::any();
+        kani::assume(shift <= 12);
+        let align = 1usize << shift;
+        let Ok(layout) = Layout::from_size_align(size, align) else {
+            return;
+        };
+        kani::assume(size >= 1);
+        let rounded = if align > WORD {
+            (size + align - 1) & !(align - 1)
+        } else {
+            size
+        };
+        let small = rounded <= SMALL_MAX_OBJ_SIZE;
+        match bins::classify(layout) {
+            Class::Bin(b) => {
+                assert!(small == (kind_of_bin(b) == PageKind::Small));
+                assert!(b <= MAX_BINNED_BIN);
+                assert!(bin_size(b) >= size);
+            }
+            Class::Huge => assert!(!small),
+        }
+        if rounded <= DIRECT_MAX_SIZE {
+            let b = bins::bin(bins::direct_index(rounded) * WORD);
+            assert!(bins::classify(layout) == Class::Bin(b));
+        }
+    }
+
+    // --------------------------------------------------------------------------------------
+    // Structure: the real heap over a tiny modelled memory
+    // --------------------------------------------------------------------------------------
+
+    /// Blocks per page and block size of bin 36, the bin the structural harnesses use: 8 KiB
+    /// blocks, seven per page, block 0 at offset 4096, one block linked per `extend`, no direct
+    /// entries, so no loop in the heap runs more than a handful of iterations.
+    const BIN: u8 = 36;
+    const BS: usize = 8192;
+    const BLOCKS: usize = 7;
+    const BLOCK_START: usize = 4096;
+    const BLOCK_WORDS: usize = 1;
+
+    const _: () = {
+        assert!(bins::bin_size(BIN) == BS && bins::block_start(BS) == BLOCK_START);
+        assert!(bins::blocks_per_page(PageKind::Small, BS) == BLOCKS);
+        assert!(direct_range(BIN).0 > direct_range(BIN).1);
+    };
+
+    /// A linear memory of one small page of [`BIN`], storing only what the heap may touch: the
+    /// page header, and the first word of every block (its free-list link) in one array. The
+    /// rest of a block is never modelled: `alloc_zeroed` clears it on a page that has seen a
+    /// free, so the harnesses only zero-allocate from pages that have not, and the bound on
+    /// that clear (`layout.size() <= bin_size`) is an arithmetic fact the bins harnesses prove.
+    ///
+    /// Two facts about CBMC shape this model. Under Kani a pointer is `object << 48 | offset`,
+    /// so a `Page` local's address is 64 KiB-aligned and can serve as the page address itself,
+    /// which the heap requires because it turns header pointers back into addresses (queue
+    /// links, `page::extend`, `free_page`, `header_of`). And every dereference of a pointer
+    /// that may target several objects is checked against each of them, and an array indexed
+    /// by a symbolic value is flattened whole into the formula, so the model keeps the targets
+    /// to two, the header and one seven-word array (see `page::verify::PageModel`; a version
+    /// with one object per block cost four times as much, and versions with a 64 KiB buffer or
+    /// with whole blocks in the array exhausted memory). A second slice would have
+    /// to be another object, whose address is `2^32` slices away, so the model has one slice;
+    /// the multi-page queue behaviour is covered by the tests and the ledger.
+    ///
+    /// Block pointers are therefore not identity-mapped: the harness converts the pointer
+    /// `alloc` returns back to the block's address with [`HeapModel::addr_of`] and hands
+    /// `dealloc` a pointer carrying that address, which is all `dealloc` reads from it.
+    struct HeapModel {
+        header: *mut Page,
+        words: *mut usize,
+        /// Whether the slice is present (initially, as the linker gap, or after one `grow`).
+        present: bool,
+    }
+
+    impl HeapModel {
+        fn page_addr(&self) -> usize {
+            self.header.addr()
+        }
+
+        /// The address the heap thinks the block returned as `p` has.
+        fn addr_of(&self, p: *mut u8) -> usize {
+            let off = p.addr().wrapping_sub(self.words.addr());
+            assert!(off % (BLOCK_WORDS * WORD) == 0, "not the start of a block");
+            let k = off / (BLOCK_WORDS * WORD);
+            assert!(k < BLOCKS, "not a block the model hands out");
+            self.page_addr() + BLOCK_START + k * BS
+        }
+    }
+
+    // SAFETY: proof-only backend. `header` points at a `Page` and `words` at
+    // `BLOCKS * BLOCK_WORDS` words, both owned by the harness frame for longer than the model
+    // lives. `ptr` yields the header for the page address and otherwise block `k`'s first word
+    // for the address of block `k`, after asserting the address is exactly that, so every
+    // pointer is valid for the access the heap makes through it (a header, a link word, or
+    // `BS` bytes).
+    unsafe impl Memory for HeapModel {
+        fn heap_base(&self) -> usize {
+            self.page_addr()
+        }
+
+        fn size_slices(&self) -> usize {
+            self.page_addr() / SLICE_SIZE + self.present as usize
+        }
+
+        fn grow(&mut self, slices: usize) -> Option<usize> {
+            if self.present || slices != 1 {
+                return None;
+            }
+            self.present = true;
+            Some(self.page_addr() / SLICE_SIZE)
+        }
+
+        fn ptr(&self, addr: usize) -> *mut u8 {
+            assert!(self.present, "access before memory exists");
+            let page = self.page_addr();
+            assert!(
+                addr >= page && addr - page < SLICE_SIZE,
+                "access outside the page"
+            );
+            let offset = addr - page;
+            if offset == 0 {
+                return self.header.cast();
+            }
+            assert!(offset >= BLOCK_START, "access inside the header reserve");
+            let rel = offset - BLOCK_START;
+            assert!(rel % BS == 0, "access is not to the start of a block");
+            let k = rel / BS;
+            assert!(k < BLOCKS, "access beyond the page's blocks");
+            // SAFETY: `words` has BLOCKS * BLOCK_WORDS elements and `k < BLOCKS`.
+            unsafe { self.words.add(k * BLOCK_WORDS).cast() }
+        }
+    }
+
+    /// One bitmap word: the model has one slice, and a two-word map would need one more
+    /// unwinding of every word loop (`SliceMap::init` scans the map) for nothing.
+    type ProofHeap = Heap<HeapModel, 1>;
+
+    /// The storage a [`HeapModel`] points into, as locals of the calling harness: the header
+    /// is its own object so that it starts at an aligned address (a struct field may not).
+    macro_rules! proof_heap {
+        ($h:ident, $initial:expr) => {
+            let mut header = EMPTY_PAGE;
+            let mut words = [0usize; BLOCKS * BLOCK_WORDS];
+            let mut $h = proof_heap(&raw mut header, words.as_mut_ptr(), $initial);
+        };
+    }
+
+    /// A heap over the given storage, whose slice is present from the start when `initial`
+    /// (the linker gap, dirty as far as the heap knows) and otherwise arrives through `grow`,
+    /// zero. Under CBMC every object starts at `object << 48`, so `header` is 64 KiB-aligned
+    /// as the heap requires; the harness checks that rather than assuming it.
+    fn proof_heap(header: *mut Page, words: *mut usize, initial: bool) -> ProofHeap {
+        assert!(
+            header.addr() % SLICE_SIZE == 0,
+            "the model's page is not slice aligned"
+        );
+        let mem = HeapModel {
+            header,
+            words,
+            present: initial,
+        };
+        let mut h = Heap::new(mem);
+        h.set_grow_policy(GrowPolicy {
+            min_grow: 1,
+            max_grow: 1,
+            step_divisor: 8,
+        });
+        h
+    }
+
+    /// A pointer with the address of the block at `addr`, as the program would hold it.
+    /// `dealloc` and an in-place `realloc` read only its address.
+    fn block_ptr(addr: usize) -> NonNull<u8> {
+        NonNull::new(ptr::without_provenance_mut(addr)).unwrap()
+    }
+
+    /// Word `w` of the block at `addr`.
+    fn word(h: &ProofHeap, addr: usize, w: usize) -> usize {
+        // SAFETY: the harness only asks for words of blocks the model stores in full.
+        unsafe { h.mem.ptr(addr + w * WORD).cast::<usize>().read() }
+    }
+
+    /// The invariants after one operation: the two queues that can hold pages are valid, every
+    /// other queue is empty (one symbolic index stands for all of them), one symbolic direct
+    /// entry is consistent, and the blocks in use are exactly the harness's `live` blocks.
+    fn check(h: &ProofHeap, live: usize) {
+        assert!(h.validate_queue(BIN as usize).is_ok());
+        assert!(h.validate_queue(FULL_QUEUE).is_ok());
+        check_rest(h, live);
+    }
+
+    /// [`check`] for harnesses in which no page can reach the full queue (only `find_page`
+    /// moves pages there): asserting the queue is empty is much cheaper than walking it.
+    fn check_no_full(h: &ProofHeap, live: usize) {
+        assert!(h.validate_queue(BIN as usize).is_ok());
+        assert!(h.queues[FULL_QUEUE].first == 0 && h.queues[FULL_QUEUE].count == 0);
+        check_rest(h, live);
+    }
+
+    /// The cheap part of [`check`] for a heap whose only page, if any, is `page`: the full
+    /// queue is empty, every other queue is empty, the page (when present) is in no queue link
+    /// but its own queue's head, and the live count matches. Used where a queue walk with
+    /// `page::validate` would cost more memory than the operation under proof. The direct
+    /// table is not checked here: [`BIN`] has no direct entries, so nothing in these harnesses
+    /// can change it, and the queue harnesses over [`QBIN`] cover its maintenance.
+    fn check_shape(h: &ProofHeap, page: *mut Page, live: usize) {
+        assert!(h.queues[FULL_QUEUE].first == 0 && h.queues[FULL_QUEUE].count == 0);
+        if !page.is_null() {
+            // SAFETY: the page is live.
+            unsafe {
+                assert!((*page).next == 0 && (*page).prev == 0 && (*page).flags == 0);
+                assert!((*page).used as usize == live);
+            }
+        }
+        assert!(used_in(h, BIN as usize) == live);
+        let other: usize = kani::any();
+        kani::assume(other < QUEUE_COUNT && other != BIN as usize && other != FULL_QUEUE);
+        assert!(h.queues[other].first == 0 && h.queues[other].count == 0);
+    }
+
+    fn check_rest(h: &ProofHeap, live: usize) {
+        let i: usize = kani::any();
+        kani::assume(i < DIRECT_ENTRIES);
+        assert!(h.validate_direct_entry(i).is_ok());
+        let other: usize = kani::any();
+        kani::assume(other < QUEUE_COUNT && other != BIN as usize && other != FULL_QUEUE);
+        assert!(h.queues[other].first == 0 && h.queues[other].count == 0);
+        assert!(used_in(h, BIN as usize) + used_in(h, FULL_QUEUE) == live);
+    }
+
+    /// Blocks in use over the pages of queue `q`.
+    fn used_in(h: &ProofHeap, q: usize) -> usize {
+        let mut used = 0;
+        let mut cur = h.queues[q].first;
+        while cur != 0 {
+            let page = h.page_at(cur);
+            // SAFETY: queue members are live pages (invariant 1, validated by the caller).
+            unsafe {
+                used += (*page).used as usize;
+                cur = (*page).next;
+            }
+        }
+        used
+    }
+
+    /// The page holding the block returned as `p`, checked to be the model's page serving
+    /// [`BIN`]; returns the block's address.
+    fn block_of(h: &ProofHeap, p: NonNull<u8>) -> usize {
+        let addr = h.mem.addr_of(p.as_ptr());
+        assert!(addr % WORD == 0);
+        let page = h.page_at(header_of(PageKind::Small, addr));
+        assert!(page == h.mem.header);
+        // SAFETY: the page is live.
+        unsafe {
+            assert!((*page).bin == BIN);
+            assert!(page::kind(page) == PageKind::Small);
+        }
+        addr
+    }
+
+    /// The page as `fresh_page` leaves it (initialised, at the front of its queue, one block
+    /// linked) on a heap whose memory has just grown, so the alloc slow path itself, proved
+    /// separately, is not part of every harness.
+    fn prepared_page(h: &mut ProofHeap) -> *mut Page {
+        h.ensure_init();
+        let s = h.mem.grow(1).unwrap();
+        h.slices.add_free(s, 1, true);
+        let run = h.slices.alloc(1, 1).unwrap();
+        let addr = h.mem.page_addr();
+        assert!(run.start * SLICE_SIZE == addr && run.zeroed);
+        // The page address is passed as the model's own value rather than as the run's
+        // arithmetic: the two are equal (asserted), but CBMC cannot simplify the run's
+        // multiplication and division back to the object's address, and a symbolic page
+        // address makes every header field symbolic.
+        // SAFETY: the run is the model's one slice, owned by nothing else.
+        let page = unsafe { page::init(&h.mem, addr, PageKind::Small, BIN, true) };
+        // SAFETY: a fresh page is in no queue and has unextended blocks.
+        unsafe {
+            h.push_front(BIN as usize, page);
+            assert!(page::extend(page, &h.mem));
+        }
+        page
+    }
+
+    /// Hand out the next block as `alloc_generic` would on this page: extend when the list is
+    /// empty, then pop. Returns the block's address.
+    fn take(h: &ProofHeap, page: *mut Page) -> usize {
+        // SAFETY: `page` is a live page of the heap.
+        unsafe {
+            if !page::has_free(page) {
+                assert!(page::extend(page, &h.mem));
+            }
+            page::pop(page, &h.mem).unwrap()
+        }
+    }
+
+    /// Address of block `k` of the model's page.
+    fn block(h: &ProofHeap, k: usize) -> usize {
+        h.mem.page_addr() + BLOCK_START + k * BS
+    }
+
+    /// The first allocation on an empty heap, with or without a linker gap and zeroed or not,
+    /// builds a valid page and heap state and hands out block 0. This is the one harness that
+    /// runs the alloc slow path (page supply, memory growth, page initialisation) end to end;
+    /// the others prepare the page directly, because every copy of that path costs about a
+    /// gigabyte of solver memory.
+    #[kani::proof]
+    #[kani::unwind(2)]
+    fn first_allocation_builds_a_valid_heap() {
+        let initial: bool = kani::any();
+        let zero: bool = kani::any();
+        // The model stores one word per block; a zeroed allocation from a dirty page would clear
+        // the whole block (an in-bounds write by `bin_size(bin) >= layout.size()`, proved in
+        // `bins`), so that combination is left out.
+        kani::assume(!(zero && initial));
+        proof_heap!(h, initial);
+        let layout = Layout::from_size_align(BS, WORD).unwrap();
+        // SAFETY: non-zero size.
+        let got = unsafe {
+            if zero {
+                h.alloc_zeroed(layout)
+            } else {
+                h.alloc(layout)
+            }
+        };
+        let addr = block_of(&h, got.unwrap());
+        assert!(addr == block(&h, 0));
+        if zero {
+            assert!(word(&h, addr, 0) == 0);
+        }
+        let page = h.mem.header;
+        // SAFETY: the page is live.
+        unsafe {
+            assert!((*page).free_is_zero == !initial);
+            assert!((*page).used == 1 && (*page).capacity == 1);
+            assert!((*page).retire_expire == 0 && (*page).flags == 0);
+        }
+        assert!(h.mem.size_slices() == h.mem.page_addr() / SLICE_SIZE + 1);
+        assert!(h.free_slices() == 0);
+        assert!(h.queues[BIN as usize].first == page.addr());
+        check(&h, 1);
+    }
+
+    /// Freeing a page's last block retires it: the queue's only page keeps its slice, its free
+    /// list holds the block, and the retired range covers its bin.
+    #[kani::proof]
+    #[kani::unwind(2)]
+    fn freeing_the_last_block_retires_the_page() {
+        proof_heap!(h, false);
+        let page = prepared_page(&mut h);
+        let layout = Layout::from_size_align(BS, WORD).unwrap();
+        let addr = take(&h, page);
+        // SAFETY: `addr` is the live block for `layout`.
+        unsafe { h.dealloc(block_ptr(addr), layout) };
+        // SAFETY: the page is still live: emptied pages are retired, not freed.
+        unsafe {
+            assert!((*page).used == 0 && (*page).retire_expire == RETIRE_CYCLES);
+            assert!(!(*page).free_is_zero && (*page).free == addr);
+        }
+        assert!(h.queues[BIN as usize].count == 1);
+        assert!(!h.slices.is_free(h.mem.page_addr() / SLICE_SIZE));
+        assert!(h.retired_min == BIN as usize && h.retired_max == BIN as usize);
+        check_no_full(&h, 0);
+    }
+
+    /// Retire a page: prepare it, hand out one block and put it back as `dealloc` does on a
+    /// page that just emptied (`page::push`, then `retire`; `dealloc` itself, with the
+    /// transition test in between, is proved in `freeing_the_last_block_retires_the_page` and
+    /// costs too much solver memory to repeat in the collection harnesses).
+    fn retired_page(h: &mut ProofHeap) -> *mut Page {
+        let page = prepared_page(h);
+        let addr = take(h, page);
+        // SAFETY: `addr` is a live block of `page`, a live member of its bin queue.
+        unsafe {
+            page::push(page, &h.mem, addr);
+            h.retire(page);
+            assert!((*page).retire_expire == RETIRE_CYCLES && (*page).used == 0);
+        }
+        assert!(h.retired_min == BIN as usize && h.retired_max == BIN as usize);
+        page
+    }
+
+    /// An unforced collection only ages a retired page: it stays in its queue with its slice.
+    #[kani::proof]
+    #[kani::unwind(2)]
+    fn an_unforced_collection_ages_a_retired_page() {
+        proof_heap!(h, false);
+        let page = retired_page(&mut h);
+        // SAFETY: invariants hold between operations.
+        unsafe { h.collect_retired(false) };
+        // SAFETY: the page is still live.
+        unsafe { assert!((*page).retire_expire == RETIRE_CYCLES - 1 && (*page).used == 0) };
+        let q = h.queues[BIN as usize];
+        assert!(q.first == page.addr() && q.last == page.addr() && q.count == 1);
+        assert!(!h.slices.is_free(h.mem.page_addr() / SLICE_SIZE));
+        assert!(h.retired_min == BIN as usize && h.retired_max == BIN as usize);
+        // The collection touched nothing but `retire_expire`, so the page's own validity is
+        // the retire harness's; the queue shape and the direct table are asserted directly,
+        // which keeps this harness a gigabyte under the memory cap.
+        check_shape(&h, page, 0);
+    }
+
+    /// A forced collection releases a retired page: the slice is free, the queue and the
+    /// retired range are empty, and the direct table is back to the sentinel.
+    #[kani::proof]
+    #[kani::unwind(2)]
+    fn a_forced_collection_frees_a_retired_page() {
+        proof_heap!(h, false);
+        retired_page(&mut h);
+        // SAFETY: invariants hold between operations.
+        unsafe { h.collect_retired(true) };
+        let q = h.queues[BIN as usize];
+        assert!(q.first == 0 && q.last == 0 && q.count == 0);
+        assert!(h.slices.is_free(h.mem.page_addr() / SLICE_SIZE));
+        assert!(h.retired_min > h.retired_max);
+        check_shape(&h, ptr::null_mut(), 0);
+    }
+
+    /// On a page with one to three live blocks, freeing any one of them keeps the invariants:
+    /// the block heads the free list, the live count matches, and the page is retired exactly
+    /// when it emptied.
+    #[kani::proof]
+    #[kani::unwind(2)]
+    fn freeing_any_live_block_preserves_invariants() {
+        proof_heap!(h, false);
+        let page = prepared_page(&mut h);
+        let layout = Layout::from_size_align(BS, WORD).unwrap();
+        let k: usize = kani::any();
+        kani::assume(k >= 1 && k <= 3);
+        // Straight-line rather than a loop, to keep the unwind bound at two.
+        assert!(take(&h, page) == block(&h, 0));
+        if k >= 2 {
+            assert!(take(&h, page) == block(&h, 1));
+        }
+        if k >= 3 {
+            assert!(take(&h, page) == block(&h, 2));
+        }
+        let i: usize = kani::any();
+        kani::assume(i < k);
+        // SAFETY: block `i` is live for `layout`.
+        unsafe { h.dealloc(block_ptr(block(&h, i)), layout) };
+        // SAFETY: the page stays live (retired at most).
+        unsafe {
+            assert!((*page).used as usize == k - 1);
+            assert!((*page).free == block(&h, i) && !(*page).free_is_zero);
+            assert!(((*page).retire_expire != 0) == (k == 1));
+        }
+        assert!(h.queues[BIN as usize].count == 1);
+        check_no_full(&h, k - 1);
+    }
+
+    /// The model's page with all seven blocks out.
+    fn full_page(h: &mut ProofHeap) -> *mut Page {
+        let page = prepared_page(h);
+        assert!(take(h, page) == block(h, 0));
+        assert!(take(h, page) == block(h, 1));
+        assert!(take(h, page) == block(h, 2));
+        assert!(take(h, page) == block(h, 3));
+        assert!(take(h, page) == block(h, 4));
+        assert!(take(h, page) == block(h, 5));
+        assert!(take(h, page) == block(h, 6));
+        // SAFETY: the page is live.
+        unsafe {
+            assert!(page::is_full(page) && !page::is_expandable(page) && !page::has_free(page));
+            assert!(!page::in_full_queue(page) && (*page).used as usize == BLOCKS);
+        }
+        assert!(h.queues[BIN as usize].first == page.addr());
+        page
+    }
+
+    /// A page whose blocks are all out is moved to the full queue by the next search for a
+    /// block, which then fails to find memory for another page and leaves the heap valid.
+    #[kani::proof]
+    #[kani::unwind(2)]
+    fn the_search_parks_a_full_page_in_the_full_queue() {
+        proof_heap!(h, false);
+        let page = full_page(&mut h);
+        // SAFETY: invariants hold between operations.
+        let none = unsafe { h.find_page(BIN) };
+        assert!(none.is_none(), "no memory for a second page");
+        // SAFETY: the page is live.
+        unsafe { assert!(page::in_full_queue(page)) };
+        assert!(h.queues[BIN as usize].count == 0 && h.queues[BIN as usize].first == 0);
+        let f = h.queues[FULL_QUEUE];
+        assert!(f.first == page.addr() && f.last == page.addr() && f.count == 1);
+        assert!(!h.slices.is_free(h.mem.page_addr() / SLICE_SIZE));
+        assert!(h.validate_queue(FULL_QUEUE).is_ok());
+        assert!(used_in(&h, FULL_QUEUE) == BLOCKS);
+    }
+
+    /// Freeing any block of a page in the full queue brings the page back to its bin queue
+    /// with that block as its only free one, and the next request pops it.
+    #[kani::proof]
+    #[kani::unwind(2)]
+    fn a_free_brings_a_full_page_back_to_its_queue() {
+        proof_heap!(h, false);
+        let page = full_page(&mut h);
+        let layout = Layout::from_size_align(BS, WORD).unwrap();
+        // What `find_page` does with a page it finds full (proved above).
+        // SAFETY: the page is a live member of its bin queue with no room.
+        unsafe { h.move_to_full(BIN as usize, page) };
+        assert!(h.queues[FULL_QUEUE].first == page.addr());
+
+        let j: usize = kani::any();
+        kani::assume(j < BLOCKS);
+        // SAFETY: block `j` is live for `layout`.
+        unsafe { h.dealloc(block_ptr(block(&h, j)), layout) };
+        // SAFETY: the page is live.
+        unsafe {
+            assert!(!page::in_full_queue(page) && page::has_free(page));
+            assert!((*page).free == block(&h, j) && (*page).used as usize == BLOCKS - 1);
+            assert!((*page).retire_expire == 0 && (*page).flags == 0);
+            assert!((*page).next == 0 && (*page).prev == 0);
+            // The freed block is the whole list.
+            assert!(word(&h, block(&h, j), 0) == 0);
+        }
+        // With one page the queue shape is fully determined; the walk that `check` would do
+        // adds nothing here and its list walk over a symbolic block is what breaks the memory
+        // budget, so the queues are asserted directly.
+        let q = h.queues[BIN as usize];
+        assert!(q.first == page.addr() && q.last == page.addr() && q.count == 1);
+        let f = h.queues[FULL_QUEUE];
+        assert!(f.first == 0 && f.last == 0 && f.count == 0);
+        // The next allocation pops the freed block: the page is the queue's first, so the
+        // search's candidate, and its list holds exactly that block.
+        assert!(take(&h, page) == block(&h, j));
+        // SAFETY: the page is live.
+        unsafe { assert!((*page).used as usize == BLOCKS && !page::has_free(page)) };
+    }
+
+    // --------------------------------------------------------------------------------------
+    // Structure: queue operations and the direct table over several pages
+    // --------------------------------------------------------------------------------------
+
+    /// Bin 16 (256-byte blocks) serves direct entries 29 to 32, so the direct-table update runs
+    /// its loop over four entries; three pages suffice for every link shape.
+    const QBIN: u8 = 16;
+    const QPAGES: usize = 3;
+
+    const _: () = assert!(direct_range(QBIN).0 == 29 && direct_range(QBIN).1 == 32);
+
+    /// A memory of [`QPAGES`] page headers, each its own object (so each address is 64 KiB
+    /// aligned) and nothing else: the queue operations touch only headers.
+    struct QueueModel {
+        headers: [*mut Page; QPAGES],
+    }
+
+    // SAFETY: proof-only backend. Each `headers[k]` points at a `Page` owned by the harness
+    // frame; `ptr` yields exactly that pointer for that page's address and nothing for any other
+    // address, so every pointer it returns is valid for a header access.
+    unsafe impl Memory for QueueModel {
+        fn heap_base(&self) -> usize {
+            self.headers[0].addr()
+        }
+
+        fn size_slices(&self) -> usize {
+            self.headers[0].addr() / SLICE_SIZE + 1
+        }
+
+        fn grow(&mut self, _slices: usize) -> Option<usize> {
+            None
+        }
+
+        fn ptr(&self, addr: usize) -> *mut u8 {
+            if addr == self.headers[0].addr() {
+                self.headers[0].cast()
+            } else if addr == self.headers[1].addr() {
+                self.headers[1].cast()
+            } else if addr == self.headers[2].addr() {
+                self.headers[2].cast()
+            } else {
+                panic!("access to something other than a page header")
+            }
+        }
+    }
+
+    type QueueHeap = Heap<QueueModel, 2>;
+
+    /// Where the harness believes a page is.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Place {
+        Out,
+        Bin,
+        Full,
+    }
+
+    /// Put page `k` into the state of a page whose blocks are all out (no free block, nothing
+    /// left to extend) or back into the fresh state; both satisfy the page invariants.
+    fn set_full(h: &QueueHeap, k: usize, full: bool) {
+        let page = h.mem.headers[k];
+        // SAFETY: the header was written by `init`.
+        unsafe {
+            let count = if full { (*page).reserved } else { 0 };
+            (*page).used = count;
+            (*page).capacity = count;
+            (*page).free = 0;
+        }
+    }
+
+    /// The queue invariants plus the harness's own view: counts per queue, and one symbolic
+    /// page's membership and flag.
+    fn check_queues(h: &QueueHeap, place: &[Place; QPAGES]) {
+        assert!(h.validate_queue_links(QBIN as usize).is_ok());
+        assert!(h.validate_queue_links(FULL_QUEUE).is_ok());
+        let i: usize = kani::any();
+        kani::assume(i < DIRECT_ENTRIES);
+        assert!(h.validate_direct_entry(i).is_ok());
+        let other: usize = kani::any();
+        kani::assume(other < QUEUE_COUNT && other != QBIN as usize && other != FULL_QUEUE);
+        assert!(h.queues[other].first == 0 && h.queues[other].count == 0);
+        let mut in_bin = 0;
+        let mut in_full = 0;
+        for &p in place {
+            in_bin += (p == Place::Bin) as usize;
+            in_full += (p == Place::Full) as usize;
+        }
+        assert!(h.queues[QBIN as usize].count == in_bin);
+        assert!(h.queues[FULL_QUEUE].count == in_full);
+        let k: usize = kani::any();
+        kani::assume(k < QPAGES);
+        let page = h.mem.headers[k];
+        // SAFETY: the header was written by `init`.
+        unsafe {
+            assert!(page::in_full_queue(page) == (place[k] == Place::Full));
+            let linked = (*page).next != 0
+                || (*page).prev != 0
+                || h.queues[QBIN as usize].first == page.addr()
+                || h.queues[FULL_QUEUE].first == page.addr();
+            assert!(linked == (place[k] != Place::Out));
+        }
+    }
+
+    /// `STEPS` symbolic queue operations on three pages of [`QBIN`], each drawn from the
+    /// operations whose preconditions the current state satisfies, preserve the queue and
+    /// direct-table invariants. Pages start out of every queue and change between "has room"
+    /// and "all blocks out" as an operation of their own.
+    fn queue_ops_preserve_invariants<const STEPS: usize>() {
+        let mut h0 = EMPTY_PAGE;
+        let mut h1 = EMPTY_PAGE;
+        let mut h2 = EMPTY_PAGE;
+        let mem = QueueModel {
+            headers: [&raw mut h0, &raw mut h1, &raw mut h2],
+        };
+        let mut h: QueueHeap = Heap::new(mem);
+        let mut k = 0;
+        while k < QPAGES {
+            let addr = h.mem.headers[k].addr();
+            assert!(addr % SLICE_SIZE == 0);
+            // SAFETY: the address maps to a header object nothing else uses.
+            unsafe { page::init(&h.mem, addr, PageKind::Small, QBIN, true) };
+            k += 1;
+        }
+        let mut place = [Place::Out; QPAGES];
+        let mut full = [false; QPAGES];
+        check_queues(&h, &place);
+        for _ in 0..STEPS {
+            let k: usize = kani::any();
+            kani::assume(k < QPAGES);
+            let page = h.mem.headers[k];
+            // SAFETY: every operation's precondition is assumed just before it: the page is a
+            // valid header, and it is in exactly the queue the operation expects.
+            unsafe {
+                match kani::any::<u8>() % 7 {
+                    0 => {
+                        kani::assume(place[k] == Place::Out);
+                        h.push_front(QBIN as usize, page);
+                        place[k] = Place::Bin;
+                        assert!(h.queues[QBIN as usize].first == page.addr());
+                    }
+                    1 => {
+                        kani::assume(place[k] == Place::Out);
+                        h.push_back(QBIN as usize, page);
+                        place[k] = Place::Bin;
+                        assert!(h.queues[QBIN as usize].last == page.addr());
+                    }
+                    2 => {
+                        kani::assume(place[k] == Place::Bin);
+                        h.remove(QBIN as usize, page);
+                        place[k] = Place::Out;
+                    }
+                    3 => {
+                        kani::assume(place[k] == Place::Bin);
+                        h.move_to_front(QBIN as usize, page);
+                        assert!(h.queues[QBIN as usize].first == page.addr());
+                    }
+                    4 => {
+                        kani::assume(place[k] == Place::Bin && full[k]);
+                        h.move_to_full(QBIN as usize, page);
+                        place[k] = Place::Full;
+                        assert!(h.queues[FULL_QUEUE].last == page.addr());
+                    }
+                    5 => {
+                        kani::assume(place[k] == Place::Full);
+                        h.unfull(page);
+                        place[k] = Place::Bin;
+                        assert!(h.queues[QBIN as usize].last == page.addr());
+                    }
+                    _ => {
+                        // A page in the full queue must stay roomless (invariant 1).
+                        kani::assume(place[k] != Place::Full);
+                        full[k] = !full[k];
+                        set_full(&h, k, full[k]);
+                    }
+                }
+            }
+            check_queues(&h, &place);
+        }
+    }
+
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn two_queue_operations_preserve_the_queues_and_the_direct_table() {
+        queue_ops_preserve_invariants::<2>();
+    }
+
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn three_queue_operations_preserve_the_queues_and_the_direct_table() {
+        queue_ops_preserve_invariants::<3>();
     }
 }

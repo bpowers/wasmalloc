@@ -116,6 +116,19 @@ Entries are grouped by module. Page invariants 1 to 5 refer to the numbered list
   Miri as above.
 - Changes: 2026-09-01, `capacity` and `reserved` are `u32` (see PAGE-01); the bound above was
   `u16::MAX`. Harnesses and Miri re-run.
+- Division: `MAX_EXTEND_SIZE / block_size` divides by a header field. It is non-zero because
+  `init` is the only writer of `block_size` and stores `bin_size(bin)` with `bin` in
+  `1..=MAX_BIN`, so at least `MIN_BLOCK_SIZE` (8); `pop`, `push` and `extend` write only `free`,
+  `used`, `capacity` and `free_is_zero`, and the heap writes only `next`, `prev`, `flags` and
+  `retire_expire` (HEAP-05, HEAP-07). The sentinel `EMPTY_PAGE` has `block_size == 0` but is
+  never extended: `extend` is called on `find_page`'s candidate and on `fresh_page`'s new page,
+  both queue members, and the sentinel is never linked into a queue (HEAP-01). Kani checks the
+  division-by-zero condition on every `extend` in the page harnesses and in the heap harnesses
+  `first_allocation_builds_a_valid_heap`, `freeing_any_live_block_preserves_invariants` and the
+  full-page pair, where `block_size` is a value read back from the modelled header. The
+  remaining panic call site in the release build can be removed without unsafe code by dividing
+  by `block_size.max(1)` (identical for every reachable value, and LLVM drops the zero check);
+  this is proposed in the verification report (2026-09-02) rather than applied here.
 - Reviewer: pending adversarial review. Date: 2026-09-01.
 
 ### PAGE-05: header field reads in the predicates and helpers
@@ -156,25 +169,445 @@ Blocks in `is_full`, `all_free`, `has_free`, `is_expandable`, `in_full_queue`,
 
 ## heap
 
-No entries yet (design document, roadmap item 9). Blocks touched on branch `tuning-b`
-(2026-09-02), all calls into `collect_retired` or existing page operations with their
-preconditions unchanged, listed so the future review knows where the code moved:
+Heap invariants 1 to 4 refer to the numbered list at the top of `src/heap.rs`; page invariants
+1 to 5 to `src/page.rs`. "Kani" names harnesses in `heap::verify` unless another module is
+given. The structural heap harnesses run the real heap over a proof-only memory of one small
+page of bin 36 (`HeapModel`) or of three bare page headers of bin 16 (`QueueModel`); the model
+and its limits are described in the `heap::verify` module documentation, and where a block's
+proof rests on tests only, the entry says so.
 
-- `Heap::acquire_run` now holds the `unsafe { self.collect_retired(true) }` call that
-  `alloc_generic` and `alloc_huge` made in their OOM retries (removed); precondition: heap
-  invariants hold between operations, which every caller (`fresh_page`, `alloc_huge`, both
-  reached only between operations) satisfies.
-- `Heap::collect_retired` no longer breaks at a page with `retire_expire == 0`; it still reads
-  and frees only pages reached through queue links, live pages of this heap by invariant 1.
-- `Heap::realloc`'s move into a run calls `alloc_huge` (safe) and then the same
-  `copy_nonoverlapping` and `dealloc` block as before.
-- Queue indexing goes through `queue_index` (a mask; debug-asserted in range), so `queues[..]`
-  cannot index out of bounds even if a header's `bin` byte were corrupt.
-- Reviewer: pending adversarial review.
+A requirement every entry below relies on and that the `Memory` trait documentation now states
+explicitly (2026-09-02): `mem.ptr(a)` returns a pointer whose address is exactly `a`. The heap
+turns header pointers back into addresses (`page as usize` for queue links and `free_page`,
+`page.addr()` in `page::extend`, `ptr.addr()` before `header_of`), so a backend that mapped
+addresses elsewhere would be unsound with this code. Both real backends satisfy it
+(`with_exposed_provenance_mut(addr)`, `base.with_addr(addr)`), and the proof-only backends are
+built to.
+
+### HEAP-01: `Heap::alloc` and `Heap::alloc_zeroed`, the direct-table fast path
+
+Blocks: the `page::pop` on `self.direct[direct_index(size)]`, the `NonNull::new_unchecked` of
+the returned block, the zeroing block in `alloc_zeroed`, and the calls into `alloc_generic`.
+
+- Preconditions: `layout.size() != 0` (the `GlobalAlloc` contract; the code also tolerates 0,
+  which `bin` maps to bin 1); heap invariants hold.
+- Invariants relied on: heap invariant 3 (every direct entry is the first page of the queue of
+  `bin(i * WORD)` or the sentinel); heap invariant 2 and the page invariants for that page;
+  `EMPTY_PAGE.free == 0`; `bins::classify`'s alignment-by-construction property.
+- Proof sketch. Rounding: `size + align - 1` cannot overflow because `Layout` guarantees the
+  rounded size fits `isize` and `align <= MAX_NATURAL_ALIGN`. Index: `direct_index(size) <
+  DIRECT_ENTRIES` for every `size <= DIRECT_MAX_SIZE`, and `bin(direct_index(size) * WORD) ==
+  bin(size) == classify(layout)`'s bin, so the entry belongs to the request's bin (Kani
+  `direct_table_tiles_and_matches_bin`, `dealloc_fast_path_agrees_with_classify`). The entry is
+  either the sentinel or a live page. Sentinel: `pop` reads `free`, finds 0 and returns without
+  writing; this is the only access ever made through a direct entry that is not a page, it is a
+  read of an immutable `static` through a `*mut` obtained from `&raw const`, which is permitted,
+  and nothing can make `EMPTY_PAGE.free` non-zero because no code writes through `sentinel()`
+  (the only writers of a header are `page::init`, `pop`, `push`, `extend`, which the heap calls
+  on queue members or fresh runs, and the queue operations, which take members; the sentinel is
+  never linked into a queue). `alloc_zeroed` reads `free_is_zero` only after a successful pop,
+  so never from the sentinel. Live page: PAGE-02's preconditions hold, and the popped block is a
+  block of a page of `bin(size)`, whose size is at least the rounded size and a multiple of
+  `align`, at an offset that is a multiple of `align` from a 64 KiB-aligned page start, so it is
+  aligned and large enough (Kani `bins::classify_aligns_by_construction`,
+  `page::every_block_of_every_bin_lies_inside_its_page_and_is_aligned`). Non-null: a block lies
+  at least `PAGE_HEADER_RESERVE` bytes into a page, so its address is at least 64. Zeroing:
+  with `free_is_zero` the block is zero except its link word (page invariant 5), and the block
+  is at least `WORD` bytes and `WORD`-aligned, so the single `usize` store is in bounds and
+  leaves a zero block; otherwise `write_bytes` clears `layout.size()` bytes, which is at most
+  the rounded size, at most `bin_size(bin) == block_size`, inside memory the allocator owns
+  (page invariant 1). The `alloc_generic` calls pass the caller's contract through.
+- Machine checks: Kani `direct_table_tiles_and_matches_bin`,
+  `dealloc_fast_path_agrees_with_classify` (also `bin_size(b) >= size` for every Layout),
+  `bins::classify_aligns_by_construction`, `first_allocation_builds_a_valid_heap` (both entry
+  points through the slow path onto a fresh page, zeroed or not, from a zero or a dirty slice),
+  `two_queue_operations_preserve_the_queues_and_the_direct_table` and
+  `three_queue_operations_...` (invariant 3 under every queue operation over three pages).
+  Tests `small_alloc_free_reuses_lifo`, `every_bin_allocates_aligned_distinct_blocks_and_recovers_its_page`,
+  `alloc_zeroed_is_zero_on_fresh_and_recycled_blocks`, `random_churn_keeps_invariants_and_contents`
+  (the validator, including invariant 3, every 997 steps), the model tester
+  (`tests/model_heap.rs`, six profiles) and the fuzz targets. Miri over the heap tests (Stacked
+  Borrows with strict provenance, Tree Borrows).
+- Not machine-checked by Kani: the direct-table pop itself (the harnesses' bin has no direct
+  entries; sizes up to 1 KiB reach it only in tests), and `alloc_zeroed`'s `write_bytes` on a
+  dirty page (the model stores one word per block); both rest on the arithmetic above and on
+  the tests.
+- Reviewer: pending adversarial review. Date: 2026-09-02.
+
+### HEAP-02: `Heap::dealloc`, the small-page fast path, and `dealloc_generic`
+
+Blocks: in `dealloc`, the `page::push` on the masked header, `needs_transition` and
+`dealloc_transition`; in `dealloc_generic`, the same three plus the `debug_assert!` reading
+`(*page).bin`, and the `slices.free` of a run.
+
+- Preconditions: `ptr` was returned by this heap for `layout`, or by `realloc` with a Layout of
+  the same alignment and a size that classifies as `realloc` left it (HEAP-03), and has not
+  been freed since; heap invariants hold.
+- Invariants relied on: the block's page has the kind `classify(layout)` names and the block
+  lies inside it (page invariant 2, `bins`); page invariants for that page; heap invariant 1
+  (full-queue membership is exactly the flag) for `dealloc_transition`.
+- Proof sketch. Rounding as in HEAP-01. Kind: for every Layout with `align <=
+  MAX_NATURAL_ALIGN`, `rounded <= SMALL_MAX_OBJ_SIZE` holds exactly when `classify(layout)` is a
+  bin of kind `Small` (Kani `dealloc_fast_path_agrees_with_classify`), and Layouts with a larger
+  alignment skip the fast path and are classified in `dealloc_generic`; `alloc` served the
+  request by the same classification (HEAP-01, HEAP-04), and an in-place `realloc` keeps the
+  page kind equal to the kind of the Layout it hands back (HEAP-03). So the mask
+  `header_of(kind, addr)` uses the page size of the block's actual page, and because every block
+  lies inside its page and pages are aligned to their size, it yields the header (Kani
+  `page::header_of_recovers_the_page_from_any_address_inside_it`,
+  `page::every_block_of_every_bin_lies_inside_its_page_and_is_aligned`). `push`'s precondition
+  (PAGE-03) is the dealloc precondition: the block is live on that page. `needs_transition`
+  reads `used`, `retire_expire` and `flags` of that header (HEAP-08). Skipping the transition
+  when `used == 0 && retire_expire != 0` skips exactly a call whose first action would have been
+  `retire`'s early return: such a page cannot be in the full queue (a full-queue page has
+  `used == reserved >= 6` before the free, so `used >= 5` after), so the `flags != 0` test is
+  independent of it and the behaviour equals the earlier unconditional call.
+  `dealloc_transition`: `in_full_queue` is set exactly for full-queue members (only
+  `move_to_full` sets it, only `unfull` clears it, both on the corresponding queue move), so
+  `unfull`'s precondition holds; after it the page is in its bin queue, so `retire`'s does.
+  Huge runs: `classify(layout) == Huge` exactly when the block was served by `alloc_huge` or
+  kept by an in-place Huge-to-Huge `realloc`, so `addr` is a run start (a multiple of
+  `SLICE_SIZE`) and `huge_slices(layout)` is the run's current length (set at allocation, and
+  changed by `realloc` together with the Layout it returns); `slices.free` then releases exactly
+  the run's slices, which were handed out (heap invariant 4).
+- Machine checks: Kani `dealloc_fast_path_agrees_with_classify`,
+  `realloc_in_place_keeps_the_kind_and_fits`, `huge_runs_cover_the_layout_and_its_alignment`,
+  `freeing_the_last_block_retires_the_page`, `freeing_any_live_block_preserves_invariants`
+  (any of up to three live blocks), `a_free_brings_a_full_page_back_to_its_queue` (the
+  `flags != 0` path through `unfull`), plus the page and bins harnesses named above. Tests: every
+  heap test frees what it allocates and ends with the validator; `page_exhaustion_adds_pages_and_full_queue_round_trips`,
+  `huge_alloc_free_and_realloc_in_place`, `large_alignment_is_honoured` (runs from over-aligned
+  requests), the model tester and the fuzz targets. Miri as above.
+- Not machine-checked by Kani: medium pages and the run branch of `dealloc_generic` (the model
+  has one small page); tests only.
+- Reviewer: pending adversarial review. Date: 2026-09-02.
+
+### HEAP-03: `Heap::realloc`
+
+Blocks: `Layout::from_size_align_unchecked`, the `self.alloc(new_layout)` for a move, and the
+`copy_nonoverlapping` followed by `self.dealloc(ptr, layout)`.
+
+- Preconditions: as HEAP-02 for `ptr` and `layout`; `new_size != 0` and `new_size` rounded up
+  to `layout.align()` does not overflow `isize` (the `GlobalAlloc::realloc` contract).
+- Invariants relied on: `fits_in_place`'s guarantee (below); page invariant 4 and heap invariant
+  4 (live blocks and handed-out runs are disjoint from everything the allocator can hand out).
+- Proof sketch. The unchecked Layout meets `from_size_align`'s requirements exactly by the
+  contract (the alignment is a Layout's, hence a power of two). In place within a page:
+  `fits_in_place(old, new, new_size)` implies `kind_of_bin(old) == kind_of_bin(new)` and
+  `bin_size(old) >= round_up(new_size, align)` (Kani `realloc_in_place_keeps_the_kind_and_fits`,
+  over every pair of Layouts with `align <= MAX_NATURAL_ALIGN`), so the block holds every byte
+  the caller may use through the new Layout and a later `dealloc` or `realloc` with it masks with
+  the same page size (HEAP-02); the alignment is unchanged. In place within a run: the length
+  becomes `huge_slices(new_layout)`, which a later `dealloc` with the new Layout recomputes;
+  `shrink` releases slices of the run itself, `extend_with_growth` claims only free slices
+  directly after it or freshly grown ones (proved in `slices::verify`), and both leave the
+  run's own slices claimed. The move: `alloc_huge` or `alloc` returns a block of at least
+  `new_size` bytes taken from a free list or from free slices, so disjoint from the live old
+  block; `min(layout.size(), new_size)` bytes fit in both; `copy_nonoverlapping` is therefore
+  in bounds on both sides and non-overlapping; `dealloc(ptr, layout)` then frees the old block
+  under HEAP-02 with the Layout it was allocated with. If the allocation fails, `?` returns
+  before any write. The allocation may release retired pages and grow memory: the old block's
+  page is not empty (it holds the block), so it is never released, and growth never moves
+  memory in either backend.
+- Machine checks: Kani `realloc_in_place_keeps_the_kind_and_fits`,
+  `huge_runs_cover_the_layout_and_its_alignment`,
+  `slices::slices_extend_with_growth_extends_only_a_top_run`,
+  `slices::slices_try_extend_claims_exactly_the_tail`; tests
+  `realloc_within_a_bin_returns_the_same_block`, `huge_alloc_free_and_realloc_in_place`,
+  `realloc_grows_a_top_run_through_memory_growth`, `a_run_that_cannot_extend_moves_to_the_top_of_the_heap`,
+  `realloc_preserves_contents_across_classes`, the churn test's realloc step, the model tester
+  (content checks across every move). Miri as above.
+- Not machine-checked by Kani: the copy on a move (the model has no block bodies); tests and
+  the model tester check contents.
+- Reviewer: pending adversarial review. Date: 2026-09-02.
+
+### HEAP-04: `alloc_generic`, `alloc_huge` and `acquire_run`, the slow-path hand-out
+
+Blocks: in `alloc_generic`, the `collect_retired(false)`, `find_page`, `page::pop` and the
+zeroing block; in `alloc_huge`, the `write_bytes` and `NonNull::new_unchecked`; in
+`acquire_run`, the `collect_retired(true)`.
+
+- Preconditions: as HEAP-01; heap invariants hold at entry.
+- Invariants relied on: the `slices` contract (a returned run was free, hence owned and
+  unreferenced, and is claimed now); page invariants of the page `find_page` returns; heap
+  invariants between operations for the collections.
+- Proof sketch. `find_page` returns a queue member of `bin` whose free list is non-empty (it
+  found one, extended an expandable one, or built a fresh one and extended it, HEAP-06), so
+  `pop` meets PAGE-02 and returns a block; if it did not, the release build returns `None`
+  rather than dereferencing anything. Zeroing as in HEAP-01 with `bin_size(bin) >=
+  layout.size()`. `alloc_huge`: `huge_slices(layout) * SLICE_SIZE >= layout.size()` and the run
+  alignment `layout.align().div_ceil(SLICE_SIZE).max(1)` is a power of two whose multiples in
+  slices are addresses aligned for the Layout (Kani `huge_runs_cover_the_layout_and_its_alignment`),
+  so the run covers the request; `write_bytes` clears `layout.size()` bytes of memory the run
+  owns; it is skipped only when every slice still had its zero bit, which `slices` sets only for
+  regions fresh from `grow` and clears on every hand-out, so the memory is zero by the `Memory`
+  contract. Non-null: a run starts at or above the first whole slice at or above `heap_base`,
+  which is positive on wasm (data and stack precede it) and a host address in the simulation.
+  Both `collect_retired` calls happen with no page pointer held by the caller: `alloc_generic`
+  calls it before `find_page`, and `acquire_run` before growing, when `fresh_page` and
+  `alloc_huge` have not yet chosen a run; the heap invariants therefore hold at those points.
+- Machine checks: Kani `first_allocation_builds_a_valid_heap` (the whole slow path onto a
+  fresh page, with the linker gap or through `grow`), `the_search_parks_a_full_page_in_the_full_queue`
+  (a failed page supply leaves the heap valid), `huge_runs_cover_the_layout_and_its_alignment`,
+  `slices::slices_acquire_stays_inside_memory_and_the_map`, `slices::slices_alloc_*`; tests
+  `huge_alloc_free_and_realloc_in_place`, `large_alignment_is_honoured`,
+  `alloc_zeroed_is_zero_on_fresh_and_recycled_blocks`, `out_of_memory_returns_none_and_keeps_state`,
+  `non_contiguous_growth_is_fine`, `uses_the_linker_gap_before_growing`, the model tester and
+  the fuzz targets. Miri as above.
+- Not machine-checked by Kani: `alloc_huge` itself (no run fits the one-slice model alongside a
+  page); tests only.
+- Reviewer: pending adversarial review. Date: 2026-09-02.
+
+### HEAP-05: the queue operations and `page_at`
+
+Blocks in `push_front`, `push_back`, `remove`, `move_to_front`, `move_to_full`, `unfull`.
+
+- Preconditions: `page` is a live page of this heap (header written by `init`, slices claimed),
+  and its membership matches the operation: in no queue for the pushes; a member of queue `qi`
+  for `remove`, `move_to_front` and `move_to_full` (the last with no free and no unextended
+  block); a member of the full queue for `unfull`.
+- Invariants relied on: heap invariant 1 (queue members are live pages, so the neighbours
+  reached through `first`, `last`, `prev` and `next` are valid headers); the links are a
+  consistent doubly linked list with `first.prev == 0` and `last.next == 0`.
+- Proof sketch: each operation writes only the `next` and `prev` fields of `page` and of its
+  neighbours, which are members and hence live, and the queue's `first`, `last` and `count`;
+  `count` cannot underflow because `remove` requires membership. The list stays consistent by
+  the usual doubly-linked-list argument (checked exhaustively by the harnesses below). Whenever
+  the head of a bin queue may have changed (`push_front` always; `push_back` and `remove` when
+  the queue was empty or the page was first; the moves through those), `update_direct` rewrites
+  `direct[lo..=hi]` for that bin, with `hi < DIRECT_ENTRIES` by construction (Kani
+  `direct_table_tiles_and_matches_bin`), restoring heap invariant 3; the full queue has no
+  direct entries and `update_direct` returns for it. `queue_index` masks every queue index, so
+  no `queues[..]` access can leave the array even if a header's `bin` byte were corrupt.
+- Machine checks: Kani `two_queue_operations_preserve_the_queues_and_the_direct_table` and
+  `three_queue_operations_...`: every sequence of two or three of the six operations over three
+  pages of bin 16, each drawn from the operations whose precondition the state satisfies, with
+  pages switching between "has room" and "all blocks out" as a seventh operation; after each,
+  the links, flags and counts of both queues, every other queue's emptiness, one symbolic direct
+  entry and one symbolic page's membership are checked. Tests: every heap test ends with the
+  validator over all 64 queues and 129 direct entries;
+  `page_exhaustion_adds_pages_and_full_queue_round_trips`,
+  `a_forced_collection_reaches_a_retired_page_behind_a_page_in_use`. Miri as above.
+- Reviewer: pending adversarial review. Date: 2026-09-02.
+
+### HEAP-06: `find_page` and `fresh_page`, the page search and supply
+
+Blocks: in `find_page`, the header reads of the current member, `move_to_full`, the candidate
+comparison with `all_free`/`free_page`/`mostly_used`, the `extend` of the candidate, the
+`collect_retired(false)`, and `move_to_front` with the `retire_expire` store; in `fresh_page`,
+`page::init` and the `push_front` and `extend` of the new page.
+
+- Preconditions: heap invariants hold; `bin` in `1..=MAX_BIN` (it comes from `classify`).
+- Invariants relied on: heap invariant 1 for the walk; page invariants of every member; the
+  `slices` contract for the run of a fresh page; slice `MAX_SLICE_INDEX` is never handed out.
+- Proof sketch. The walk starts at `queues[bin].first` and follows `next`, all members; `next`
+  is read before the member is touched. `move_to_full` is applied to the current member, just
+  read to have neither a free nor an unextended block (HEAP-05). `free_page(candidate, qi)` is
+  applied to an earlier member, just read to be empty, still a member because nothing has
+  removed it since it was chosen; it may be the current member's predecessor, in which case
+  `remove` rewrites the current member's `prev`, which the loop does not use. After the walk the
+  candidate is a member with a free block or an unextended one; `extend` on it meets PAGE-04
+  and, when the list was empty, succeeds because `capacity < reserved` held when it was chosen
+  and nothing changes `capacity` but `extend`. `move_to_front` takes a member; the
+  `retire_expire` store is a heap-owned byte of a live header. With no candidate, the pages
+  retired earlier are collected (HEAP-07) and a fresh page is built: `acquire_run(n, n)`
+  returns `n` free slices starting at a multiple of `n` (Kani `slices::slices_alloc_small_page`,
+  `slices_alloc_medium_page`, `slices_alloc_large_page`), so `run.start * SLICE_SIZE` is a
+  multiple of the page size; the page cannot reach slice 65535 (`add_free` drops it and growth
+  stops at `usable_limit`, test `slices::the_last_slice_of_the_address_space_is_never_usable`),
+  so `page_addr + page_size` does not overflow a wasm32 `usize`; the slices were free, hence
+  owned by the allocator through `mem` and referenced by no page or run (heap invariant 4);
+  `kind == kind_of_bin(bin)` by construction. PAGE-01's preconditions hold. The new page is in no
+  queue, so `push_front` applies, and has `capacity == 0 < reserved`, so `extend` succeeds.
+- Machine checks: Kani `first_allocation_builds_a_valid_heap` (an empty queue through
+  `fresh_page`, both memory starts), `the_search_parks_a_full_page_in_the_full_queue` (the walk
+  parks a full page, the supply fails cleanly), `a_free_brings_a_full_page_back_to_its_queue`
+  (the page returns as the candidate with exactly the freed block), the slices harnesses named
+  above. Tests `page_exhaustion_adds_pages_and_full_queue_round_trips` (four pages of one bin,
+  the candidate walk over several members), `retired_pages_are_released_before_memory_grows`,
+  `a_forced_collection_reaches_a_retired_page_behind_a_page_in_use`,
+  `every_bin_allocates_aligned_distinct_blocks_and_recovers_its_page`, the churn test, the model
+  tester and the fuzz targets. Miri as above.
+- Not machine-checked by Kani: the candidate comparison with two or more members in one queue
+  (including `free_page` of an empty earlier candidate); tests only.
+- Reviewer: pending adversarial review. Date: 2026-09-02.
+
+### HEAP-07: retirement and release (`dealloc_transition`, `retire`, `collect_retired`, `free_page`)
+
+- Preconditions: `page` is a live page of this heap; for `retire`, a member of its bin queue;
+  for `free_page`, empty and a member of queue `qi`; for `collect_retired`, heap invariants hold.
+- Invariants relied on: heap invariant 1; a page's slices are exactly `page_size / SLICE_SIZE`
+  slices from its address, claimed since `fresh_page` (heap invariant 4).
+- Proof sketch. `dealloc_transition` orders `unfull` before `retire`, so `retire` sees a member
+  of its bin queue (HEAP-02). `retire` returns at once for a page already retired; otherwise it
+  writes `retire_expire` and the retired range, or calls `free_page(page, bin)`. `free_page`
+  removes the page from its queue (HEAP-05, which also fixes the direct table) and returns its
+  slices with `slices.free`, which requires them to be handed out and inside the map, true since
+  `fresh_page`; afterwards nothing in the heap refers to the page: it is in no queue, no direct
+  entry (updated by `remove`), and not the full queue's (an empty page is never there, HEAP-02),
+  and the caller holds no other pointer to it (`retire` and `dealloc_transition` return;
+  `collect_retired` read `next` first; `find_page` moves on). `collect_retired` walks at most
+  `RETIRE_MAX_PAGES` members of each bin queue in the retired range, all live, reads `next`
+  before any change, decrements `retire_expire` only when non-zero, and frees only empty pages;
+  the range is clipped to `MAX_BIN`. The retired range is a search hint, not a safety property:
+  a retired page outside it stays a valid member of its queue and is collected once its bin is
+  retired again or used by a search.
+- Machine checks: Kani `freeing_the_last_block_retires_the_page`,
+  `an_unforced_collection_ages_a_retired_page`, `a_forced_collection_frees_a_retired_page`
+  (release: slice free, queue and range empty, direct entries back to the sentinel),
+  `freeing_any_live_block_preserves_invariants`. Tests `retired_page_is_kept_then_released`
+  (release when the count runs out), `retired_pages_are_released_before_memory_grows`,
+  `a_forced_collection_reaches_a_retired_page_behind_a_page_in_use`,
+  `page_exhaustion_adds_pages_and_full_queue_round_trips`, the churn test (a forced collection at
+  the end), the model tester and the fuzz targets. Miri as above.
+- Not machine-checked by Kani: `retire`'s immediate release (a queue of more than one page, or
+  more than three), which needs a second page; tests only.
+- Reviewer: pending adversarial review. Date: 2026-09-02.
+
+### HEAP-08: header reads in `needs_transition` and `mostly_used`
+
+- Preconditions: `page` points at a header written by `init` (the masked header of a live block
+  in `dealloc`, a queue member in `find_page`).
+- Proof sketch: as PAGE-05, reads of fully initialised fields of their own types through the
+  raw pointer; `mostly_used`'s products are of counts at most 8188, far below `usize::MAX`.
+- Machine checks: every structural heap harness and every heap test reaches both; Miri as above.
+- Reviewer: pending adversarial review. Date: 2026-09-02.
+
+### HEAP-09: `validate_queue_inner`, `validate_direct_entry` and the harness helpers (test and proof infrastructure only)
+
+- Compiled only under `cfg(test)` and `cfg(kani)`; never part of the allocator.
+- Proof sketch: the walk follows queue links, relying on the invariant it checks, and stops
+  after `count + 1` members so a cycle is reported rather than looped on; `page::validate`
+  (PAGE-06) guards every free-list read. The proof-only backends `HeapModel` and `QueueModel`
+  assert that every address the heap touches is a header or a modelled block word, so a stray
+  access fails the proof instead of reading outside the model.
+- Reviewer: pending adversarial review. Date: 2026-09-02.
+
+## global
+
+### GLOBAL-01: `unsafe impl Sync for WasmAlloc`
+
+- Preconditions: the program has one thread.
+- Proof sketch: `Sync` is required for a `static` and is the only thing that lets two threads
+  call the `GlobalAlloc` methods concurrently. This crate compiles only for wasm32 without the
+  `atomics` target feature (`compile_error!` otherwise), and such a module cannot start a second
+  thread: there is no shared memory and no thread primitive. Every access to the heap goes
+  through `heap()` (GLOBAL-02). The Miri and Kani runs do not reach this block (it exists only
+  on wasm32); the wasm32 end-to-end test `tests/global_wasm.rs` runs the static under wasmtime.
+- Reviewer: pending adversarial review. Date: 2026-09-02.
+
+### GLOBAL-02: `WasmAlloc::heap` and the four `GlobalAlloc` methods
+
+Blocks: `&mut *self.heap.get()`, and in each method the call into the heap, with
+`NonNull::new_unchecked(ptr)` in `dealloc` and `realloc`.
+
+- Preconditions: no other `&mut Heap` is live (calls into the allocator never nest); for
+  `dealloc` and `realloc`, `ptr` was returned by this allocator (the `GlobalAlloc` contract).
+- Proof sketch: `heap()` creates a `&mut Heap` that lives for one method call. Calls cannot
+  nest because the heap allocates nothing (`no_std`, no collections, no formatting) and, in a
+  release build, cannot panic or unwind (the release profile aborts on panic and the only panic
+  call site left in the allocator's code is the `page::extend` division discussed under
+  PAGE-04, whose divisor is never zero). In a build with debug assertions a failing assertion
+  runs the panic hook before aborting, and std's hook may allocate, which would re-enter the
+  allocator while a `&mut Heap` is live; this can only happen once an invariant is already
+  broken, and is the reason the allocator's own invariant checks are debug-only. The
+  single-thread argument is GLOBAL-01. `ptr` is non-null because `alloc` never returns a
+  null block as a success (HEAP-01, HEAP-04) and the contract requires a pointer this allocator
+  returned.
+- Machine checks: `tests/global_wasm.rs` under wasmtime (std collections, churn, zeroed and
+  over-aligned allocations through the static). The heap methods themselves are HEAP-01 to
+  HEAP-04.
+- Reviewer: pending adversarial review. Date: 2026-09-02.
+
+### GLOBAL-03: `unsafe impl GlobalAlloc for WasmAlloc`
+
+- Contract discharged: blocks are aligned to `layout.align()` and hold `layout.size()` bytes
+  (HEAP-01, HEAP-04, `bins`); live blocks never overlap (page invariant 4 within a page, heap
+  invariant 4 and the slice bitmap across pages and runs); `alloc_zeroed` returns
+  `layout.size()` zero bytes (HEAP-01, HEAP-04); `dealloc` and `realloc` recover the block's
+  page or run from the Layout the caller passes back (HEAP-02, HEAP-03); `realloc` preserves
+  `min(old, new)` bytes and leaves the old block untouched on failure (HEAP-03); no method
+  unwinds (GLOBAL-02). A zero-size request is undefined behaviour for the caller under the
+  contract; the implementation still returns a distinct 8-byte block.
+- Machine checks: as GLOBAL-02; the model tester (`tests/model_heap.rs`, `tests/model_system.rs`
+  against `System` for the tester's own soundness, `tests/model_mutants.rs` for its power).
+- Reviewer: pending adversarial review. Date: 2026-09-02.
+
+## backend
+
+### BACKEND-01: the `Memory` contract
+
+`unsafe trait Memory`: implementors promise fresh, zero-filled, exclusively owned slices from
+`grow`, indices at most `MAX_SLICE_INDEX`, a `size_slices` that never decreases, a `heap_base`
+from which everything to the end of memory (except what `grow` has not handed out) is the
+allocator's, `ptr(addr)` valid with provenance over the owned region, and (stated 2026-09-02,
+relied on throughout `heap` and `page`) `ptr(addr).addr() == addr`. Every unsafe block in
+`heap` and `page` that dereferences a `Memory::ptr` result cites this contract; the entries
+below argue that the implementations meet it.
+
+- Reviewer: pending adversarial review. Date: 2026-09-02.
+
+### BACKEND-02: `unsafe impl Memory for WasmMemory`
+
+- Proof sketch: `heap_base` takes the address of the linker-provided `__heap_base` symbol with
+  `addr_of!`, never reading it; wasm-ld defines it for every wasm32 target as the end of static
+  data and the shadow stack, so memory from there to `memory.size()` is unused by the program
+  (the contract's exclusivity for the linker gap). `memory.grow` returns fresh pages that the
+  specification zero-fills, contiguous with the previous end unless another party grew memory in
+  between, in which case the returned index is still the start of our region and the contract
+  allows the gap (`slices::acquire` and `extend_with_growth` handle it). `memory.size` never
+  decreases. `ptr` is `with_exposed_provenance_mut(addr)`: linear memory is one allocation in
+  Rust's model of wasm, every address below `memory.size() * SLICE_SIZE` is valid, and the
+  returned pointer has address `addr`. `grow` maps the `usize::MAX` failure code to `None`.
+  Assumption to keep in view: nothing else in the module allocates linear memory it expects to
+  keep from the region between `__heap_base` and the memory end that existed at the first
+  allocation, or from regions `memory.grow` returns to us; a second allocator or hand-written
+  `memory.grow` in the same module is compatible only if it never touches slices this
+  allocator has been given (it may grow memory itself; that only makes our regions
+  non-contiguous).
+- Machine checks: `tests/global_wasm.rs` under wasmtime; the wasm32-wasip1 unit tests exercise
+  the slice logic against `SimMemory`, not this backend.
+- Reviewer: pending adversarial review. Date: 2026-09-02.
+
+### BACKEND-03: `SimMemory::from_region`, `SimMemory::grow` and `unsafe impl Memory for SimMemory`
+
+- Preconditions (`from_region`): `base..base + len` is valid for reads and writes for the life
+  of the value and accessed by nobody else; the constructor panics on an unaligned base, a
+  length that is not whole slices, an initial size beyond the region or a heap base beyond the
+  initial size.
+- Proof sketch: `grow` checks `end_slice + slices` against the region's last slice before
+  zero-filling the new slices with `write_bytes` from `base.add(offset)`, an in-bounds range of
+  the caller's region; each slice is handed out once because `end_slice` only increases.
+  `ptr` is `base.with_addr(addr)`, which keeps `base`'s provenance over the whole region and has
+  address `addr`; it is valid for every address in the region, and the heap only passes
+  addresses of memory it owns (its callers' entries), which lie in `[heap_base, end)`. The
+  debug assertions check the range. `skip_slices` models another party's growth and never hands
+  those slices to the allocator. On a 64-bit host slice indices exceed `MAX_SLICE_INDEX`; the
+  `slices` module's `usable_limit` treats a map entirely above that index as having no hole,
+  which is why the assertion on the index is conditional on the pointer width.
+- Machine checks: tests `sim_grows_zeroed_and_contiguously_until_skipped`,
+  `sim_pointers_round_trip_addresses`; every heap, page and slices test and the model tester run
+  over this backend under Miri with strict provenance (Stacked Borrows) and under Tree Borrows,
+  which is the check that `with_addr` keeps the right provenance.
+- Reviewer: pending adversarial review. Date: 2026-09-02.
+
+### BACKEND-04: `testing::HostRegion` and `testing::Region` (test infrastructure only)
+
+- Compiled only under `cfg(test)` or the `testing` feature; never part of a
+  `#[global_allocator]` build.
+- Proof sketch: `HostRegion::new` allocates with a non-zero Layout and panics on null; `Drop`
+  frees with the same Layout exactly once. `simulate` hands the region to `from_region` with
+  the caller promising exclusivity and that the memory dies first; `Region` enforces both by
+  owning exactly one `SimMemory` and declaring it before the region so it drops first.
+- Machine checks: every test that uses `Region` or `SimHeap`, under Miri as above.
+- Reviewer: pending adversarial review. Date: 2026-09-02.
+
+## slices
 
 `slices` has no unsafe code. The bitmap helpers there gained explicit `w < WORDS` tests
 (2026-09-02) so that the release build carries no bounds-check panic path; they are safe code
 and are covered by the twelve slices Kani harnesses.
 
-Not listed: the unsafe blocks inside `#[cfg(test)]` test code and the proof-only `PageModel`
-backend under `#[cfg(kani)]`, which never ship.
+Not listed: the unsafe blocks inside `#[cfg(test)]` test code and the proof-only backends
+under `#[cfg(kani)]` (`page::verify::PageModel`, `heap::verify::HeapModel` and `QueueModel`),
+which never ship; their safety arguments are in their `SAFETY` comments and HEAP-09.
