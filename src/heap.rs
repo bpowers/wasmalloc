@@ -5,7 +5,7 @@
 //!
 //! - the page kind and the page header address are derived from the `Layout`, so `dealloc`
 //!   masks the pointer instead of consulting a page map (see [`page::header_of`]);
-//! - blocks above [`bins::LARGE_MAX_OBJ_SIZE`], and blocks with alignment above
+//! - blocks above [`bins::MAX_BINNED_OBJ_SIZE`], and blocks with alignment above
 //!   [`bins::MAX_NATURAL_ALIGN`], are header-less runs of slices whose length is recomputed from
 //!   the Layout on free;
 //! - freed blocks go straight onto the page's `free` list (mimalloc's `local_free` exists for
@@ -831,7 +831,10 @@ const _: () = {
 mod tests {
     use super::*;
     use crate::backend::SimMemory;
-    use crate::bins::{LARGE_MAX_OBJ_SIZE, LARGE_PAGE_SIZE, MEDIUM_MAX_OBJ_SIZE, bin_size};
+    use crate::bins::{
+        LARGE_MAX_OBJ_SIZE, LARGE_PAGE_SIZE, MAX_BINNED_BIN, MAX_BINNED_OBJ_SIZE,
+        MEDIUM_MAX_OBJ_SIZE, bin_size,
+    };
     use std::alloc::{alloc, dealloc};
     use std::vec::Vec;
 
@@ -980,7 +983,7 @@ mod tests {
     fn every_bin_allocates_aligned_distinct_blocks_and_recovers_its_page() {
         let mut f = heap(1024, 4, 0);
         let h = &mut f.heap;
-        for b in 1..=MAX_BIN {
+        for b in 1..=MAX_BINNED_BIN {
             let size = bin_size(b);
             let l = layout(size, 8);
             let kind = bins::kind_of_bin(b);
@@ -1107,9 +1110,9 @@ mod tests {
             for s in 0..20 {
                 assert!(!h.slices.is_free(start + s));
             }
-            // Shrinking below the large-object limit must move the block: the new Layout would
-            // classify it as a page block and the next dealloc would mask to a page header.
-            let tiny = LARGE_MAX_OBJ_SIZE;
+            // Shrinking to a binned size must move the block: the new Layout would classify it
+            // as a page block and the next dealloc would mask to a page header.
+            let tiny = MAX_BINNED_OBJ_SIZE;
             let t = h.realloc(r, layout(bigger, 8), tiny).unwrap();
             assert_ne!(t, r);
             check(t, tiny, 0x5B);
@@ -1237,7 +1240,7 @@ mod tests {
             let a = h.alloc(layout(100, 8)).unwrap();
             assert!(
                 h.alloc(layout(LARGE_MAX_OBJ_SIZE, 8)).is_none(),
-                "4 MiB page cannot fit"
+                "neither a 4 MiB page nor an 8-slice run fits in 7 slices"
             );
             assert!(
                 h.alloc(layout(9 * SLICE_SIZE, 8)).is_none(),

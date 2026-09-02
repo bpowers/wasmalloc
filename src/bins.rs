@@ -47,9 +47,29 @@ pub const LARGE_PAGE_SIZE: usize = 64 * SLICE_SIZE;
 pub const SMALL_MAX_OBJ_SIZE: usize = 10 * 1024;
 /// See [`SMALL_MAX_OBJ_SIZE`].
 pub const MEDIUM_MAX_OBJ_SIZE: usize = 80 * 1024;
-/// See [`SMALL_MAX_OBJ_SIZE`]. Anything larger, or anything with an alignment above
-/// [`MAX_NATURAL_ALIGN`], is a header-less singleton run of slices.
+/// See [`SMALL_MAX_OBJ_SIZE`]. The bin table ends here; whether the bins above the medium limit
+/// are ever used is [`LARGE_PAGES`].
 pub const LARGE_MAX_OBJ_SIZE: usize = 512 * 1024;
+
+/// Whether blocks above [`MEDIUM_MAX_OBJ_SIZE`] and up to [`LARGE_MAX_OBJ_SIZE`] are served from
+/// 4 MiB large pages. When false they are header-less runs of whole slices, like everything
+/// larger: a 128 KiB block then costs 128 KiB of footprint instead of pinning a 4 MiB page that
+/// holds one block per touched bin, and a run can grow in place (with the slices after it, or by
+/// growing linear memory when it sits at the end), which is what a doubling `Vec` needs. The
+/// cost is slice granularity, up to one 64 KiB slice of waste per block, against the bins'
+/// 12.5 percent. mimalloc's own source doubts large pages for the same footprint reason
+/// (`docs/research/roofline.md` 12.3 and 12.5). The large-page machinery stays compiled either
+/// way so the two can be compared.
+pub const LARGE_PAGES: bool = false;
+
+/// Largest block served from a binned page: the medium limit unless [`LARGE_PAGES`] is on.
+/// Anything larger, or anything with an alignment above [`MAX_NATURAL_ALIGN`], is a header-less
+/// singleton run of slices (see [`classify`]).
+pub const MAX_BINNED_OBJ_SIZE: usize = if LARGE_PAGES {
+    LARGE_MAX_OBJ_SIZE
+} else {
+    MEDIUM_MAX_OBJ_SIZE
+};
 
 /// Largest alignment satisfied inside a binned page. Requests above this get their own run of
 /// slices, which are 64 KiB-aligned (or aligned to the request when it is larger still).
@@ -80,12 +100,24 @@ pub const SMALL_MAX_BIN: u8 = bin(SMALL_MAX_OBJ_SIZE);
 pub const MEDIUM_MAX_BIN: u8 = bin(MEDIUM_MAX_OBJ_SIZE);
 /// See [`SMALL_MAX_BIN`].
 pub const LARGE_MAX_BIN: u8 = bin(LARGE_MAX_OBJ_SIZE);
+/// Largest bin [`classify`] produces: `bin(MAX_BINNED_OBJ_SIZE)`. Bins above it exist in the
+/// table but no request reaches them unless [`LARGE_PAGES`] is on.
+pub const MAX_BINNED_BIN: u8 = bin(MAX_BINNED_OBJ_SIZE);
 
 const _: () = {
     assert!(bin_size(SMALL_MAX_BIN) == SMALL_MAX_OBJ_SIZE);
     assert!(bin_size(MEDIUM_MAX_BIN) == MEDIUM_MAX_OBJ_SIZE);
     assert!(bin_size(LARGE_MAX_BIN) == LARGE_MAX_OBJ_SIZE);
     assert!(LARGE_MAX_BIN == MAX_BIN);
+    assert!(bin_size(MAX_BINNED_BIN) == MAX_BINNED_OBJ_SIZE);
+    assert!(
+        MAX_BINNED_BIN
+            == if LARGE_PAGES {
+                LARGE_MAX_BIN
+            } else {
+                MEDIUM_MAX_BIN
+            }
+    );
     assert!((bin(DIRECT_MAX_SIZE) as usize) < BIN_COUNT);
     assert!(PAGE_HEADER_RESERVE % WORD == 0);
     assert!(MAX_NATURAL_ALIGN <= SLICE_SIZE);
@@ -198,7 +230,7 @@ pub const fn direct_index(size: usize) -> usize {
 /// Classify a request. This is the one function that decides how a Layout is served; alloc,
 /// dealloc and realloc must all go through it so they agree.
 ///
-/// Alignments above [`MAX_NATURAL_ALIGN`] and sizes above [`LARGE_MAX_OBJ_SIZE`] become
+/// Alignments above [`MAX_NATURAL_ALIGN`] and sizes above [`MAX_BINNED_OBJ_SIZE`] become
 /// [`Class::Huge`]. Otherwise the size is rounded up to a multiple of the alignment (a no-op for
 /// well-formed type layouts, whose size is already a multiple of their alignment) and binned;
 /// the alignment property documented at the top of the module then guarantees the block is
@@ -215,7 +247,7 @@ pub const fn classify(layout: Layout) -> Class {
     } else {
         layout.size()
     };
-    if size > LARGE_MAX_OBJ_SIZE {
+    if size > MAX_BINNED_OBJ_SIZE {
         Class::Huge
     } else {
         Class::Bin(bin(size))
@@ -320,6 +352,15 @@ mod tests {
 
     #[test]
     fn kind_boundaries() {
+        assert_eq!(
+            MAX_BINNED_OBJ_SIZE,
+            if LARGE_PAGES {
+                LARGE_MAX_OBJ_SIZE
+            } else {
+                MEDIUM_MAX_OBJ_SIZE
+            }
+        );
+        assert_eq!(bin(MAX_BINNED_OBJ_SIZE), MAX_BINNED_BIN);
         assert_eq!(kind_of_bin(1), PageKind::Small);
         assert_eq!(kind_of_bin(SMALL_MAX_BIN), PageKind::Small);
         assert_eq!(kind_of_bin(SMALL_MAX_BIN + 1), PageKind::Medium);
@@ -382,28 +423,39 @@ mod tests {
                 }
             }
         }
-        // Alignment above the natural cap, or size above the large cap, is a singleton run.
+        // Alignment above the natural cap, or size above the binned cap, is a singleton run.
         assert_eq!(
             classify(Layout::from_size_align(1, 8192).unwrap()),
             Class::Huge
         );
         assert_eq!(
+            classify(Layout::from_size_align(MAX_BINNED_OBJ_SIZE + 1, 1).unwrap()),
+            Class::Huge
+        );
+        assert_eq!(
+            classify(Layout::from_size_align(MAX_BINNED_OBJ_SIZE, 1).unwrap()),
+            Class::Bin(MAX_BINNED_BIN)
+        );
+        assert_eq!(
             classify(Layout::from_size_align(LARGE_MAX_OBJ_SIZE + 1, 1).unwrap()),
             Class::Huge
         );
+        // Rounding up to the alignment can push a request over the binned cap.
         assert_eq!(
-            classify(Layout::from_size_align(LARGE_MAX_OBJ_SIZE, 1).unwrap()),
-            Class::Bin(MAX_BIN)
-        );
-        // Rounding up to the alignment can push a request over the large cap.
-        assert_eq!(
-            classify(Layout::from_size_align(LARGE_MAX_OBJ_SIZE - 1, 4096).unwrap()),
-            Class::Bin(MAX_BIN)
+            classify(Layout::from_size_align(MAX_BINNED_OBJ_SIZE - 1, 4096).unwrap()),
+            Class::Bin(MAX_BINNED_BIN)
         );
         assert_eq!(
-            classify(Layout::from_size_align(LARGE_MAX_OBJ_SIZE + 1, 4096).unwrap()),
+            classify(Layout::from_size_align(MAX_BINNED_OBJ_SIZE + 1, 4096).unwrap()),
             Class::Huge
         );
+        // Every class classify produces is a bin at or below the binned cap.
+        for size in (1..=LARGE_MAX_OBJ_SIZE + 1).step_by(4093) {
+            match classify(Layout::from_size_align(size, 1).unwrap()) {
+                Class::Bin(b) => assert!(b <= MAX_BINNED_BIN && size <= MAX_BINNED_OBJ_SIZE),
+                Class::Huge => assert!(size > MAX_BINNED_OBJ_SIZE),
+            }
+        }
         // Small alignments never change the class.
         for size in 1..=DIRECT_MAX_SIZE {
             let a1 = classify(Layout::from_size_align(size, 1).unwrap());
