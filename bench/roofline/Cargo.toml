@@ -38,6 +38,8 @@ talc = ["dep:talc"]
 lol_alloc = ["dep:lol_alloc"]
 # The allocator this repository builds:
 wasmalloc = ["dep:wasmalloc"]
+# wasmalloc's heap behind a memory.grow-counting backend, for the footprint step's grow counts.
+wasmalloc_count = ["dep:wasmalloc"]
 
 [dependencies]
 talc = { version = "5.1", optional = true, default-features = false }

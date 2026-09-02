@@ -118,6 +118,14 @@
     return p === 0xffffffff ? null : p;
   }
 
+  // memory.grow calls the allocator has made, through the module's export; null
+  // when the variant does not count them.
+  function growCalls(exports) {
+    if (typeof exports.grow_calls !== 'function') return null;
+    const c = exports.grow_calls() >>> 0;
+    return c === 0xffffffff ? null : c;
+  }
+
   function median(sorted) {
     return sorted[sorted.length >> 1];
   }
@@ -145,6 +153,8 @@
     const ops = wl.ops(n);
     let checksum = 0;
     const pagesBefore = memoryPages(exports);
+    const growCallsBefore = growCalls(exports);
+    let growCallsFirstCall = null;
 
     const call = () => {
       exports.reset();
@@ -162,6 +172,7 @@
     for (;;) {
       times.push(call());
       tiers.push(env.tierOf(fn));
+      if (times.length === 1) growCallsFirstCall = growCalls(exports);
       const warm = times.length;
       const last = times.slice(-3);
       const stable =
@@ -191,6 +202,9 @@
       tierStable: tierBefore === tier,
       pagesBefore,
       pagesAfter: memoryPages(exports),
+      growCallsBefore,
+      growCallsFirstCall,
+      growCallsAfter: growCalls(exports),
       checksum: checksum >>> 0,
     };
   }
@@ -309,6 +323,7 @@
         pad('warm', 6, true) +
         pad('lift', 6, true) +
         pad('pages', 7, true) +
+        pad('grows', 7, true) +
         '  tier'
     );
     for (const r of report.results) {
@@ -321,6 +336,7 @@
           pad(r.warmupCalls, 6, true) +
           pad(r.liftoffWarmupCalls, 6, true) +
           pad(r.pagesAfter === null ? '-' : r.pagesAfter, 7, true) +
+          pad(r.growCallsAfter === null ? '-' : r.growCallsAfter - r.growCallsBefore, 7, true) +
           '  ' +
           r.tier +
           (r.tierStable ? '' : ' (changed during reps)')

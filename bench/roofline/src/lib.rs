@@ -39,6 +39,13 @@ pub extern "C" fn memory_pages() -> u32 {
     alloc::memory_pages().map_or(u32::MAX, |p| p as u32)
 }
 
+/// `memory.grow` calls the allocator has made so far, or `u32::MAX` where the
+/// variant does not count them (only `wasmalloc_count` does).
+#[no_mangle]
+pub extern "C" fn grow_calls() -> u32 {
+    alloc::grow_calls().map_or(u32::MAX, |c| c as u32)
+}
+
 #[no_mangle]
 pub extern "C" fn alloc_free_32(iters: u32) -> u32 {
     w::alloc_free_fixed(iters as usize, 32, 8)

@@ -13,7 +13,9 @@ tables are regenerated into `results/REPORT.md`.
   in `src/alloc/`), `mimic`, `mimic_lean`, `mimic_u32`, `mimic_nozero`, `mimic_notest`,
   `mimic_u32_notest` (floors that
   reproduce wasmalloc's fast-path memory traffic with one detail changed each,
-  see `src/alloc/mimic.rs`), `talc`, `lol_alloc`, `wasmalloc`, or none for std's
+  see `src/alloc/mimic.rs`), `talc`, `lol_alloc`, `wasmalloc`, `wasmalloc_count`
+  (wasmalloc's heap behind a `memory.grow`-counting backend, for the `grows` column
+  and the `growCalls*` fields; timings are only close to `wasmalloc`'s), or none for std's
   default (`dlmalloc-rs` on wasm32-unknown-unknown, wasi-libc's C dlmalloc on
   wasm32-wasip1, libc malloc natively). The features are mutually exclusive.
 - `src/workloads.rs`: the workloads; `src/lib.rs`: the C ABI exports the JS

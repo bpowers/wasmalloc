@@ -94,13 +94,14 @@ const ENABLED: usize = count_enabled!(
     "dlmalloc",
     "talc",
     "lol_alloc",
-    "wasmalloc"
+    "wasmalloc",
+    "wasmalloc_count"
 );
 
 #[allow(dead_code)]
 const _: () = assert!(
     ENABLED <= 1,
-    "enable at most one allocator feature (bump, freelist, sizeclass, pages, mimic, mimic_lean, mimic_u32, mimic_nozero, mimic_notest, mimic_u32_notest, dlmalloc, talc, lol_alloc, wasmalloc)"
+    "enable at most one allocator feature (bump, freelist, sizeclass, pages, mimic, mimic_lean, mimic_u32, mimic_nozero, mimic_notest, mimic_u32_notest, dlmalloc, talc, lol_alloc, wasmalloc, wasmalloc_count)"
 );
 
 // The floor allocators are always compiled so that they can share code
@@ -110,6 +111,20 @@ pub mod freelist;
 pub mod mimic;
 pub mod pages;
 pub mod sizeclass;
+#[cfg(all(feature = "wasmalloc_count", target_arch = "wasm32"))]
+pub mod counting;
+
+/// `memory.grow` calls the allocator has made so far; only the `wasmalloc_count`
+/// variant counts them.
+#[cfg(feature = "wasmalloc_count")]
+pub fn grow_calls() -> Option<usize> {
+    Some(selected::grow_calls())
+}
+
+#[cfg(not(feature = "wasmalloc_count"))]
+pub fn grow_calls() -> Option<usize> {
+    None
+}
 
 #[cfg(feature = "bump")]
 mod selected {
@@ -261,6 +276,22 @@ mod selected {
     pub fn reset() {}
 }
 
+#[cfg(feature = "wasmalloc_count")]
+mod selected {
+    pub const NAME: &str = "wasmalloc_count";
+    pub const DETAIL: &str =
+        "wasmalloc's Heap over a memory.grow-counting WasmMemory, behind the harness's own shim";
+    #[cfg(target_arch = "wasm32")]
+    #[global_allocator]
+    static GLOBAL: super::counting::CountingAlloc = super::counting::CountingAlloc::new();
+    #[cfg(not(target_arch = "wasm32"))]
+    compile_error!("the wasmalloc_count variant only exists for wasm32 targets");
+    pub fn reset() {}
+    pub fn grow_calls() -> usize {
+        GLOBAL.grow_calls()
+    }
+}
+
 // No feature: std's default. Which allocator that is depends on the target, and
 // the harness records it so the tables can say what was actually measured.
 #[cfg(not(any(
@@ -276,7 +307,8 @@ mod selected {
     feature = "mimic_u32_notest",
     feature = "talc",
     feature = "lol_alloc",
-    feature = "wasmalloc"
+    feature = "wasmalloc",
+    feature = "wasmalloc_count"
 )))]
 mod selected {
     #[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
