@@ -7,6 +7,11 @@
 // and report median and min ns per op. Every timed call is preceded by
 // reset() (rewinds the floor allocators; no-op otherwise) and the workload's
 // setup, and followed by its teardown; only the workload call itself is timed.
+// memory.size is read before the first warm-up call and after the last timed
+// call: linear memory never shrinks, so the latter is the peak footprint the
+// allocator reached while running this workload (and everything before it in
+// the same process; the footprint step of run-all.sh runs one workload per
+// process for clean numbers).
 //
 // Tiering: on V8 with --allow-natives-syntax the driver can tell whether a
 // function is still running Liftoff (baseline) code. Under dynamic tiering the
@@ -14,7 +19,9 @@
 // optimized tier, so warm-up keeps going while the function is in Liftoff
 // (up to MAX_WARM_TIERUP calls) unless --tier-hint liftoff says Liftoff is the
 // tier under test. Functions that never execute enough code to exhaust V8's
-// tiering budget stay in Liftoff and are reported as such.
+// tiering budget stay in Liftoff and are reported as such. The workload loops
+// are inlined into the exports (see workloads.rs) so the query describes the
+// code that actually runs.
 (function () {
   'use strict';
 
@@ -22,9 +29,12 @@
   // equivalent) operations that call performs, for the per-op figure.
   const WORKLOADS = [
     { name: 'alloc_free_32', n: 2000000, ops: (n) => n, unit: 'alloc+free pair' },
+    { name: 'alloc_free_32_align16', n: 2000000, ops: (n) => n, unit: 'alloc+free pair, align 16' },
     { name: 'batch_lifo_32', n: 2000, ops: (n) => n * 1000, unit: 'alloc+free pair' },
     { name: 'batch_fifo_32', n: 2000, ops: (n) => n * 1000, unit: 'alloc+free pair' },
     { name: 'churn', n: 200000, ops: (n) => n, unit: 'free+alloc step', setup: 'churn_init', teardown: 'churn_fini' },
+    { name: 'random_actions', n: 100000, ops: (n) => n, unit: 'action (3/7 alloc, 3/7 free, 1/7 realloc)', teardown: 'random_actions_fini' },
+    { name: 'random_actions_norealloc', n: 100000, ops: (n) => n, unit: 'action (1/2 alloc, 1/2 free)', teardown: 'random_actions_fini' },
     { name: 'vec_push_growth', n: 20, ops: (n) => n, unit: '1 MiB Vec<u8> growth' },
     { name: 'realloc_doubling', n: 100, ops: (n) => n, unit: '16 B to 1 MiB realloc chain' },
     { name: 'large_alloc_free', n: 50, ops: (n) => n, unit: 'alloc+touch+free, 256K-4M' },
@@ -77,6 +87,11 @@
     if (!opts.wasm) throw new Error(USAGE);
     if (!(opts.reps > 0) || !(opts.scale > 0)) throw new Error(USAGE);
     if (opts.tierHint !== 'liftoff' && opts.tierHint !== 'any') throw new Error(USAGE);
+    if (opts.only) {
+      for (const name of opts.only) {
+        if (!WORKLOADS.some((w) => w.name === name)) throw new Error('unknown workload ' + name);
+      }
+    }
     return opts;
   }
 
@@ -93,6 +108,14 @@
     let s = '';
     for (let i = 0; i < len; i++) s += String.fromCharCode(view[i]);
     return s;
+  }
+
+  // memory.size in 64 KiB pages, through the module's own export so that the
+  // JS and wasi drivers report the same thing; null when the module has none.
+  function memoryPages(exports) {
+    if (typeof exports.memory_pages !== 'function') return null;
+    const p = exports.memory_pages() >>> 0;
+    return p === 0xffffffff ? null : p;
   }
 
   function median(sorted) {
@@ -121,6 +144,7 @@
     const n = Math.max(1, Math.round(wl.n * opts.scale));
     const ops = wl.ops(n);
     let checksum = 0;
+    const pagesBefore = memoryPages(exports);
 
     const call = () => {
       exports.reset();
@@ -165,6 +189,8 @@
       firstCallNsPerOp: (times[0] - callNs) / ops,
       tier,
       tierStable: tierBefore === tier,
+      pagesBefore,
+      pagesAfter: memoryPages(exports),
       checksum: checksum >>> 0,
     };
   }
@@ -232,6 +258,7 @@
       note: opts.note,
       wasm: opts.wasm,
       variant,
+      memoryPagesAtStart: memoryPages(exports),
     };
     let report;
     if (opts.tierup !== null) {
@@ -271,27 +298,29 @@
       `engine: ${report.engine} ${report.engineVersion || ''}  flags: ${report.flags || '(default)'}  variant: ${report.variant}  wasm: ${report.wasm}`
     );
     lines.push(
-      `js->wasm call: median ${report.callOverheadNs.median.toFixed(2)} ns, min ${report.callOverheadNs.min.toFixed(2)} ns (${report.callOverheadNs.tier})`
+      `js->wasm call: median ${report.callOverheadNs.median.toFixed(2)} ns, min ${report.callOverheadNs.min.toFixed(2)} ns (${report.callOverheadNs.tier}); memory at start: ${report.memoryPagesAtStart} pages`
     );
     lines.push(
-      pad('workload', 20) +
+      pad('workload', 26) +
         pad('ops/call', 12, true) +
         pad('median ns/op', 14, true) +
         pad('min ns/op', 12, true) +
         pad('first', 10, true) +
         pad('warm', 6, true) +
         pad('lift', 6, true) +
+        pad('pages', 7, true) +
         '  tier'
     );
     for (const r of report.results) {
       lines.push(
-        pad(r.workload, 20) +
+        pad(r.workload, 26) +
           pad(r.opsPerCall, 12, true) +
           pad(r.medianNsPerOp.toFixed(2), 14, true) +
           pad(r.minNsPerOp.toFixed(2), 12, true) +
           pad(r.firstCallNsPerOp.toFixed(1), 10, true) +
           pad(r.warmupCalls, 6, true) +
           pad(r.liftoffWarmupCalls, 6, true) +
+          pad(r.pagesAfter === null ? '-' : r.pagesAfter, 7, true) +
           '  ' +
           r.tier +
           (r.tierStable ? '' : ' (changed during reps)')

@@ -31,9 +31,24 @@ pub extern "C" fn variant_name_len() -> u32 {
     alloc::NAME.len() as u32
 }
 
+/// Current `memory.size` in 64 KiB pages, or `u32::MAX` where there is no
+/// linear memory (native builds). Read after a workload it is the peak
+/// footprint, since linear memory never shrinks.
+#[no_mangle]
+pub extern "C" fn memory_pages() -> u32 {
+    alloc::memory_pages().map_or(u32::MAX, |p| p as u32)
+}
+
 #[no_mangle]
 pub extern "C" fn alloc_free_32(iters: u32) -> u32 {
-    w::alloc_free_fixed(iters as usize, 32)
+    w::alloc_free_fixed(iters as usize, 32, 8)
+}
+
+/// The same pair with 16-byte alignment, the `v128` case: dlmalloc-rs leaves
+/// its 8-byte natural alignment and takes the memalign path.
+#[no_mangle]
+pub extern "C" fn alloc_free_32_align16(iters: u32) -> u32 {
+    w::alloc_free_fixed(iters as usize, 32, 16)
 }
 
 #[no_mangle]
@@ -59,6 +74,21 @@ pub extern "C" fn churn(steps: u32) -> u32 {
 #[no_mangle]
 pub extern "C" fn churn_fini() -> u32 {
     w::churn_fini()
+}
+
+#[no_mangle]
+pub extern "C" fn random_actions(actions: u32) -> u32 {
+    w::random_actions(actions as usize)
+}
+
+#[no_mangle]
+pub extern "C" fn random_actions_norealloc(actions: u32) -> u32 {
+    w::random_actions_norealloc(actions as usize)
+}
+
+#[no_mangle]
+pub extern "C" fn random_actions_fini() -> u32 {
+    w::random_actions_fini()
 }
 
 #[no_mangle]

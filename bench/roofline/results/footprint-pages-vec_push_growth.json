@@ -1,0 +1,35 @@
+{
+  "engine": "node",
+  "engineVersion": "node 22.22.2 / V8 12.4.254.21-node.39",
+  "flags": "--no-liftoff",
+  "note": null,
+  "wasm": "/home/bpowers/src/wasm-clalloc/.worktrees/roofline/bench/roofline/target/dist/pages-release.wasm",
+  "variant": "pages",
+  "memoryPagesAtStart": 20,
+  "reps": 3,
+  "scale": 1,
+  "tierHint": "any",
+  "callOverheadNs": {
+    "median": 1.3725360000000038,
+    "min": 0.3730989999999963,
+    "tier": "turbofan"
+  },
+  "results": [
+    {
+      "workload": "vec_push_growth",
+      "unit": "1 MiB Vec<u8> growth",
+      "n": 20,
+      "opsPerCall": 20,
+      "medianNsPerOp": 421924.98137319944,
+      "minNsPerOp": 421468.58137319994,
+      "warmupCalls": 4,
+      "liftoffWarmupCalls": 0,
+      "firstCallNsPerOp": 753128.9313732001,
+      "tier": "turbofan",
+      "tierStable": true,
+      "pagesBefore": 20,
+      "pagesAfter": 788,
+      "checksum": 3925081182
+    }
+  ]
+}

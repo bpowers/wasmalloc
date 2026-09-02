@@ -26,14 +26,23 @@ bump = []        # bump pointer over memory.grow, free is a no-op
 freelist = []    # one intrusive LIFO free list for <=32-byte blocks, bump otherwise
 sizeclass = []   # 16-byte-granular free lists up to 1024 B, class from Layout on free
 pages = []       # like sizeclass, but class recovered from a 64 KiB page header on free
+mimic = []       # wasmalloc's fast-path memory traffic (direct table, header bookkeeping), nothing else
+mimic_lean = []  # mimic without the used/free_is_zero/flags bookkeeping
+mimic_u32 = []   # mimic with a 32-bit used counter
+mimic_nozero = [] # mimic without the free_is_zero store
 # Incumbents:
 dlmalloc = []    # marker only: std's default #[global_allocator] (dlmalloc port)
 talc = ["dep:talc"]
 lol_alloc = ["dep:lol_alloc"]
+# The allocator this repository builds:
+wasmalloc = ["dep:wasmalloc"]
 
 [dependencies]
 talc = { version = "5.1", optional = true, default-features = false }
 lol_alloc = { version = "0.4", optional = true }
+# The crate under test. Built with this crate's profiles, so the shim study also
+# measures wasmalloc at opt-level z and without LTO, as a consumer might build it.
+wasmalloc = { path = "../..", optional = true }
 
 [profile.release]
 opt-level = 3

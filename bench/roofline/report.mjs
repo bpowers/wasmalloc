@@ -1,17 +1,18 @@
 // Turn results/*.json into markdown tables.
 //   node report.mjs [results-dir]
 //
-// Reads the matrix files (<engine>-<tier>-<variant>.json), the tier-up probes
-// (tierup-*.json), the flag checks (flagcheck-*.json) and the shim study
-// (shim-*.json, shim-inspect.txt) and prints markdown to stdout. Engine and
-// tier come from the file name so that the self-timed (wasmtime, native)
-// results and the JS-driven ones are treated alike.
+// Reads the matrix files (<engine>-<tier>-<variant>.json), the footprint runs
+// (footprint-<variant>-<workload>.json), the size records (size-<variant>.json),
+// the tier-up probes (tierup-*.json), the flag checks (flagcheck-*.json) and the
+// shim study (shim-*.json, shim-inspect-*.txt) and prints markdown to stdout.
+// Engine and tier come from the file name so that the self-timed (wasmtime,
+// native) results and the JS-driven ones are treated alike.
 import fs from 'node:fs';
 import path from 'node:path';
 
 const dir = process.argv[2] || path.join(path.dirname(new URL(import.meta.url).pathname), 'results');
 
-const VARIANTS = ['bump', 'freelist', 'sizeclass', 'pages', 'dlmalloc', 'talc', 'lol_alloc'];
+const VARIANTS = ['bump', 'freelist', 'sizeclass', 'pages', 'mimic', 'mimic_lean', 'mimic_u32', 'mimic_nozero', 'dlmalloc', 'talc', 'lol_alloc', 'wasmalloc'];
 const CONFIGS = [
   ['node-default', 'node 22 (V8 12.4), default tiering'],
   ['node-liftoff', 'node 22 (V8 12.4), --liftoff-only'],
@@ -25,15 +26,36 @@ const CONFIGS = [
 ];
 const WORKLOADS = [
   'alloc_free_32',
+  'alloc_free_32_align16',
   'batch_lifo_32',
   'batch_fifo_32',
   'churn',
+  'random_actions',
+  'random_actions_norealloc',
   'vec_push_growth',
   'realloc_doubling',
   'large_alloc_free',
   'memory_grow_only',
   'memory_grow_touch',
 ];
+// The floor each workload is compared against: the single free list for the
+// 32-byte workloads, the size-class lists for churn and random actions (which
+// leak everything above 1 KiB there, so that floor is a bound, not a target),
+// and the bump pointer where no floor is honest.
+const FLOOR_OF = {
+  alloc_free_32: 'freelist',
+  alloc_free_32_align16: 'freelist',
+  batch_lifo_32: 'freelist',
+  batch_fifo_32: 'freelist',
+  churn: 'sizeclass',
+  random_actions: 'sizeclass',
+  random_actions_norealloc: 'sizeclass',
+  vec_push_growth: 'bump',
+  realloc_doubling: null,
+  large_alloc_free: 'bump',
+};
+const RATIO_WORKLOADS = Object.keys(FLOOR_OF);
+const FOOTPRINT_WORKLOADS = RATIO_WORKLOADS;
 
 function readJson(file) {
   try {
@@ -58,6 +80,10 @@ function table(header, rows) {
   out.push('|' + header.map((h, i) => (i === 0 ? '---' : '---:')).join('|') + '|');
   for (const r of rows) out.push('| ' + r.join(' | ') + ' |');
   return out.join('\n');
+}
+
+function shortTitle(cfg, title) {
+  return title.replace(/ \(.*\)/, '').replace(/,.*/, '') + ' ' + cfg.split('-')[1];
 }
 
 // ---------------------------------------------------------------- matrix
@@ -112,45 +138,141 @@ for (const [cfg, title] of CONFIGS) {
   console.log('');
 }
 
-// ---------------------------------------------------------------- ratios
+// ---------------------------------------------------------------- wasmalloc against floor and incumbents
 
-const RATIO_WORKLOADS = ['alloc_free_32', 'batch_lifo_32', 'batch_fifo_32', 'churn'];
-const ratioRows = [];
-for (const [cfg, title] of CONFIGS) {
-  for (const wl of RATIO_WORKLOADS) {
-    const bump = resultOf(cfg, 'bump', wl);
-    const fl = resultOf(cfg, 'freelist', wl);
-    const sc = resultOf(cfg, 'sizeclass', wl);
-    const pg = resultOf(cfg, 'pages', wl);
-    const dl = resultOf(cfg, 'dlmalloc', wl);
-    const talc = resultOf(cfg, 'talc', wl);
-    const lol = resultOf(cfg, 'lol_alloc', wl);
-    if (!sc && !dl) continue;
-    // The floor for the 32-byte workloads is the free list; churn's floor is
-    // the size-class list (the single free list falls through to bump there).
-    const floor = wl === 'churn' ? sc : fl;
-    const f = floor ? floor.medianNsPerOp : null;
-    const ratio = (r) => (r && f ? fmt(r.medianNsPerOp / f, 1) + 'x' : '-');
-    ratioRows.push([
-      title.replace(/ \(.*\)/, '').replace(/,.*/, '') + ' ' + cfg.split('-')[1],
-      wl,
-      fmt(bump && bump.medianNsPerOp),
-      fmt(f),
-      fmt(sc && sc.medianNsPerOp),
-      fmt(pg && pg.medianNsPerOp),
-      dl ? `${fmt(dl.medianNsPerOp)} (${ratio(dl)})` : '-',
-      talc ? `${fmt(talc.medianNsPerOp)} (${ratio(talc)})` : '-',
-      lol ? `${fmt(lol.medianNsPerOp)} (${ratio(lol)})` : '-',
-    ]);
+{
+  const rows = [];
+  for (const [cfg, title] of CONFIGS) {
+    for (const wl of RATIO_WORKLOADS) {
+      const wa = resultOf(cfg, 'wasmalloc', wl);
+      const dl = resultOf(cfg, 'dlmalloc', wl);
+      const talc = resultOf(cfg, 'talc', wl);
+      const lol = resultOf(cfg, 'lol_alloc', wl);
+      if (!wa && !dl) continue;
+      const floorName = FLOOR_OF[wl];
+      const floor = floorName ? resultOf(cfg, floorName, wl) : null;
+      const f = floor ? floor.medianNsPerOp : null;
+      const w = wa ? wa.medianNsPerOp : null;
+      const over = (r) => (r && w ? fmt(r.medianNsPerOp / w, 2) + 'x' : '-');
+      rows.push([
+        shortTitle(cfg, title),
+        wl,
+        floor ? `${fmt(f)} (${floorName})` : '-',
+        wa ? fmt(w) + tierMark(wa) : '-',
+        f && w ? fmt(w / f, 2) + 'x' : '-',
+        dl ? `${fmt(dl.medianNsPerOp)} (${over(dl)})` : '-',
+        talc ? `${fmt(talc.medianNsPerOp)} (${over(talc)})` : '-',
+        lol ? `${fmt(lol.medianNsPerOp)} (${over(lol)})` : '-',
+      ]);
+    }
+  }
+  if (rows.length) {
+    console.log('## wasmalloc against the floor and the incumbents\n');
+    console.log(
+      'Median ns/op. "floor" is the harness allocator named in parentheses (the single free list for the 32-byte workloads, the size-class lists for churn and random actions, the bump pointer for the growth workloads; the size-class floor leaks everything above 1 KiB, so for random actions it is a bound rather than a target). "wasmalloc/floor" is how far wasmalloc sits above the floor; the incumbent columns show their time and, in parentheses, how many times slower than wasmalloc they are (below 1x means the incumbent is faster).\n'
+    );
+    console.log(
+      table(['engine/tier', 'workload', 'floor', 'wasmalloc', 'wasmalloc/floor', 'dlmalloc', 'talc', 'lol_alloc'], rows)
+    );
+    console.log('');
   }
 }
-if (ratioRows.length) {
-  console.log('## Incumbents against the floor\n');
-  console.log(
-    'Median ns/op. The floor column is the single free list for the 32-byte workloads and the size-class free lists for churn; incumbents show their ratio to that floor in parentheses.\n'
-  );
-  console.log(table(['engine/tier', 'workload', 'bump', 'floor', 'sizeclass', 'pages', 'dlmalloc', 'talc', 'lol_alloc'], ratioRows));
-  console.log('');
+
+// ---------------------------------------------------------------- floors against each other
+
+{
+  const rows = [];
+  for (const [cfg, title] of CONFIGS) {
+    for (const wl of ['alloc_free_32', 'alloc_free_32_align16', 'batch_lifo_32', 'batch_fifo_32', 'churn']) {
+      const cells = ['bump', 'freelist', 'sizeclass', 'pages', 'mimic_lean', 'mimic_u32', 'mimic_nozero', 'mimic', 'wasmalloc'].map((v) => resultOf(cfg, v, wl));
+      if (cells.every((c) => !c)) continue;
+      rows.push([shortTitle(cfg, title), wl, ...cells.map((c) => (c ? fmt(c.medianNsPerOp) + tierMark(c) : '-'))]);
+    }
+  }
+  if (rows.length) {
+    console.log('## The floors, and the two mimics of wasmalloc\'s fast path\n');
+    console.log(
+      'Median ns/op of the harness allocators: bump (no free), one LIFO free list, 64 size-class lists keyed by the Layout, size classes recovered from a 64 KiB page header on free, then the mimics of wasmalloc\'s fast path: mimic_lean (a direct table pointing at a page header that holds only the free list head), mimic_u32 (plus a 32-bit used count, the free_is_zero byte and the flags test), mimic_nozero (a 16-bit used count and the flags test, no free_is_zero store) and mimic (wasmalloc\'s exact header traffic: 16-bit used count, free_is_zero store, flags test), against wasmalloc itself.\n'
+    );
+    console.log(table(['engine/tier', 'workload', 'bump', 'freelist', 'sizeclass', 'pages', 'mimic_lean', 'mimic_u32', 'mimic_nozero', 'mimic', 'wasmalloc'], rows));
+    console.log('');
+  }
+}
+
+// ---------------------------------------------------------------- footprint
+
+{
+  const foot = {}; // variant -> workload -> {start, before, after}
+  let any = false;
+  for (const v of VARIANTS) {
+    for (const wl of FOOTPRINT_WORKLOADS) {
+      const r = readJson(path.join(dir, `footprint-${v}-${wl}.json`));
+      if (!r || !r.results || !r.results.length) continue;
+      any = true;
+      foot[v] = foot[v] || {};
+      foot[v][wl] = { start: r.memoryPagesAtStart, before: r.results[0].pagesBefore, after: r.results[0].pagesAfter };
+    }
+  }
+  if (any) {
+    const present = VARIANTS.filter((v) => foot[v]);
+    console.log('## Footprint: memory.size after one workload in a fresh process\n');
+    console.log(
+      'Pages of 64 KiB. Each cell is `memory.size` after the workload ran its warm-up and timed calls in a process of its own (node --no-liftoff; the tier does not matter for footprint). "start" is `memory.size` right after instantiation, before any allocation: the linker-set initial memory. In parentheses, the ratio of the pages the workload added (after minus start) to what dlmalloc added.\n'
+    );
+    const dl = foot.dlmalloc || {};
+    const rows = [];
+    rows.push(['start', ...present.map((v) => fmt(Object.values(foot[v])[0].start, 0))]);
+    for (const wl of FOOTPRINT_WORKLOADS) {
+      const row = [wl];
+      for (const v of present) {
+        const c = foot[v][wl];
+        if (!c) {
+          row.push('-');
+          continue;
+        }
+        const added = c.after - c.start;
+        const dlAdded = dl[wl] ? dl[wl].after - dl[wl].start : null;
+        const ratio = dlAdded ? ` (${fmt(added / dlAdded, 2)}x)` : '';
+        row.push(`${fmt(c.after, 0)}${v === 'dlmalloc' ? '' : ratio}`);
+      }
+      rows.push(row);
+    }
+    console.log(table(['workload', ...present], rows));
+    console.log('');
+  }
+}
+
+// ---------------------------------------------------------------- sizes
+
+{
+  const rows = [];
+  let bump = null;
+  for (const v of VARIANTS) {
+    const r = readJson(path.join(dir, `size-${v}.json`));
+    if (!r) continue;
+    if (v === 'bump') bump = r;
+    rows.push(r);
+  }
+  if (rows.length) {
+    console.log('## Module size\n');
+    console.log(
+      'Bytes of the wasm32-unknown-unknown harness module (release profile: opt-level 3, fat LTO, one codegen unit, panic=abort, debuginfo stripped) before and after `wasm-opt -O3 --all-features`. The module contains the workloads and the parts of std they pull in, so the difference from the bump variant is the allocator\'s own contribution: its code plus any data segment its static state needs.\n'
+    );
+    console.log(
+      table(
+        ['variant', 'release bytes', 'functions', 'wasm-opt -O3 bytes', 'functions', 'over bump (wasm-opt)'],
+        rows.map((r) => [
+          r.variant,
+          r.releaseBytes.toLocaleString('en-US'),
+          r.releaseFunctions,
+          r.wasmoptBytes.toLocaleString('en-US'),
+          r.wasmoptFunctions,
+          bump ? (r.wasmoptBytes - bump.wasmoptBytes).toLocaleString('en-US') : '-',
+        ])
+      )
+    );
+    console.log('');
+  }
 }
 
 // ---------------------------------------------------------------- V8 12.4 vs 15.2
@@ -158,7 +280,7 @@ if (ratioRows.length) {
 {
   const rows = [];
   for (const v of VARIANTS) {
-    for (const wl of ['alloc_free_32', 'churn']) {
+    for (const wl of ['alloc_free_32', 'churn', 'random_actions', 'memory_grow_only']) {
       const a = resultOf('node-turbofan', v, wl);
       const b = resultOf('d8-turbofan', v, wl);
       const la = resultOf('node-liftoff', v, wl);
@@ -234,7 +356,7 @@ if (ratioRows.length) {
   const checks = fs.readdirSync(dir).filter((f) => /^flagcheck-.*\.json$/.test(f)).sort();
   const crow = [];
   for (const f of checks) {
-    const m = /^flagcheck-(node|d8)-(.*)-(sizeclass|dlmalloc)\.json$/.exec(f);
+    const m = /^flagcheck-(node|d8)-(.*)-(\w+)\.json$/.exec(f);
     const r = readJson(path.join(dir, f));
     if (!m || !r) continue;
     const af = r.results.find((x) => x.workload === 'alloc_free_32');
@@ -274,22 +396,26 @@ if (ratioRows.length) {
       ch,
     });
   }
+  const inspects = fs
+    .readdirSync(dir)
+    .filter((f) => /^shim-inspect-.*\.txt$/.test(f))
+    .sort()
+    .map((f) => fs.readFileSync(path.join(dir, f), 'utf8').trimEnd())
+    .filter((s) => s.length > 0);
   if (rows.length) {
     rows.sort(
-      (a, b) => a.variant.localeCompare(b.variant) || a.engine.localeCompare(b.engine) || a.profile.localeCompare(b.profile)
+      (a, b) => a.variant.localeCompare(b.variant) || a.profile.localeCompare(b.profile) || a.engine.localeCompare(b.engine)
     );
     console.log('## Shim indirection: build profile against the fast path\n');
     console.log(
-      'Median ns/op (min). release = opt-level 3, fat LTO, one codegen unit; -nolto = no LTO, 16 codegen units; -z = opt-level z; -wasmopt = the same file after wasm-opt -O3.\n'
+      'Median ns/op (min), optimizing tier on both V8 versions. release = opt-level 3, fat LTO, one codegen unit; -nolto = no LTO, 16 codegen units; -z = opt-level z; -wasmopt = the same file after wasm-opt -O3.\n'
     );
     const size = {};
-    try {
-      for (const line of fs.readFileSync(path.join(dir, 'shim-inspect.txt'), 'utf8').split('\n')) {
+    for (const text of inspects) {
+      for (const line of text.split('\n')) {
         const m = /^(\w+)-(\S+)\.wasm: (\d+) bytes/.exec(line);
         if (m) size[`${m[1]}-${m[2]}`] = parseInt(m[3], 10);
       }
-    } catch (e) {
-      // no inspection file
     }
     console.log(
       table(
@@ -305,13 +431,14 @@ if (ratioRows.length) {
       )
     );
     console.log('');
-    try {
-      console.log('### Call structure of the hot loops\n');
-      console.log('```');
-      console.log(fs.readFileSync(path.join(dir, 'shim-inspect.txt'), 'utf8').trimEnd());
-      console.log('```\n');
-    } catch (e) {
-      // no inspection file
-    }
+  }
+  if (inspects.length) {
+    console.log('### Call structure of the hot loops and the allocator shims\n');
+    console.log(
+      'From `wasm-tools print` after demangling: instruction count of each function and the functions it calls. A fast path that is inlined shows up as a loop with no call except the cold slow path (and `__rust_no_alloc_shim_is_unstable_v2`, an empty function std calls on every allocation).\n'
+    );
+    console.log('```');
+    console.log(inspects.join('\n\n'));
+    console.log('```\n');
   }
 }

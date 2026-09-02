@@ -1,0 +1,20 @@
+{
+  "engine": "d8",
+  "engineVersion": "V8 15.2.124",
+  "flags": null,
+  "note": null,
+  "wasm": "/home/bpowers/src/wasm-clalloc/.worktrees/roofline/bench/roofline/target/dist/wasmalloc-release.wasm",
+  "variant": "wasmalloc",
+  "memoryPagesAtStart": 20,
+  "tierup": {
+    "fn": "alloc_free_32",
+    "n": 10000,
+    "callsUntilTierUp": 9,
+    "itersUntilTierUp": 90000,
+    "gaveUpAfterCalls": null,
+    "tierAfter": "turbofan",
+    "liftoffNsPerOp": null,
+    "optimizedNsPerOp": 2.97035,
+    "checksum": 2693909253
+  }
+}
