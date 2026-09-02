@@ -65,6 +65,8 @@ PATH first: `export PATH="$HOME/.wasmtime/bin:$PATH"`.
 - Merge gate is fast on purpose: `cargo fmt --check`, `cargo clippy -D warnings`, host tests,
   wasm32-wasip1 tests under wasmtime, and the quick Kani harness set. It must stay well under
   a minute. Full benchmarks and long proofs run on demand, never as a gate.
+- GitHub Actions (`.github/workflows/ci.yml`) runs the same gate, plus an MSRV check and a build
+  of the roofline harness, on every push to `main` and every pull request.
 - Commit messages: imperative subject, body explains why. No emoji anywhere (commits, docs,
   code). No "Generated with Claude Code" or "Co-Authored-By" trailers.
 - Comments explain why or something non-obvious, never restate the next line of code.

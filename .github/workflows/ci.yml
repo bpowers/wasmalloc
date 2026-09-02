@@ -1,0 +1,133 @@
+# The merge gate from CLAUDE.md, run on GitHub-hosted runners: formatting and lints, host and
+# wasm32-wasip1 tests, the wasm32 release build, and the quick Kani set; plus an MSRV check and
+# a build of the roofline harness so neither can rot. Benchmarks and the full Kani set stay
+# on demand (bench/roofline/run-all.sh, scripts/kani-full).
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+# A newer push to the same branch or pull request supersedes the run in flight.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Pinned so a run is reproducible; bump on purpose. wasmtime is the wasm32-wasip1 test
+  # runner named in .cargo/config.toml. Kani's version fixes the nightly it verifies with.
+  WASMTIME_VERSION: 48.0.1
+  KANI_VERSION: 0.67.0
+
+jobs:
+  lint:
+    name: Format and lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown,wasm32-wasip1
+          components: rustfmt,clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo clippy --target wasm32-unknown-unknown -- -D warnings
+      - run: cargo clippy --target wasm32-wasip1 --all-targets -- -D warnings
+
+  msrv:
+    name: MSRV 1.85 check
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.85
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      # Library only: the tests and their helpers may use newer Rust than the crate promises.
+      - run: cargo check --lib
+      - run: cargo check --lib --target wasm32-unknown-unknown
+
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown,wasm32-wasip1,wasm32-wasip2
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - name: Install wasmtime ${{ env.WASMTIME_VERSION }}
+        run: |
+          dir="wasmtime-v${WASMTIME_VERSION}-x86_64-linux"
+          curl --proto '=https' --tlsv1.2 -sSfL --retry 5 \
+            "https://github.com/bytecodealliance/wasmtime/releases/download/v${WASMTIME_VERSION}/${dir}.tar.xz" \
+            | tar -xJ -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/$dir" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/$dir/wasmtime" --version
+      - run: cargo test
+      - run: cargo test --target wasm32-wasip1
+      - run: cargo check --target wasm32-wasip2
+      - run: cargo build --release --target wasm32-unknown-unknown
+
+  kani:
+    name: Kani quick set
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    continue-on-error: false
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Restore the Kani installation
+        id: kani-cache
+        uses: actions/cache@v6
+        with:
+          # Everything `cargo install` and `cargo kani setup` produce: the proxy binaries, the
+          # release bundle (kani-driver, kani-compiler, CBMC, the instrumented library) and the
+          # pinned nightly toolchain the bundle links against. On a hit the install step is
+          # skipped entirely, so the proxies need not be re-registered with cargo.
+          path: |
+            ~/.cargo/bin/cargo-kani
+            ~/.cargo/bin/kani
+            ~/.kani
+            ~/.rustup/toolchains/nightly-*
+          key: kani-${{ runner.os }}-${{ env.KANI_VERSION }}
+      - name: Install Kani ${{ env.KANI_VERSION }}
+        if: steps.kani-cache.outputs.cache-hit != 'true'
+        run: |
+          cargo install --locked kani-verifier --version "$KANI_VERSION"
+          cargo kani setup
+      - run: cargo kani --version
+      # scripts/kani wraps `cargo kani` in scripts/memlimit. ubuntu-latest has a systemd user
+      # session, so the cgroup cap applies there (the journal is not readable, so no peak
+      # memory is reported); anywhere without systemd-run the wrapper falls back to prlimit.
+      - run: scripts/kani-quick
+
+  roofline:
+    name: Roofline harness builds
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: bench/roofline
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: bench/roofline
+      - run: cargo build --release --target wasm32-unknown-unknown --features wasmalloc

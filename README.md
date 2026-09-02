@@ -1,4 +1,4 @@
-# wasmalloc
+# wasmalloc [![CI](https://github.com/bpowers/wasmalloc/actions/workflows/ci.yml/badge.svg)](https://github.com/bpowers/wasmalloc/actions/workflows/ci.yml)
 
 wasmalloc is a memory allocator for Rust programs compiled to WebAssembly: a single-threaded
 reimplementation of [mimalloc](https://github.com/microsoft/mimalloc) v3's design in pure Rust.
