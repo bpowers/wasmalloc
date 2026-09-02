@@ -256,32 +256,32 @@ impl<M: Memory, const WORDS: usize> Heap<M, WORDS> {
     #[inline(always)]
     pub unsafe fn dealloc(&mut self, ptr: NonNull<u8>, layout: Layout) {
         let addr = ptr.addr().get();
-        let mut size = layout.size();
         let align = layout.align();
-        if align <= MAX_NATURAL_ALIGN {
-            if align > WORD {
-                // The same rounding as `alloc` and `bins::classify`: the page kind is a function
-                // of the rounded size, and every block of a small page masks to its header
-                // whatever its alignment, so aligned frees need not leave the fast path.
-                size = (size + align - 1) & !(align - 1);
-            }
-            if size <= SMALL_MAX_OBJ_SIZE {
-                // Small page: classify(layout) is Bin(b) with kind Small, and bins::block_start
-                // plus the small page alignment put every block strictly inside its page.
-                let page = self
-                    .mem
-                    .ptr(page::header_of(PageKind::Small, addr))
-                    .cast::<Page>();
-                // SAFETY: by the precondition `addr` is a live block of the small page at the
-                // masked address, which is a page of this heap.
-                unsafe {
-                    page::push(page, &self.mem, addr);
-                    if needs_transition(page) {
-                        self.dealloc_transition(page);
-                    }
+        // The page kind is a function of the size rounded up to the alignment, as `alloc` and
+        // `bins::classify` round it, and every block of a small page masks to its header
+        // whatever its alignment, so aligned frees need not leave the fast path. The rounded
+        // size itself is not needed: for a power-of-two `align`, `round_up(size, align) <= L`
+        // is `size <= round_down(L, align)`, one mask on the constant (Kani
+        // `dealloc_fast_path_agrees_with_classify`). Written as the rounding, LLVM computed it
+        // on every free and selected between the two sizes, seven instructions the common
+        // word-aligned free did not need.
+        let small_limit = SMALL_MAX_OBJ_SIZE & align.wrapping_neg();
+        if align <= MAX_NATURAL_ALIGN && layout.size() <= small_limit {
+            // Small page: classify(layout) is Bin(b) with kind Small, and bins::block_start
+            // plus the small page alignment put every block strictly inside its page.
+            let page = self
+                .mem
+                .ptr(page::header_of(PageKind::Small, addr))
+                .cast::<Page>();
+            // SAFETY: by the precondition `addr` is a live block of the small page at the
+            // masked address, which is a page of this heap.
+            unsafe {
+                page::push(page, &self.mem, addr);
+                if needs_transition(page) {
+                    self.dealloc_transition(page);
                 }
-                return;
             }
+            return;
         }
         // SAFETY: same contract as this function.
         unsafe { self.dealloc_generic(ptr, layout) }
@@ -2199,9 +2199,11 @@ mod verify {
         assert!((start * SLICE_SIZE) & (align - 1) == 0);
     }
 
-    /// The `dealloc` fast path decides "small page" from the size rounded up to the alignment;
-    /// that agrees with `classify`, which `alloc` used, for every Layout that reaches the test,
-    /// and `alloc`'s direct-table index picks the same bin as `classify`.
+    /// The `dealloc` fast path decides "small page" by comparing the size against the small
+    /// limit rounded down to the alignment, which is the same as comparing the size rounded up
+    /// to the alignment against the limit; that agrees with `classify`, which `alloc` used, for
+    /// every Layout that reaches the test, and `alloc`'s direct-table index picks the same bin
+    /// as `classify`.
     #[kani::proof]
     fn dealloc_fast_path_agrees_with_classify() {
         let size: usize = kani::any();
@@ -2217,7 +2219,9 @@ mod verify {
         } else {
             size
         };
-        let small = rounded <= SMALL_MAX_OBJ_SIZE;
+        // The test as `dealloc` writes it, without the rounding.
+        let small = size <= (SMALL_MAX_OBJ_SIZE & align.wrapping_neg());
+        assert!(small == (rounded <= SMALL_MAX_OBJ_SIZE));
         match bins::classify(layout) {
             Class::Bin(b) => {
                 assert!(small == (kind_of_bin(b) == PageKind::Small));

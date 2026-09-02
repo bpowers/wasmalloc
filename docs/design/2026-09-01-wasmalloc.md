@@ -509,3 +509,17 @@ run, the code the bench executes). Baseline: main at afc0e2c (byte-identical to 
    14.50/19.99/14.51/13.97, realloc_doubling 632/827/644/628 -> 640/810/623/609. Kept for the
    4 to 7 percent on the workloads with requests in that range; the simlin gain is real but
    at the resolution limit.
+
+3. **`dealloc` decides the page kind without rounding** (profile rank 3, section 5.2). The fast
+   path tested `round_up(size, align) <= SMALL_MAX_OBJ_SIZE`, and LLVM computed the rounding on
+   every free and selected between the two sizes: `lea, sub, mov, neg, and, mov, cmp, cmova`
+   before the compare, for the 54 aligned requests per simlin compile. For a power-of-two
+   alignment the same test is `size <= SMALL_MAX_OBJ_SIZE & -align` (the limit rounded down;
+   for `align <= WORD` it is the limit itself), proved equal to the rounded test and to
+   `classify`'s kind for every Layout in `dealloc_fast_path_agrees_with_classify`.
+   `__rust_dealloc` 68 -> 59 wasm instructions and no `select`; V8 TurboFan 248 -> 228 bytes,
+   the predicate `mov, neg, and, cmp, jc` (5 instructions, was 10), the dealloc path inlined
+   into 103 callers (was 100). simlin compile against change 2: paired difference +0.3 ms
+   (IQR -7.8 to 7.0, n = 20), that is nothing, as the profile predicted (under 0.1 ns per
+   free). Roofline flat on every engine (largest move random_actions 14.54 -> 14.40 on n24
+   TurboFan, within the run-to-run spread). Kept for the shorter shim.

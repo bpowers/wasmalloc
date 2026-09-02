@@ -271,10 +271,13 @@ Blocks: in `dealloc`, the `page::push` on the masked header, `needs_transition` 
 - Invariants relied on: the block's page has the kind `classify(layout)` names and the block
   lies inside it (page invariant 2, `bins`); page invariants for that page; heap invariant 1
   (full-queue membership is exactly the flag) for `dealloc_transition`.
-- Proof sketch. Rounding as in HEAP-01. Kind: for every Layout with `align <=
-  MAX_NATURAL_ALIGN`, `rounded <= SMALL_MAX_OBJ_SIZE` holds exactly when `classify(layout)` is a
-  bin of kind `Small` (Kani `dealloc_fast_path_agrees_with_classify`), and Layouts with a larger
-  alignment skip the fast path and are classified in `dealloc_generic`; `alloc` served the
+- Proof sketch. Kind: the fast path tests `layout.size() <= SMALL_MAX_OBJ_SIZE &
+  align.wrapping_neg()`, the small limit rounded down to the alignment, which for a power-of-two
+  `align` holds exactly when the size rounded up to `align` (the rounding `alloc` and
+  `bins::classify` perform, HEAP-01) is at most `SMALL_MAX_OBJ_SIZE`, and that holds exactly
+  when `classify(layout)` is a bin of kind `Small`, for every Layout with `align <=
+  MAX_NATURAL_ALIGN` (both equivalences in Kani `dealloc_fast_path_agrees_with_classify`);
+  Layouts with a larger alignment skip the fast path and are classified in `dealloc_generic`; `alloc` served the
   request by the same classification (HEAP-01, HEAP-04), and an in-place `realloc` keeps the
   page kind equal to the kind of the Layout it hands back (HEAP-03). So the mask
   `header_of(kind, addr)` uses the page size of the block's actual page, and because every block
@@ -307,7 +310,11 @@ Blocks: in `dealloc`, the `page::push` on the masked header, `needs_transition` 
   requests), the model tester and the fuzz targets. Miri as above.
 - Not machine-checked by Kani: medium pages and the run branch of `dealloc_generic` (the model
   has one small page); tests only.
-- Reviewer: adversarial-reviewer, 2026-09-02: accepted.
+- Changes: 2026-09-02, tuning-c: the fast-path condition compares the size against the masked
+  limit instead of rounding the size (safe arithmetic before the unsafe block, proved equal in
+  the harness above); the unsafe blocks are unchanged. `freeing_any_live_block_preserves_invariants`
+  and `a_free_brings_a_full_page_back_to_its_queue` re-run.
+- Reviewer: adversarial-reviewer, 2026-09-02: accepted; the tuning-c change awaits a fresh look.
 
 ### HEAP-03: `Heap::realloc`
 
