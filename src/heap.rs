@@ -1992,6 +1992,123 @@ mod tests {
         validate(h);
     }
 
+    /// Why the retirement countdown cannot move the footprint of a small heap: a workload in
+    /// the shape of the roofline's `random_actions` (talc's benchmark: sizes 1 to 10,000 biased
+    /// small, alignment 8 to 64, a floor of 100 live objects, one action in seven a realloc) on
+    /// a heap that starts like a `wasm32-unknown-unknown` module (20 slices of stack and data,
+    /// heap base inside slice 17) with the default growth policy. Every time memory grows the
+    /// test takes a census of the bin queues and asserts that no queue holds an empty page:
+    /// `acquire_run` released them all before asking for memory, so whatever countdown a
+    /// retired page carried, it was gone by the time the footprint was decided. The census
+    /// lines (`--nocapture`) show what the footprint is made of instead: one page per touched
+    /// bin, most of them far from full, then the growth step (tuning log, 2026-09-02,
+    /// footprint).
+    #[test]
+    fn a_small_heap_holds_no_empty_page_when_it_grows() {
+        let mut f = heap(1024, 20, 17 * SLICE_SIZE + 100);
+        let h = &mut f.heap;
+        h.set_grow_policy(GrowPolicy::DEFAULT);
+        let mut state = 0x7a1c_0000_5eed_0002u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut below = |n: u64| (next() >> 11) % n;
+        let mut live: Vec<(NonNull<u8>, Layout)> = Vec::new();
+        let mut grows = 0;
+        let mut end = h.mem.size_slices();
+        let start = end;
+        for _ in 0..100_000 {
+            let action = if live.len() < 100 { 0 } else { below(7) };
+            unsafe {
+                if action < 3 {
+                    let bound = 1 + below(10_000);
+                    let size = 1 + below(bound) as usize;
+                    let shift = 3 + ((below(1 << 16) as u16).trailing_zeros() / 2).min(3);
+                    let l = layout(size, 1 << shift);
+                    let p = h.alloc(l).unwrap();
+                    live.push((p, l));
+                } else if action < 6 {
+                    let i = below(live.len() as u64) as usize;
+                    let (p, l) = live.swap_remove(i);
+                    h.dealloc(p, l);
+                } else {
+                    let i = below(live.len() as u64) as usize;
+                    let (p, l) = live[i];
+                    let bound = 1 + below(10_000);
+                    let new_size = 1 + below(bound) as usize;
+                    let q = h.realloc(p, l, new_size).unwrap();
+                    live[i] = (q, layout(new_size, l.align()));
+                }
+            }
+            let now = h.mem.size_slices();
+            if now == end {
+                continue;
+            }
+            grows += 1;
+            // The census: every page of every bin queue and of the full queue, by bin.
+            let mut pages = 0;
+            let mut slices = 0;
+            let mut empty = 0;
+            let mut bins = 0;
+            let mut one_block = 0;
+            let mut live_bytes_in_pages = 0usize;
+            for qi in 1..=MAX_BIN as usize {
+                let mut cur = h.queues[qi].first;
+                let mut in_bin = 0;
+                while cur != 0 {
+                    let page = h.page_at(cur);
+                    unsafe {
+                        let used = (*page).used as usize;
+                        empty += (used == 0) as usize;
+                        one_block += (used == 1) as usize;
+                        live_bytes_in_pages += used * (*page).block_size as usize;
+                        slices += page::kind(page).page_size() / SLICE_SIZE;
+                        cur = (*page).next;
+                    }
+                    in_bin += 1;
+                }
+                let mut cur = h.queues[FULL_QUEUE].first;
+                while cur != 0 {
+                    let page = h.page_at(cur);
+                    unsafe {
+                        if (*page).bin as usize == qi {
+                            live_bytes_in_pages +=
+                                (*page).used as usize * (*page).block_size as usize;
+                            slices += page::kind(page).page_size() / SLICE_SIZE;
+                            in_bin += 1;
+                        }
+                        cur = (*page).next;
+                    }
+                }
+                pages += in_bin;
+                bins += (in_bin > 0) as usize;
+            }
+            let live_bytes: usize = live.iter().map(|(_, l)| l.size()).sum();
+            std::eprintln!(
+                "grow {grows}: +{} slices, {} grown so far: {pages} pages ({slices} slices) in {bins} bins, {one_block} with one block, {} free slices, {} live blocks, {live_bytes} live bytes ({} in the pages' block sizes, {} slices if packed)",
+                now - end,
+                now - start,
+                h.free_slices(),
+                live.len(),
+                live_bytes_in_pages,
+                live_bytes.div_ceil(SLICE_SIZE)
+            );
+            assert_eq!(
+                empty, 0,
+                "an empty page survived the release before growth {grows}"
+            );
+            end = now;
+        }
+        assert!(grows >= 3, "the workload grew memory {grows} times");
+        for (p, l) in live {
+            unsafe { h.dealloc(p, l) };
+        }
+        validate(h);
+    }
+
     /// Sizes above the direct table's range and up to the binned limit are served from the
     /// head of their bin's queue without the generic path's bookkeeping once the queue has a
     /// page with a free block; a queue head without one, or a request outside that range, still
