@@ -287,15 +287,12 @@ to try, each behind a benchmark and a proof, roughly in order of expected payoff
 2. **Fold `free_is_zero` into the flags byte.** The dealloc fast path currently stores a byte on
    every free; the flags byte is already loaded, so the clear can move to the slow path and run
    once per page.
-3. **Shrink the fixed footprint of small heaps.** Mostly done (tuning log, 2026-09-02): the
-   256 KiB medium page, the eighth-heap growth step from the first grow (floor two slices, was
-   1 MiB) and releasing retired pages before growth took the batch profiles from 18 to 29x peak
-   live bytes to 3.7 to 4.6x and the trivial workloads to dlmalloc's footprint plus one page.
-   What remains is one 64 KiB page per touched bin (37 pages before any object is counted in
-   random_actions, 2.3 MiB of the fishbanks heap's 3.9); the footprint entry of the tuning log,
-   item 4, lays out the sub-slice ("tiny") page design that would halve it, its expected
-   saving and its cost. A 128 KiB medium page was measured and rejected there. Reclaiming the
-   partial slice below the first page for metadata is still open.
+3. **Shrink the fixed footprint of small heaps: done as far as it goes.** The 1 MiB first grow
+   was most of the cost and is gone (tuning log, footprint pass); retirement provably cannot
+   hold empty pages at growth time; 128 KiB medium pages were measured and rejected. The
+   remaining 2x on tiny heaps is one page per touched size class, and the only lever left, a
+   16 KiB page kind for the smallest bins, was analysed and closed by the project owner as not
+   worth a fast-path compare: small-heap footprint at this level is acceptable.
 4. **Bump allocation in fresh pages.** mimalloc found no gain natively (page.c:627); under V8
    the tradeoff between a free-list pop and a bump-and-compare may differ. Measure.
 5. **Liftoff-tier and `opt-level = "z"` behaviour.** Consumers like simlin build at `-Oz`; V8
