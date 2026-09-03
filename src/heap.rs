@@ -26,12 +26,14 @@
 //!
 //! An empty page is retired rather than freed (mimalloc's `MI_RETIRE_CYCLES` scheme, see
 //! [`RETIRE_CYCLES`]) so that a size class that oscillates between empty and one block keeps
-//! its page; retired pages age at each collection (every [`GENERIC_COLLECT_PERIOD`] slow-path
-//! allocations and before a fresh page is taken) and are released when their count runs out.
+//! its page; retired pages age at each collection (every [`GENERIC_COLLECT_PERIOD`] page
+//! searches and before a fresh page is taken) and are released when their count runs out.
 //! They are also all released before linear memory is grown, whatever their count: growth is
-//! permanent footprint on wasm, a released page is only a page initialisation away. That release
-//! walks every bin queue rather than the retired range and its window, so it does not depend on
-//! the countdown bookkeeping, which the fast paths do not maintain (`Heap::release_empty_pages`).
+//! permanent footprint on wasm, a released page is only a page initialisation away. Both roads
+//! that grow memory run that release: `acquire_run`, for a page or a fresh run, and the
+//! in-place growth of a run at the top of the heap in [`Heap::realloc`]. The release walks
+//! every bin queue rather than the retired range and its window, so it does not depend on the
+//! countdown bookkeeping, which the fast paths do not maintain (`Heap::release_empty_pages`).
 //!
 //! # Fast paths
 //!
@@ -90,7 +92,10 @@ const RETIRE_MAX_PAGES: usize = 3;
 /// Candidate pages inspected after the first usable one when searching a queue
 /// (`mi_option_page_max_candidates`).
 const MAX_CANDIDATES: usize = 4;
-/// Retired pages are collected every this many slow-path allocations.
+/// Retired pages age every this many page searches: entries of `alloc_generic` that the bin
+/// queue's head cannot serve. A request above the direct table whose queue head has a free
+/// block is served without counting, so under such workloads the aging walk runs less often;
+/// what bounds the footprint is the release before memory grows, not this walk.
 const GENERIC_COLLECT_PERIOD: u32 = 1000;
 /// The largest bin the direct table serves; larger bins are found through their queue head.
 const DIRECT_MAX_BIN: u8 = bins::bin(DIRECT_MAX_SIZE);
@@ -317,8 +322,8 @@ impl<M: Memory, const WORDS: usize> Heap<M, WORDS> {
         let new_class = bins::classify(new_layout);
         match (bins::classify(layout), new_class) {
             // Same block if it fits. Shrinking in place is only allowed within the same page
-            // kind (the next dealloc recomputes the kind from the new Layout) and, as in
-            // mimalloc, only while the block stays at least half used.
+            // kind (the next dealloc recomputes the kind from the new Layout) and only down
+            // to half of the bin of the Layout the caller holds; see `fits_in_place`.
             (Class::Bin(old), Class::Bin(new)) if fits_in_place(old, new, new_size) => {
                 return Some(ptr);
             }
@@ -335,12 +340,24 @@ impl<M: Memory, const WORDS: usize> Heap<M, WORDS> {
                 }
                 // In place through the free slices after the run and, when the run is at the
                 // top of the heap, through memory.grow; the copy below is the last resort.
+                let extra = new_n - old_n;
+                if self.slices.try_extend(start, old_n, extra).is_some() {
+                    return Some(ptr);
+                }
+                // The map alone cannot extend the run, so what follows is a memory.grow (the
+                // run is at the top of the heap) or a move. Every empty page is released
+                // first, as `acquire_run` does before it grows memory: a grow is footprint
+                // for good (review finding R2-1), and when the slice in the run's way is an
+                // empty page, the release lets the run grow into it instead of moving.
+                // SAFETY: heap invariants hold between operations, and no page pointer is
+                // held here: the block is a run, which the walk never touches.
+                unsafe { self.release_empty_pages() };
                 if slices::extend_with_growth(
                     &mut self.slices,
                     &mut self.mem,
                     start,
                     old_n,
-                    new_n - old_n,
+                    extra,
                     &self.policy,
                 )
                 .is_some()
@@ -737,10 +754,11 @@ impl<M: Memory, const WORDS: usize> Heap<M, WORDS> {
     }
 
     /// Release every empty page of every bin queue and un-retire the pages in use, whatever the
-    /// retired range and the countdowns say. Runs before linear memory is grown: a grow is
-    /// footprint for good, a released page costs one page initialisation if its bin comes back,
-    /// and a walk over every page (one header read each) is cheap next to the tens of
-    /// microseconds a `memory.grow` costs in V8.
+    /// retired range and the countdowns say. Runs before linear memory is grown, from
+    /// [`acquire_run`](Self::acquire_run) and from the in-place growth of a run in
+    /// [`realloc`](Self::realloc): a grow is footprint for good, a released page costs one page
+    /// initialisation if its bin comes back, and a walk over every page (one header read each)
+    /// is cheap next to the tens of microseconds a `memory.grow` costs in V8.
     ///
     /// Walking every queue that holds a page (heap invariant 5), rather than the retired range
     /// and its three-page window as [`collect_retired`](Self::collect_retired) does, is what
@@ -980,8 +998,14 @@ fn direct_size(layout: Layout) -> usize {
 /// bin `new` (the in-place decision of [`Heap::realloc`], kept pure so a proof can quantify over
 /// every pair of Layouts). Growing never fits: bins are tight, so `new > old` means the request
 /// exceeds the block. Shrinking stays in place only within the page kind, because the next
-/// `dealloc` recomputes the kind from the new Layout and masks the address with it, and, as in
-/// mimalloc, only while the block stays at least half used.
+/// `dealloc` recomputes the kind from the new Layout and masks the address with it, and only
+/// while `new_size` is at least half of `bin_size(old)`. That bound is half of the bin of the
+/// Layout the caller holds, not half of the block: after an in-place shrink the block may
+/// belong to a larger bin than the Layout names, so a chain of shrinks, each above half of the
+/// current bin, can walk a block down through every bin of its kind and hold a Layout far
+/// below the block's size until it is freed (review finding R2-3; mimalloc bounds by half of
+/// the block's usable size instead). Sound either way, since the block is always at least the
+/// Layout's bin; the difference is footprint.
 ///
 /// `#[inline(always)]`, like [`huge_slices`] and the `bins` arithmetic: at `opt-level = "z"`
 /// these were out-of-line calls on every `realloc` (`docs/research/simlin-profile.md`, 6).
@@ -1730,6 +1754,49 @@ mod tests {
                 "the old run is free again"
             );
             h.dealloc(r, layout(12 * SLICE_SIZE, 8));
+        }
+        validate(h);
+    }
+
+    /// The in-place growth of a run runs the release walk when the free slices after the run
+    /// cannot serve it, before memory is grown or the block moves (review finding R2-1). Here
+    /// the slice in the run's way is an empty, retired page: the walk frees it and the run
+    /// grows into its slice, no copy and no `memory.grow`. Before the change the run moved: the
+    /// page went only with the move's `acquire_run`, and memory grew by a whole run for a
+    /// block that could have stayed where it was.
+    #[test]
+    fn a_run_grows_in_place_into_an_empty_page_released_before_growth() {
+        let mut f = heap(64, 4, 0);
+        let h = &mut f.heap;
+        let three = layout(3 * SLICE_SIZE, 8);
+        let small = layout(16, 8);
+        let qi = bins::bin(16) as usize;
+        unsafe {
+            let r = h.alloc(three).unwrap();
+            let start = r.as_ptr() as usize / SLICE_SIZE;
+            fill(r, three.size(), 0x31);
+            // The fourth and last initial slice becomes a page, then an empty, retired one.
+            let a = h.alloc(small).unwrap();
+            let page = page::header_of(PageKind::Small, a.as_ptr() as usize);
+            assert_eq!(page / SLICE_SIZE, start + 3);
+            h.dealloc(a, small);
+            assert_eq!(h.queues[qi].count, 1, "retired, not freed");
+            assert_eq!(h.free_slices(), 0);
+            let end = h.mem.size_slices();
+            let r2 = h.realloc(r, three, 4 * SLICE_SIZE).unwrap();
+            assert_eq!(
+                r2, r,
+                "the run grew in place into the released page's slice"
+            );
+            check(r2, three.size(), 0x31);
+            assert_eq!(h.mem.size_slices(), end, "no memory.grow");
+            assert_eq!(h.queues[qi].count, 0, "the empty page is gone");
+            assert_eq!(h.free_slices(), 0);
+            for s in 0..4 {
+                assert!(!h.slices.is_free(start + s));
+            }
+            validate(h);
+            h.dealloc(r2, layout(4 * SLICE_SIZE, 8));
         }
         validate(h);
     }

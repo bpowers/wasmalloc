@@ -17,6 +17,14 @@ that model to every bin, kind and backend is the pen-and-paper part below.
 Entries are grouped by module. Page invariants 1 to 5 refer to the numbered list at the top of
 `src/page.rs`.
 
+Running the harnesses an entry names: only through `scripts/kani` (never bare `cargo kani`), and
+the structural heap harnesses one per invocation, as `scripts/kani-full` runs every harness. One
+`cargo kani` invocation runs its harnesses sequentially in one scope, and CBMC's residue
+accumulates across them, so two structural heap harnesses that each verify alone at 4 GiB in
+under a minute are OOM-killed together at the same cap (R2-2, below). The arithmetic, bins, page
+and slices harnesses are small enough to share an invocation, which is how `scripts/kani-quick`
+runs the gate's set.
+
 ## page
 
 ### PAGE-01: `page::init`, the header write
@@ -199,7 +207,10 @@ Heap invariants 1 to 5 refer to the numbered list at the top of `src/heap.rs`; p
 given. The structural heap harnesses run the real heap over a proof-only memory of one small
 page of bin 36 (`HeapModel`) or of three bare page headers of bin 16 (`QueueModel`); the model
 and its limits are described in the `heap::verify` module documentation, and where a block's
-proof rests on tests only, the entry says so.
+proof rests on tests only, the entry says so. Where an entry says a structural harness was
+re-run, it was run in its own `scripts/kani` invocation (`scripts/kani --harness <name>`); see
+the note at the top of this ledger and R2-2 for why two of them in one invocation do not fit
+under the 4 GiB cap.
 
 A requirement every entry below relies on and that the `Memory` trait documentation now states
 explicitly (2026-09-02): `mem.ptr(a)` returns a pointer whose address is exactly `a`. The heap
@@ -340,8 +351,9 @@ Blocks: in `dealloc`, the `page::push` on the masked header, `needs_transition` 
 
 ### HEAP-03: `Heap::realloc`
 
-Blocks: `Layout::from_size_align_unchecked`, the `self.alloc(new_layout)` for a move, and the
-`copy_nonoverlapping` followed by `self.dealloc(ptr, layout)`.
+Blocks: `Layout::from_size_align_unchecked`, the `release_empty_pages()` before a run is grown
+through memory or moved, the `self.alloc(new_layout)` for a move, and the `copy_nonoverlapping`
+followed by `self.dealloc(ptr, layout)`.
 
 - Preconditions: as HEAP-02 for `ptr` and `layout`; `new_size != 0` and `new_size` rounded up
   to `layout.align()` does not overflow `isize` (the `GlobalAlloc::realloc` contract).
@@ -357,13 +369,22 @@ Blocks: `Layout::from_size_align_unchecked`, the `self.alloc(new_layout)` for a 
   contract (the alignment is a Layout's, hence a power of two). In place within a page:
   `fits_in_place(old, new, new_size)` implies `kind_of_bin(old) == kind_of_bin(new)` and
   `bin_size(old) >= round_up(new_size, align)` (Kani `realloc_in_place_keeps_the_kind_and_fits`,
-  over every pair of Layouts with `align <= MAX_NATURAL_ALIGN`), so the block holds every byte
+  over every pair of Layouts with `align <= MAX_NATURAL_ALIGN`; its shrink bound is half of
+  `bin_size(old)`, the bin of the Layout the caller holds, not half of the block, which may be
+  larger after earlier in-place shrinks, R2-3), so the block holds every byte
   the caller may use through the new Layout and a later `dealloc` or `realloc` with it masks with
   the same page size (HEAP-02); the alignment is unchanged. In place within a run: the length
   becomes `huge_slices(new_layout)`, which a later `dealloc` with the new Layout recomputes;
-  `shrink` releases slices of the run itself, `extend_with_growth` claims only free slices
-  directly after it or freshly grown ones (proved in `slices::verify`), and both leave the
-  run's own slices claimed. The move: `alloc_huge` or `alloc` returns a block of at least
+  `shrink` releases slices of the run itself, `try_extend` and `extend_with_growth` claim only
+  free slices directly after it or freshly grown ones (proved in `slices::verify`), and all
+  three leave the run's own slices claimed. When `try_extend` cannot serve a growth from the
+  map, `release_empty_pages` runs before `extend_with_growth` grows memory or the block moves
+  (R2-1): its precondition (heap invariants, no page pointer held, HEAP-07) holds because the
+  block is a run, not a page, and `realloc` refers to no page at that point; the walk frees the
+  slices of empty pages and clears countdowns, touching neither the run nor its Layout, so
+  `extend_with_growth`'s arguments still describe a handed-out run, and a released page's
+  slices right after the run are exactly free slices `try_extend` may then claim. The move:
+  `alloc_huge` or `alloc` returns a block of at least
   `new_size` bytes taken from a free list or from free slices, so disjoint from the live old
   block; `min(layout.size(), new_size)` bytes fit in both; `copy_nonoverlapping` is therefore
   in bounds on both sides and non-overlapping; `dealloc(ptr, layout)` then frees the old block
@@ -377,8 +398,12 @@ Blocks: `Layout::from_size_align_unchecked`, the `self.alloc(new_layout)` for a 
   `slices::slices_try_extend_claims_exactly_the_tail`; tests
   `realloc_within_a_bin_returns_the_same_block`, `huge_alloc_free_and_realloc_in_place`,
   `realloc_grows_a_top_run_through_memory_growth`, `a_run_that_cannot_extend_moves_to_the_top_of_the_heap`,
+  `a_run_grows_in_place_into_an_empty_page_released_before_growth` (the walk frees the page in
+  the run's way and the run grows into it without a copy or a grow),
   `realloc_preserves_contents_across_classes`, the churn test's realloc step, the model tester
-  (content checks across every move). Miri as above.
+  (content checks across every move), and in `tests/review_edge_cases.rs`
+  `in_place_run_growth_releases_every_empty_page_before_memory_grows` (the R2-1 reproducer,
+  asserting the property). Miri as above.
 - Not machine-checked by Kani: the copy on a move (the model has no block bodies); tests and
   the model tester check contents.
 - Changes: 2026-09-02, tuning-c: the direct-index shortcut above (safe code before the unsafe
@@ -386,6 +411,10 @@ Blocks: `Layout::from_size_align_unchecked`, the `self.alloc(new_layout)` for a 
   `bins::classify`, `fits_in_place` and `huge_slices` (no semantic change; at `opt-level = "z"`
   they were out-of-line calls with an sret round trip through the shadow stack, see
   `docs/research/simlin-profile.md` section 6). The unsafe blocks are unchanged.
+  2026-09-02, R2-1: the Huge-to-Huge growth tries the map alone first (`try_extend`), then
+  releases every empty page (`release_empty_pages`, a new unsafe call in this function) before
+  `extend_with_growth` grows memory or the block moves; the other unsafe blocks are unchanged.
+  The heap harnesses named under HEAP-07 were re-run, one per invocation. Awaits a fresh look.
 - Reviewer: adversarial-reviewer, 2026-09-02: accepted; the tuning-c change awaits a fresh look.
 - Reviewer: adversarial-reviewer-2, 2026-09-02: accepted. On the shortcut: it fires for a proper
   subset of the pairs whose block size is unchanged (two sizes in adjacent slots of one bin, such as
@@ -616,7 +645,9 @@ assertion that the candidate is not empty), the `extend` of the candidate, the
   walk, visits at most `RETIRE_MAX_PAGES` members of each bin queue in the retired range, all
   live, reads `next` before any change, decrements `retire_expire` only when non-zero, and
   frees only empty pages; the range is clipped to `MAX_BIN`. `release_empty_pages`, which
-  `acquire_run` runs before memory is grown, walks every member of every bin queue that holds a
+  `acquire_run` runs before memory is grown for a page or a fresh run and `Heap::realloc` runs
+  before a run at the top of the heap is grown in place through memory or moved (HEAP-03),
+  walks every member of every bin queue that holds a
   page (the set bits of `occupied & BIN_QUEUE_BITS`, heap invariant 5, so the walk costs the
   pages that exist; `queue_index` keeps the queue index in bounds), reads `next` first, frees
   every empty page and clears the countdown of every other member, then empties the range,
@@ -643,10 +674,14 @@ assertion that the candidate is not empty), the `extend` of the candidate, the
   `the_release_before_growth_frees_every_empty_page_whatever_its_position` (an empty page
   beyond the window with a countdown and an empty range, and one with no countdown at all, both
   freed), `retire_refreshes_the_countdown_and_the_range_of_a_retired_page`,
-  `page_exhaustion_adds_pages_and_full_queue_round_trips`, the churn test (a full release at
-  the end), `tests/review_edge_cases.rs` (`an_emptied_page_behind_three_others_is_released_before_memory_grows`,
-  the R-2 reproducer, no longer ignored, and `a_page_reused_through_the_direct_table_is_still_released`),
-  the model tester and the fuzz targets. Miri as above.
+  `page_exhaustion_adds_pages_and_full_queue_round_trips`,
+  `a_run_grows_in_place_into_an_empty_page_released_before_growth` (the walk from `realloc`
+  frees the page in a run's way), the churn test (a full release at the end),
+  `tests/review_edge_cases.rs` (`an_emptied_page_behind_three_others_is_released_before_memory_grows`,
+  the R-2 reproducer, no longer ignored, `a_page_reused_through_the_direct_table_is_still_released`,
+  and `in_place_run_growth_releases_every_empty_page_before_memory_grows`, the R2-1 reproducer,
+  asserting that the in-place growth of a run releases the page before memory grows), the
+  model tester and the fuzz targets. Miri as above.
 - Not machine-checked by Kani: `retire`'s immediate release (a queue of more than one page, or
   more than three), which needs a second page, and the full walk over a queue of several pages;
   tests only.
@@ -658,7 +693,12 @@ assertion that the candidate is not empty), the `extend` of the candidate, the
   all 60 queue heads in a plain loop; CBMC unrolled the inner queue walk once per queue and the
   three harnesses that reach the walk ran past the 4 GiB cap, which is why the walk iterates the
   occupancy bits (one iteration per queue with pages) and the harnesses keep their unwind bound
-  of 2.
+  of 2. 2026-09-02, review finding R2-1: `Heap::realloc` runs the walk when the free slices
+  after a run cannot serve its growth, before `slices::extend_with_growth` grows memory or the
+  block moves, so the promise covers both roads that grow memory; the walk itself is unchanged
+  and HEAP-03 lists the new call. The harnesses `freeing_the_last_block_retires_the_page`,
+  `an_unforced_collection_ages_a_retired_page`, `a_forced_collection_frees_a_retired_page` and
+  `freeing_any_live_block_preserves_invariants` were re-run, one per invocation.
 - Reviewer: adversarial-reviewer, 2026-09-02: accepted with a caveat (R-2), addressed by the
   change above; fresh review of the changed blocks pending.
 - Reviewer: adversarial-reviewer-2, 2026-09-02: accepted for the blocks, with a caveat on the
@@ -666,7 +706,9 @@ assertion that the candidate is not empty), the `extend` of the candidate, the
   run, but not before the in-place growth of a run at the top of the heap (`Heap::realloc`, Huge to
   Huge, through `slices::extend_with_growth`), which grows memory while empty pages sit in their
   queues (test `in_place_run_growth_grows_memory_while_an_empty_page_is_kept`). Footprint wording,
-  not soundness. The walk itself re-derived: `pending` is a snapshot of the bits, each queue is
+  not soundness. Addressed on 2026-09-02 by the walk in `Heap::realloc` (Changes above); the test
+  is now `in_place_run_growth_releases_every_empty_page_before_memory_grows` and asserts the
+  property. The walk itself re-derived: `pending` is a snapshot of the bits, each queue is
   walked from `first` with `next` read before `free_page`, `free_page` is a `remove` on the page's
   own queue (invariant 1) plus `slices.free` of exactly the page's slices, and a full-queue page
   never carries a countdown (only `find_page` parks, after clearing it), so emptying the range
@@ -748,7 +790,11 @@ Blocks: `&mut *self.heap.get()`, and in each method the call into the heap, with
   page or run from the Layout the caller passes back (HEAP-02, HEAP-03); `realloc` preserves
   `min(old, new)` bytes and leaves the old block untouched on failure (HEAP-03); no method
   unwinds (GLOBAL-02). A zero-size request is undefined behaviour for the caller under the
-  contract; the implementation still returns a distinct 8-byte block.
+  contract; the implementation still returns a distinct block: for an alignment up to
+  `MAX_NATURAL_ALIGN` an 8-byte block of bin 1, aligned to 8 whatever the Layout asks
+  (`direct_size` rounds 0 to 0 and slot 0 is bin 1, HEAP-01), so it may not be aligned for the
+  Layout; for a larger alignment a one-slice run, aligned. Outside the contract either way, and
+  `dealloc` with the same Layout finds the page or the run (HEAP-02).
 - Machine checks: as GLOBAL-02; the model tester (`tests/model_heap.rs`, `tests/model_system.rs`
   against `System` for the tester's own soundness, `tests/model_mutants.rs` for its power).
 - Reviewer: adversarial-reviewer, 2026-09-02: accepted. Caveat: discharged among this allocator's
@@ -756,7 +802,7 @@ Blocks: `&mut *self.heap.get()`, and in each method the call into the heap, with
   2026-09-02 by BACKEND-02's per-target heap base.
 - Reviewer: adversarial-reviewer-2, 2026-09-02: accepted. R2-4: the zero-size remark should add that
   such a block is aligned to 8 whatever the Layout's alignment (HEAP-01), still outside the
-  contract.
+  contract. Added on 2026-09-02.
 
 ## backend
 
@@ -944,7 +990,10 @@ with a caveat), 1 rejected (BACKEND-02). Ranked by severity.
 Machine checks run for this review (all in the `review` worktree): host tests, wasm32-wasip1
 tests under wasmtime, `cargo fmt --check`, `cargo clippy --all-targets -D warnings`; every one
 of the 33 Kani harnesses (`scripts/kani`, at most four per invocation, `KANI_MEM=4G`), all
-successful, the heap structural harnesses peaking at 3.8 GB; Miri with `-Zmiri-strict-provenance`
+successful, the heap structural harnesses peaking at 3.8 GB (a recipe that no longer reproduces
+for the structural heap harnesses since the retirement rework: run each of them in its own
+invocation, as `scripts/kani-full` does, or the second in a scope is OOM-killed at 4 GiB, R2-2);
+Miri with `-Zmiri-strict-provenance`
 over the `page` (11 tests) and `heap` (18 tests) unit tests and with `-Zmiri-tree-borrows` over
 the `page` tests, all clean; a 3-minute `model_heap` fuzz run (474k executions), clean; and the
 new probes in `tests/review_edge_cases.rs` (every size within an alignment of each class
@@ -1034,6 +1083,20 @@ probes in `tests/review_edge_cases.rs` (the shrink chain across every direct slo
 retired page reused through the queue head and released before growth, the R2-1 reproducer, and
 a model-tester profile over sizes to 100 KiB with alignments 16 to 4096 and a fifth reallocs,
 90 000 operations over three memory starts), all passing.
+
+Resolutions (branch `release-0.1.1`, 2026-09-02): R2-1 fixed in `Heap::realloc`, which runs
+`release_empty_pages` when the map alone cannot extend a run, before `slices::extend_with_growth`
+grows memory or the block moves (HEAP-03, HEAP-07; the reproducer is now
+`in_place_run_growth_releases_every_empty_page_before_memory_grows` and asserts the property, and
+`a_run_grows_in_place_into_an_empty_page_released_before_growth` in `heap::tests` shows a run
+growing into a released page instead of moving). HEAP-03 awaits the reviewer's fresh look. R2-2
+stated at the top of the ledger, in the heap section's introduction and next to the first
+review's recipe: structural heap harnesses run one per `scripts/kani` invocation, which is what
+`scripts/kani-full` does and why. R2-3 worded in `fits_in_place`'s documentation, the
+`realloc` comment and HEAP-03 (the shrink bound is half of the held Layout's bin, not of the
+block), and in `GENERIC_COLLECT_PERIOD`'s documentation (it counts page searches, and the
+release before growth, not the aging walk, bounds the footprint). R2-4 added to GLOBAL-03's
+zero-size remark.
 
 Test speed (`class_boundaries_with_every_natural_alignment`): it scanned every size within
 `align + 1` of seven boundaries, 37 s here and up to 145 s on the CI runner. It now takes, for
