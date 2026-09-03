@@ -267,12 +267,13 @@ random churn over 10k live objects is 6.4 on V8 15.2 (floor 3.2, talc 26, dlmall
 talc-style random actions 14.6 (talc 20.1, dlmalloc 40.6). After the second tuning pass
 (tuning log, 2026-09-02) the 16 B to 1 MiB realloc chain costs 0.63 us on V8 15.2 and 0.64 on
 node 22 (was 12 us; dlmalloc 0.04 and 0.07, talc 0.05 and 0.09), the rest being the copies
-below the 40 KiB medium limit, and after the footprint pass (tuning log, 2026-09-02) footprint
-is 0.74x dlmalloc's on the 1 MiB Vec growth (40 pages against 54, was 288), 1.23x on churn (128
-against 104, was 181), 1.05x on the trivial pair (22 against 21, was 36) and 2.0x on random
-actions (64 against 32, was 81), the last being one 64 KiB page per touched bin, which needs a
-design change to go below. Note that our pages are extended 8 KiB at a time, so `memory.size`
-overstates our resident memory relative to dlmalloc, which touches everything it hands out.
+below the 40 KiB medium limit, and after the footprint pass and the release-before-growth fix
+on the in-place run road (tuning log, 2026-09-02, both) footprint is 1.07x dlmalloc's on the
+1 MiB Vec growth (58 pages against 54, was 288), 1.23x on churn (128 against 104, was 181),
+1.05x on the trivial pair (22 against 21, was 36) and 2.0x on random actions (64 against 32,
+was 81), the last being one 64 KiB page per touched bin, which needs a design change to go
+below. Note that our pages are extended 8 KiB at a time, so `memory.size` overstates our
+resident memory relative to dlmalloc, which touches everything it hands out.
 
 ## Roadmap and research directions
 
@@ -738,3 +739,42 @@ against 32, the Vec workloads 68 -> 40 against 54). simlin: fishbanks 88 -> 83 p
 
 Next for footprint: the tiny-page prototype (item 4), and the growth fraction above a few tens
 of MiB (item 1) if 6 percent of a large heap is worth twice the grows there.
+
+### 2026-09-02, release 0.1.1 (the second review's R2-1)
+
+Branch `release-0.1.1`, baseline `main` at 29e973b. Roofline as in the footprint entry: node 24
+`--no-liftoff`, d8 (V8 15.2) `--no-liftoff` and wasmtime, five interleaved runs per variant
+pinned to CPUs 4-7, median of the per-run medians (three runs for the d8 and node 22 spot
+checks); footprint by the footprint step's protocol on node 24 (one workload per process,
+`memory.size` pages after the workload).
+
+1. **Every empty page is released before a run at the top of the heap grows in place through
+   memory** (review finding R2-1). `Heap::realloc` called `slices::extend_with_growth` directly,
+   which grows memory without the release walk `acquire_run` runs first; now it tries the map
+   alone (`try_extend`), then runs `release_empty_pages` before `extend_with_growth` grows memory
+   or the block moves. The walk also frees an empty page sitting right after the run, which lets
+   the run grow into it instead of moving, and that second effect is what the numbers show. In
+   the roofline module's geometry (heap base inside slice 18, one gap slice) main's
+   realloc_doubling left a retired page right after the 2-slice run, so every chain copied
+   128 KiB into a hole and never grew in place: 2526 ns per chain on node 24, 2600 on node 22
+   and 2510 to 2540 on d8 (the wasip1 binary, with 25 initial pages, never hit it: 586 ns on
+   wasmtime), against the 627 the footprint entry measured on a build whose heap base lay
+   elsewhere. Now realloc_doubling reads 2526 -> 605 ns on node 24, 2600 -> 592 on node 22,
+   2510 to 2540 -> 580 to 590 on d8 and 586 -> 581 on wasmtime; large_alloc_free 2093 -> 2084
+   (node 24) and 2362 -> 2365 (wasmtime); alloc_free_32 1.12 -> 1.12, alloc_free_32_align16
+   1.12 -> 1.12, churn 6.65 -> 6.46 and random_actions 13.70 -> 13.56 on d8 (the change is off
+   every path these take). Footprint, pages after the workload: vec_push_growth 40 -> 58 and
+   realloc_doubling 40 -> 57 (dlmalloc 54), every other workload unchanged (alloc_free_32 and
+   the batches 22, churn 128, random_actions 64, random_actions_norealloc 72, large_alloc_free
+   144). The 17 pages are the run growing in place through `memory.grow` at the top of a heap
+   that used to serve it by copying into the holes below: a replay of the chain on the
+   simulated heap with the module's geometry shows main moving the run once per chain in steady
+   state (128 KiB copied each time, 22 slices above the heap base) and this branch never moving
+   it (38 slices, 19 of them free); on the two other geometries tried (heap base inside slice 17
+   with 20 initial slices, inside slice 22 with 25) both hold 35 to 41 slices and neither moves
+   a run in steady state. Speed first, so kept; the README's footprint range starts at 1.0x
+   instead of 0.7x (large_alloc_free, 144 against 149, is the low end now). Proofs: the four
+   retirement and collection harnesses re-run, one per invocation (18 to 29 s, up to 3.8 GB);
+   tests `a_run_grows_in_place_into_an_empty_page_released_before_growth` (heap) and
+   `in_place_run_growth_releases_every_empty_page_before_memory_grows` (the R2-1 reproducer,
+   now asserting the property; both fail on main).

@@ -26,12 +26,14 @@
 //!
 //! An empty page is retired rather than freed (mimalloc's `MI_RETIRE_CYCLES` scheme, see
 //! [`RETIRE_CYCLES`]) so that a size class that oscillates between empty and one block keeps
-//! its page; retired pages age at each collection (every [`GENERIC_COLLECT_PERIOD`] slow-path
-//! allocations and before a fresh page is taken) and are released when their count runs out.
+//! its page; retired pages age at each collection (every [`GENERIC_COLLECT_PERIOD`] page
+//! searches and before a fresh page is taken) and are released when their count runs out.
 //! They are also all released before linear memory is grown, whatever their count: growth is
-//! permanent footprint on wasm, a released page is only a page initialisation away. That release
-//! walks every bin queue rather than the retired range and its window, so it does not depend on
-//! the countdown bookkeeping, which the fast paths do not maintain (`Heap::release_empty_pages`).
+//! permanent footprint on wasm, a released page is only a page initialisation away. Both roads
+//! that grow memory run that release: `acquire_run`, for a page or a fresh run, and the
+//! in-place growth of a run at the top of the heap in [`Heap::realloc`]. The release walks
+//! every bin queue rather than the retired range and its window, so it does not depend on the
+//! countdown bookkeeping, which the fast paths do not maintain (`Heap::release_empty_pages`).
 //!
 //! # Fast paths
 //!
@@ -335,12 +337,24 @@ impl<M: Memory, const WORDS: usize> Heap<M, WORDS> {
                 }
                 // In place through the free slices after the run and, when the run is at the
                 // top of the heap, through memory.grow; the copy below is the last resort.
+                let extra = new_n - old_n;
+                if self.slices.try_extend(start, old_n, extra).is_some() {
+                    return Some(ptr);
+                }
+                // The map alone cannot extend the run, so what follows is a memory.grow (the
+                // run is at the top of the heap) or a move. Every empty page is released
+                // first, as `acquire_run` does before it grows memory: a grow is footprint
+                // for good (review finding R2-1), and when the slice in the run's way is an
+                // empty page, the release lets the run grow into it instead of moving.
+                // SAFETY: heap invariants hold between operations, and no page pointer is
+                // held here: the block is a run, which the walk never touches.
+                unsafe { self.release_empty_pages() };
                 if slices::extend_with_growth(
                     &mut self.slices,
                     &mut self.mem,
                     start,
                     old_n,
-                    new_n - old_n,
+                    extra,
                     &self.policy,
                 )
                 .is_some()
@@ -737,10 +751,11 @@ impl<M: Memory, const WORDS: usize> Heap<M, WORDS> {
     }
 
     /// Release every empty page of every bin queue and un-retire the pages in use, whatever the
-    /// retired range and the countdowns say. Runs before linear memory is grown: a grow is
-    /// footprint for good, a released page costs one page initialisation if its bin comes back,
-    /// and a walk over every page (one header read each) is cheap next to the tens of
-    /// microseconds a `memory.grow` costs in V8.
+    /// retired range and the countdowns say. Runs before linear memory is grown, from
+    /// [`acquire_run`](Self::acquire_run) and from the in-place growth of a run in
+    /// [`realloc`](Self::realloc): a grow is footprint for good, a released page costs one page
+    /// initialisation if its bin comes back, and a walk over every page (one header read each)
+    /// is cheap next to the tens of microseconds a `memory.grow` costs in V8.
     ///
     /// Walking every queue that holds a page (heap invariant 5), rather than the retired range
     /// and its three-page window as [`collect_retired`](Self::collect_retired) does, is what
@@ -1730,6 +1745,49 @@ mod tests {
                 "the old run is free again"
             );
             h.dealloc(r, layout(12 * SLICE_SIZE, 8));
+        }
+        validate(h);
+    }
+
+    /// The in-place growth of a run runs the release walk when the free slices after the run
+    /// cannot serve it, before memory is grown or the block moves (review finding R2-1). Here
+    /// the slice in the run's way is an empty, retired page: the walk frees it and the run
+    /// grows into its slice, no copy and no `memory.grow`. Before the change the run moved: the
+    /// page went only with the move's `acquire_run`, and memory grew by a whole run for a
+    /// block that could have stayed where it was.
+    #[test]
+    fn a_run_grows_in_place_into_an_empty_page_released_before_growth() {
+        let mut f = heap(64, 4, 0);
+        let h = &mut f.heap;
+        let three = layout(3 * SLICE_SIZE, 8);
+        let small = layout(16, 8);
+        let qi = bins::bin(16) as usize;
+        unsafe {
+            let r = h.alloc(three).unwrap();
+            let start = r.as_ptr() as usize / SLICE_SIZE;
+            fill(r, three.size(), 0x31);
+            // The fourth and last initial slice becomes a page, then an empty, retired one.
+            let a = h.alloc(small).unwrap();
+            let page = page::header_of(PageKind::Small, a.as_ptr() as usize);
+            assert_eq!(page / SLICE_SIZE, start + 3);
+            h.dealloc(a, small);
+            assert_eq!(h.queues[qi].count, 1, "retired, not freed");
+            assert_eq!(h.free_slices(), 0);
+            let end = h.mem.size_slices();
+            let r2 = h.realloc(r, three, 4 * SLICE_SIZE).unwrap();
+            assert_eq!(
+                r2, r,
+                "the run grew in place into the released page's slice"
+            );
+            check(r2, three.size(), 0x31);
+            assert_eq!(h.mem.size_slices(), end, "no memory.grow");
+            assert_eq!(h.queues[qi].count, 0, "the empty page is gone");
+            assert_eq!(h.free_slices(), 0);
+            for s in 0..4 {
+                assert!(!h.slices.is_free(start + s));
+            }
+            validate(h);
+            h.dealloc(r2, layout(4 * SLICE_SIZE, 8));
         }
         validate(h);
     }

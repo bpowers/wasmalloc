@@ -595,14 +595,16 @@ fn a_retired_page_at_the_queue_head_is_reused_and_still_released() {
 }
 
 /// Review finding R2-1 (footprint, not memory safety). The heap documents that every empty
-/// page is released before linear memory is grown, whatever its countdown, and `acquire_run`
-/// does so. The in-place growth of a run at the top of the heap takes another road,
-/// `slices::extend_with_growth`, which grows memory without that release: here the retired
-/// page in the first slice survives the `memory.grow` that extends the run in the slices after
-/// it. The growth step for a heap this small is two slices, so had the release run first the
-/// map would hold two free slices afterwards, the page's and the spare one; it holds one.
+/// page is released before linear memory is grown, whatever its countdown. `acquire_run` did
+/// so, but the in-place growth of a run at the top of the heap took another road,
+/// `slices::extend_with_growth`, which grew memory without that release: the retired page in
+/// the first slice survived the `memory.grow` that extended the run in the slices after it.
+/// Since 2026-09-02 `Heap::realloc` runs the release walk whenever the free slices after the
+/// run cannot serve the growth, before memory is grown. The growth step for a heap this small
+/// is two slices, so the map holds two free slices afterwards, the released page's and the
+/// step's spare one; before the fix it held one.
 #[test]
-fn in_place_run_growth_grows_memory_while_an_empty_page_is_kept() {
+fn in_place_run_growth_releases_every_empty_page_before_memory_grows() {
     let mut h = heap(64, 4, 0);
     let small = layout(16, 8);
     let run = layout(3 * SLICE_SIZE, 8);
@@ -621,11 +623,15 @@ fn in_place_run_growth_grows_memory_while_an_empty_page_is_kept() {
         let r2 = h.realloc(r, run, 4 * SLICE_SIZE).unwrap();
         assert_eq!(r2, r, "the run grows in place through memory.grow");
         check(r2, 3 * SLICE_SIZE, 0x66);
-        assert!(h.memory().size_slices() > end, "memory grew");
+        assert_eq!(
+            h.memory().size_slices(),
+            end + 2,
+            "memory grew by the step of two slices"
+        );
         assert_eq!(
             h.free_slices(),
-            1,
-            "only the spare slice of the growth step is free: the empty page was not released"
+            2,
+            "the empty page was released before memory grew: its slice and the step's spare one"
         );
         h.dealloc(r2, layout(4 * SLICE_SIZE, 8));
     }
