@@ -19,7 +19,7 @@ use wasmalloc::bins::{
     PageKind, SLICE_SIZE, SMALL_MAX_OBJ_SIZE, WORD,
 };
 use wasmalloc::slices::GrowPolicy;
-use wasmalloc::testing::model::RawAlloc;
+use wasmalloc::testing::model::{self, Order, Profile, RawAlloc};
 use wasmalloc::testing::sim::SimHeap;
 
 fn heap(total: usize, initial: usize, offset: usize) -> SimHeap {
@@ -57,27 +57,56 @@ unsafe fn check(p: NonNull<u8>, size: usize, tag: u8) {
     }
 }
 
-/// Every size within a word of each class boundary, with every alignment up to the natural
-/// cap: the block is aligned, holds its bytes, survives a realloc by one byte in each
-/// direction (which may cross the boundary and change the page kind) and frees cleanly. This
-/// is the `dealloc` fast-path condition against `classify` on real memory.
+/// Sizes around every bin boundary and every page-kind boundary, with every alignment up to
+/// the natural cap: the block is aligned, holds its bytes, survives a realloc by one byte in
+/// each direction (which may cross the boundary and change the bin or the page kind) and frees
+/// cleanly. This is the `dealloc` fast-path condition against `classify` on real memory, and
+/// `realloc`'s direct-index shortcut at every slot edge of the direct table.
+///
+/// For a boundary `b` and an alignment `a` the class of a request changes exactly where the
+/// size rounded up to `a` crosses `b`: at `b - a + 1`, the first size that rounds to `b`, and
+/// at `b + 1`, the first that rounds past it. The probe takes `b - a`, `b` and `b + a` with
+/// their neighbours, which covers both edges and the sizes on either side of them; every other
+/// size within `a + 1` of `b` rounds to the same value as one of these. The exhaustive scan of
+/// that whole range, which took 37 s here and up to 145 s on the CI runner, is kept behind
+/// `WASMALLOC_EXHAUSTIVE=1`.
 #[test]
 fn class_boundaries_with_every_natural_alignment() {
+    let exhaustive = std::env::var_os("WASMALLOC_EXHAUSTIVE").is_some();
     let mut h = heap(4096, 4, 100);
-    let boundaries = [
+    // Every bin edge (the eight-byte classes, the direct-table limit, the small and the medium
+    // limit among them), then the run boundaries where `huge_slices` changes.
+    let mut boundaries: Vec<usize> = (1..=bins::MAX_BINNED_BIN).map(bins::bin_size).collect();
+    boundaries.extend([SLICE_SIZE, 2 * SLICE_SIZE]);
+    for &b in [
         WORD,
         8 * WORD,
         1024,
         SMALL_MAX_OBJ_SIZE,
         MEDIUM_MAX_OBJ_SIZE,
         MAX_BINNED_OBJ_SIZE,
-        SLICE_SIZE,
-    ];
+    ]
+    .iter()
+    {
+        assert!(boundaries.contains(&b), "{b} is a bin edge");
+    }
     let mut shift = 0;
     while (1usize << shift) <= MAX_NATURAL_ALIGN {
         let align = 1usize << shift;
         for &b in &boundaries {
-            for size in (b.saturating_sub(align + 1)).max(1)..=b + align + 1 {
+            let sizes: Vec<usize> = if exhaustive {
+                ((b.saturating_sub(align + 1)).max(1)..=b + align + 1).collect()
+            } else {
+                let mut v: Vec<usize> = [b.saturating_sub(align), b, b + align]
+                    .into_iter()
+                    .flat_map(|c| [c.saturating_sub(1), c, c + 1])
+                    .filter(|&s| s >= 1)
+                    .collect();
+                v.sort_unstable();
+                v.dedup();
+                v
+            };
+            for size in sizes {
                 let l = layout(size, align);
                 unsafe {
                     let p = h.alloc(l).expect("memory");
@@ -411,5 +440,223 @@ fn an_emptied_page_behind_three_others_is_released_before_memory_grows() {
         for &b in q_blocks[1..].iter().chain(&r_blocks[1..]) {
             h.dealloc(b, l);
         }
+    }
+}
+
+/// The direct-index shortcut of `realloc` decides on the two sizes alone, so it also fires for
+/// a Layout that an in-place shrink left on a block of a larger bin. The block is at least the
+/// bin of the Layout the caller holds, so it holds the new size, and the Layout handed back
+/// still masks to the block's page. Walked one byte at a time across every direct slot edge
+/// between the shrunk size and half the block, where the in-place decision flips and the block
+/// moves, with the contents checked at every step; then the same on a medium page, where the
+/// shrink may not leave the page kind.
+#[test]
+fn realloc_shortcut_after_an_in_place_shrink_keeps_contents() {
+    let mut h = heap(64, 4, 0);
+    for align in [1usize, 8] {
+        let big = layout(1024, align);
+        unsafe {
+            let p = h.alloc(big).unwrap();
+            fill(p, 1024, 1);
+            // Above half the block: stays in place, in a page of bin 24 with a Layout of bin 22.
+            let mut cur = h.realloc(p, big, 600).unwrap();
+            assert_eq!(
+                cur, p,
+                "a shrink to more than half the block stays in place"
+            );
+            check(cur, 600, 1);
+            let mut size = 600;
+            let mut tag = 1u8;
+            while size > 512 {
+                let target = size - 1;
+                let same_slot = bins::direct_index(size) == bins::direct_index(target);
+                let q = h.realloc(cur, layout(size, align), target).unwrap();
+                assert_eq!(
+                    q, p,
+                    "size {size} to {target} (same direct slot: {same_slot}) keeps the block"
+                );
+                check(q, target, tag);
+                tag = tag.wrapping_add(1);
+                fill(q, target, tag);
+                // A free with the Layout the caller holds now finds the page: exercised by the
+                // realloc's own mask on the next step, and directly at the end.
+                cur = q;
+                size = target;
+            }
+            assert_eq!(size, 512);
+            // The half bound of the in-place decision is taken from the Layout the caller
+            // holds, not from the block: from (512, bin 20) every step below stays in place as
+            // long as the target is at least half of the current bin, so the chain walks the
+            // 1 KiB block down through every bin of its kind to an 8-byte Layout (review
+            // finding R2-3, a footprint remark; the block is always large enough).
+            for target in [511usize, 384, 256, 192, 128, 96, 64, 48, 32, 24, 16, 8] {
+                let q = h.realloc(cur, layout(size, align), target).unwrap();
+                assert_eq!(q, p, "size {size} to {target} stays in the 1 KiB block");
+                check(q, target, tag);
+                tag = tag.wrapping_add(1);
+                fill(q, target, tag);
+                cur = q;
+                size = target;
+            }
+            // The Layout the caller holds now names bin 1; the free finds the bin-24 page.
+            h.dealloc(cur, layout(8, align));
+            // From the original Layout a target below half of its bin moves the block.
+            let p = h.alloc(big).unwrap();
+            fill(p, 1024, 8);
+            let moved = h.realloc(p, big, 511).unwrap();
+            assert_ne!(moved, p, "a shrink below half of the Layout's bin moves it");
+            check(moved, 511, 8);
+            h.dealloc(moved, layout(511, align));
+        }
+    }
+    // Medium pages: a shrink stays in place only above half the Layout's bin and within the
+    // kind.
+    let l = layout(MEDIUM_MAX_OBJ_SIZE, 8);
+    unsafe {
+        let p = h.alloc(l).unwrap();
+        fill(p, MEDIUM_MAX_OBJ_SIZE, 4);
+        let half = MEDIUM_MAX_OBJ_SIZE / 2;
+        let q = h.realloc(p, l, half).unwrap();
+        assert_eq!(q, p, "exactly half stays in place");
+        check(q, half, 4);
+        // The half bound is taken from the Layout the caller holds (bin 41, 20 KiB), not from
+        // the 40 KiB block it sits in, so one byte less than half of that block still stays.
+        let r = h.realloc(q, layout(half, 8), half - 1).unwrap();
+        assert_eq!(r, p, "above half of the Layout's own bin stays in place");
+        check(r, half - 1, 4);
+        // From the original Layout the same target is below half of its bin and moves.
+        let p2 = h.alloc(l).unwrap();
+        fill(p2, MEDIUM_MAX_OBJ_SIZE, 6);
+        let r2 = h.realloc(p2, l, half - 1).unwrap();
+        assert_ne!(r2, p2, "below half of the Layout's bin moves");
+        check(r2, half - 1, 6);
+        h.dealloc(r2, layout(half - 1, 8));
+        // Down to a small-page bin from a medium block: the kind changes, so the block moves
+        // even though the size is above half of the medium block it sits in.
+        let m = h.alloc(layout(12 * 1024, 8)).unwrap();
+        fill(m, 12 * 1024, 5);
+        let n = h
+            .realloc(m, layout(12 * 1024, 8), SMALL_MAX_OBJ_SIZE)
+            .unwrap();
+        assert_ne!(n, m, "a medium block never serves a small-page Layout");
+        check(n, SMALL_MAX_OBJ_SIZE, 5);
+        h.dealloc(n, layout(SMALL_MAX_OBJ_SIZE, 8));
+        h.dealloc(r, layout(half - 1, 8));
+    }
+}
+
+/// A retired page of a bin above the direct table keeps its countdown while the queue-head
+/// path of `alloc_generic` pops from it, exactly as a page drained through the direct table
+/// does (nothing on either path touches `retire_expire`). The page still serves requests, and
+/// the release before memory growth frees it: with four initial slices, three pages of other
+/// bins fill the map, the fourth is served from the released page's slice, and only the fifth
+/// grows memory.
+#[test]
+fn a_retired_page_at_the_queue_head_is_reused_and_still_released() {
+    let mut h = heap(64, 4, 0);
+    // Bin 28: 2 KiB blocks, above DIRECT_MAX_SIZE, in a small page.
+    let l = layout(2000, 8);
+    assert!(l.size() > bins::DIRECT_MAX_SIZE);
+    unsafe {
+        let a = h.alloc(l).unwrap();
+        h.dealloc(a, l);
+        for round in 0..40u8 {
+            let b = h.alloc(l).unwrap();
+            assert_eq!(a, b, "LIFO reuse of the retired page's block");
+            fill(b, 2000, round);
+            check(b, 2000, round);
+            h.dealloc(b, l);
+        }
+        assert_eq!(h.free_slices(), 3, "the page holds one of the four slices");
+        let end = h.memory().size_slices();
+        let mut others = Vec::new();
+        for size in [24usize, 32, 40, 48] {
+            let p = h.alloc(layout(size, 8)).unwrap();
+            fill(p, size, size as u8);
+            others.push((p, layout(size, 8)));
+            assert_eq!(
+                h.memory().size_slices(),
+                end,
+                "the {size}-byte page came from the map, the fourth from the released page"
+            );
+        }
+        assert_eq!(h.free_slices(), 0);
+        let fifth = h.alloc(layout(56, 8)).unwrap();
+        assert!(
+            h.memory().size_slices() > end,
+            "only the fifth page grows memory"
+        );
+        h.dealloc(fifth, layout(56, 8));
+        for (p, l) in others {
+            check(p, l.size(), l.size() as u8);
+            h.dealloc(p, l);
+        }
+    }
+}
+
+/// Review finding R2-1 (footprint, not memory safety). The heap documents that every empty
+/// page is released before linear memory is grown, whatever its countdown, and `acquire_run`
+/// does so. The in-place growth of a run at the top of the heap takes another road,
+/// `slices::extend_with_growth`, which grows memory without that release: here the retired
+/// page in the first slice survives the `memory.grow` that extends the run in the slices after
+/// it. The growth step for a heap this small is two slices, so had the release run first the
+/// map would hold two free slices afterwards, the page's and the spare one; it holds one.
+#[test]
+fn in_place_run_growth_grows_memory_while_an_empty_page_is_kept() {
+    let mut h = heap(64, 4, 0);
+    let small = layout(16, 8);
+    let run = layout(3 * SLICE_SIZE, 8);
+    unsafe {
+        // Slice 0: a page that is emptied and retired. Slices 1 to 3: a run at the top.
+        let a = h.alloc(small).unwrap();
+        h.dealloc(a, small);
+        let r = h.alloc(run).unwrap();
+        fill(r, 3 * SLICE_SIZE, 0x66);
+        assert_eq!(
+            h.free_slices(),
+            0,
+            "the page and the run fill the initial memory"
+        );
+        let end = h.memory().size_slices();
+        let r2 = h.realloc(r, run, 4 * SLICE_SIZE).unwrap();
+        assert_eq!(r2, r, "the run grows in place through memory.grow");
+        check(r2, 3 * SLICE_SIZE, 0x66);
+        assert!(h.memory().size_slices() > end, "memory grew");
+        assert_eq!(
+            h.free_slices(),
+            1,
+            "only the spare slice of the growth step is free: the empty page was not released"
+        );
+        h.dealloc(r2, layout(4 * SLICE_SIZE, 8));
+    }
+}
+
+/// The model tester over a profile aimed at the paths this review examined: sizes from 1 to
+/// 100 KiB, so the direct-table edge, the queue-head range (1 KiB to 40 KiB) and both page
+/// kinds are all hit; alignments 16 to 4096 as often as word alignment, so the fast-path
+/// kind test sees rounded sizes; a fifth of the operations reallocs, for the direct-index
+/// shortcut and the in-place decisions; sweeps so pages empty, retire and come back.
+#[test]
+fn model_profile_aimed_at_the_reviewed_paths() {
+    let profile = Profile {
+        name: "review2",
+        ops: [35, 10, 35, 20],
+        sizes: [700, 300, 0, 0],
+        aligns: [40, 15, 10, 10, 25, 0, 0],
+        sweep_every: 4000,
+        max_live_bytes: 32 * 1024 * 1024,
+        order: Order::Random,
+        batch: 0,
+    };
+    for (seed, (initial, offset)) in [(11u64, (4, 100)), (12, (1, 0)), (13, (64, SLICE_SIZE + 8))] {
+        let mut h = heap(4096, initial, offset);
+        let stats = model::check(&mut h, seed, 30_000, profile);
+        assert_eq!(stats.ops, 30_000, "{stats:?}");
+        assert_eq!(
+            stats.deallocs,
+            stats.allocs + stats.zeroed_allocs,
+            "{stats:?}"
+        );
+        assert!(stats.reallocs > 3_000, "{stats:?}");
     }
 }
