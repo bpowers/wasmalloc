@@ -17,6 +17,14 @@ that model to every bin, kind and backend is the pen-and-paper part below.
 Entries are grouped by module. Page invariants 1 to 5 refer to the numbered list at the top of
 `src/page.rs`.
 
+Running the harnesses an entry names: only through `scripts/kani` (never bare `cargo kani`), and
+the structural heap harnesses one per invocation, as `scripts/kani-full` runs every harness. One
+`cargo kani` invocation runs its harnesses sequentially in one scope, and CBMC's residue
+accumulates across them, so two structural heap harnesses that each verify alone at 4 GiB in
+under a minute are OOM-killed together at the same cap (R2-2, below). The arithmetic, bins, page
+and slices harnesses are small enough to share an invocation, which is how `scripts/kani-quick`
+runs the gate's set.
+
 ## page
 
 ### PAGE-01: `page::init`, the header write
@@ -199,7 +207,10 @@ Heap invariants 1 to 5 refer to the numbered list at the top of `src/heap.rs`; p
 given. The structural heap harnesses run the real heap over a proof-only memory of one small
 page of bin 36 (`HeapModel`) or of three bare page headers of bin 16 (`QueueModel`); the model
 and its limits are described in the `heap::verify` module documentation, and where a block's
-proof rests on tests only, the entry says so.
+proof rests on tests only, the entry says so. Where an entry says a structural harness was
+re-run, it was run in its own `scripts/kani` invocation (`scripts/kani --harness <name>`); see
+the note at the top of this ledger and R2-2 for why two of them in one invocation do not fit
+under the 4 GiB cap.
 
 A requirement every entry below relies on and that the `Memory` trait documentation now states
 explicitly (2026-09-02): `mem.ptr(a)` returns a pointer whose address is exactly `a`. The heap
@@ -973,7 +984,10 @@ with a caveat), 1 rejected (BACKEND-02). Ranked by severity.
 Machine checks run for this review (all in the `review` worktree): host tests, wasm32-wasip1
 tests under wasmtime, `cargo fmt --check`, `cargo clippy --all-targets -D warnings`; every one
 of the 33 Kani harnesses (`scripts/kani`, at most four per invocation, `KANI_MEM=4G`), all
-successful, the heap structural harnesses peaking at 3.8 GB; Miri with `-Zmiri-strict-provenance`
+successful, the heap structural harnesses peaking at 3.8 GB (a recipe that no longer reproduces
+for the structural heap harnesses since the retirement rework: run each of them in its own
+invocation, as `scripts/kani-full` does, or the second in a scope is OOM-killed at 4 GiB, R2-2);
+Miri with `-Zmiri-strict-provenance`
 over the `page` (11 tests) and `heap` (18 tests) unit tests and with `-Zmiri-tree-borrows` over
 the `page` tests, all clean; a 3-minute `model_heap` fuzz run (474k executions), clean; and the
 new probes in `tests/review_edge_cases.rs` (every size within an alignment of each class
@@ -1069,7 +1083,10 @@ Resolutions (branch `release-0.1.1`, 2026-09-02): R2-1 fixed in `Heap::realloc`,
 grows memory or the block moves (HEAP-03, HEAP-07; the reproducer is now
 `in_place_run_growth_releases_every_empty_page_before_memory_grows` and asserts the property, and
 `a_run_grows_in_place_into_an_empty_page_released_before_growth` in `heap::tests` shows a run
-growing into a released page instead of moving). HEAP-03 awaits the reviewer's fresh look.
+growing into a released page instead of moving). HEAP-03 awaits the reviewer's fresh look. R2-2
+stated at the top of the ledger, in the heap section's introduction and next to the first
+review's recipe: structural heap harnesses run one per `scripts/kani` invocation, which is what
+`scripts/kani-full` does and why.
 
 Test speed (`class_boundaries_with_every_natural_alignment`): it scanned every size within
 `align + 1` of seven boundaries, 37 s here and up to 145 s on the CI runner. It now takes, for
