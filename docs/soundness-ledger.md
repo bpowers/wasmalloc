@@ -54,6 +54,9 @@ Entries are grouped by module. Page invariants 1 to 5 refer to the numbered list
   `every_block_of_every_bin_lies_inside_its_page_and_is_aligned` covers every bin's `reserved`
   and was re-run (see PAGE-04 for the module-level check).
 - Reviewer: adversarial-reviewer, 2026-09-02: accepted (the 2026-09-02 division note is new).
+- Reviewer: adversarial-reviewer-2, 2026-09-02: accepted. The divisor is `bin_size(bin)` with `bin`
+  in `1..=MAX_BIN`, never zero, so the `1` branch of `blocks_per_page` is dead for every caller; the
+  geometry harness and the page tests were re-run.
 
 ### PAGE-02: `page::pop`, the free-list pop
 
@@ -147,6 +150,11 @@ Entries are grouped by module. Page invariants 1 to 5 refer to the numbered list
 - Reviewer: adversarial-reviewer, 2026-09-02: accepted, with the caveat that the
   `block_size.max(1)` proposal be applied and this entry updated; applied on 2026-09-02 as
   described under Changes, fresh look pending.
+- Reviewer: adversarial-reviewer-2, 2026-09-02: accepted. Re-derived: `init` is the only writer of
+  `block_size` and stores `bin_size(bin) >= 8`; `extend` is called on `find_page`'s candidate and
+  `fresh_page`'s new page, both queue members, and the sentinel (`block_size == 0`) is never linked
+  into a queue, so `.max(1)` selects no reachable value. Both page operation-sequence harnesses, the
+  geometry harness and Miri (strict provenance) over the page tests re-run.
 
 ### PAGE-05: header field reads in the predicates and helpers
 
@@ -258,6 +266,13 @@ the returned block, the zeroing block in `alloc_zeroed`, and the calls into `all
   blocks are unchanged and reached under the same condition (`size <= DIRECT_MAX_SIZE` after
   rounding, never for `align > MAX_NATURAL_ALIGN`). The three arithmetic harnesses re-run.
 - Reviewer: adversarial-reviewer, 2026-09-02: accepted; the tuning-c change awaits a fresh look.
+- Reviewer: adversarial-reviewer-2, 2026-09-02: accepted. `direct_size` is the size for `align <=
+  WORD`, the rounding `classify` performs for `WORD < align <= MAX_NATURAL_ALIGN` (no overflow: a
+  Layout's rounded size fits `isize`), and `usize::MAX` above it, which fails the table test, so the
+  pop is reached exactly when `classify` yields a bin whose direct range holds the index (Kani
+  `dealloc_fast_path_agrees_with_classify`, re-run). One note outside the contract (R2-4): a
+  zero-size request with an alignment above `WORD` rounds to size 0, indexes slot 0 and gets a block
+  aligned to 8 only; nothing else changes, and `dealloc` with that Layout finds the page.
 
 ### HEAP-02: `Heap::dealloc`, the small-page fast path, and `dealloc_generic`
 
@@ -315,6 +330,13 @@ Blocks: in `dealloc`, the `page::push` on the masked header, `needs_transition` 
   the harness above); the unsafe blocks are unchanged. `freeing_any_live_block_preserves_invariants`
   and `a_free_brings_a_full_page_back_to_its_queue` re-run.
 - Reviewer: adversarial-reviewer, 2026-09-02: accepted; the tuning-c change awaits a fresh look.
+- Reviewer: adversarial-reviewer-2, 2026-09-02: accepted. The mask identity re-derived by hand: for
+  a power of two `a`, `round_up(s, a) <= L` holds exactly when a multiple of `a` lies in `[s, L]`,
+  that is when `s <= round_down(L, a) == L & -a`; for `a <= WORD` the mask leaves
+  `SMALL_MAX_OBJ_SIZE` (a multiple of 8) intact, matching `classify`'s unrounded size. The harness
+  models the code as written (`size <= (SMALL_MAX_OBJ_SIZE & align.wrapping_neg())`) for every
+  Layout with `shift <= 12`; re-run. `tests/review_edge_cases.rs` now probes every bin edge and both
+  run boundaries with every natural alignment on real memory (see R2 test speed note below).
 
 ### HEAP-03: `Heap::realloc`
 
@@ -365,6 +387,20 @@ Blocks: `Layout::from_size_align_unchecked`, the `self.alloc(new_layout)` for a 
   they were out-of-line calls with an sret round trip through the shadow stack, see
   `docs/research/simlin-profile.md` section 6). The unsafe blocks are unchanged.
 - Reviewer: adversarial-reviewer, 2026-09-02: accepted; the tuning-c change awaits a fresh look.
+- Reviewer: adversarial-reviewer-2, 2026-09-02: accepted. On the shortcut: it fires for a proper
+  subset of the pairs whose block size is unchanged (two sizes in adjacent slots of one bin, such as
+  65 and 80, take the general path and get the same answer); a zero `new_size` or a zero old size,
+  both outside the contract, miss the shortcut and are served by the general path without any
+  out-of-bounds access; an old alignment above `WORD` is excluded by the first test, so over-aligned
+  blocks (runs) never reach it. The in-place argument is inductive over chains of reallocs: each
+  in-place step keeps `kind_of_bin` of the held Layout's bin equal to the page's kind and
+  `block_size` at least the held size, and the entry's precondition ("a size that classifies as
+  `realloc` left it") is exactly that induction hypothesis. Because the half bound is taken from the
+  held Layout's bin rather than the block, a chain of shrinks can walk a 1 KiB block down to an
+  8-byte Layout of the same kind (footprint only, R2-3; test
+  `realloc_shortcut_after_an_in_place_shrink_keeps_contents` shows the chain with contents checked
+  and the block freed through the final Layout). Kani `realloc_in_place_keeps_the_kind_and_fits`
+  re-run.
 
 ### HEAP-04: `alloc_generic`, `alloc_huge` and `acquire_run`, the slow-path hand-out
 
@@ -432,6 +468,19 @@ Blocks: in `alloc_generic`, the `page::has_free` read of the bin queue's first p
 - Reviewer: adversarial-reviewer, 2026-09-02: accepted with two caveats (R-3, R-4), both
   addressed in the text above on 2026-09-02; fresh review of the wording and of the tuning-c
   change pending.
+- Reviewer: adversarial-reviewer-2, 2026-09-02: accepted, wording and the queue-head path. The head
+  of `queues[bin]` is a member of that bin queue, never of the full queue (a different index), of
+  bin `bin` and hence of its kind (heap invariant 1), possibly retired: the pop then leaves a stale
+  countdown exactly as the direct table does, which `collect_retired` (un-retires a page in use),
+  `find_page` (clears it on the candidate and on a parked page) and `release_empty_pages` (clears or
+  frees) all tolerate. Bins above `DIRECT_MAX_BIN` have no direct entries, so heap invariant 3 is
+  untouched, and nothing on the path changes a queue. Test
+  `a_retired_page_at_the_queue_head_is_reused_and_still_released`. A consequence for the
+  documentation of `GENERIC_COLLECT_PERIOD`: it now counts page searches, not slow-path allocations
+  (R2-3). The non-null and ownership wording (R-3, R-4) is accurate. Kani
+  `an_allocation_above_the_direct_table_pops_the_queue_head`,
+  `first_allocation_builds_a_valid_heap`, `the_search_parks_a_full_page_in_the_full_queue` re-run,
+  one per invocation (R2-2).
 
 ### HEAP-05: the queue operations and `page_at`
 
@@ -472,6 +521,13 @@ Blocks in `push_front`, `push_back`, `remove`, `move_to_front`, `move_to_full`, 
   safe integer operations after them. Queue harnesses re-run.
 - Reviewer: adversarial-reviewer, 2026-09-02: accepted; the 2026-09-02 addition awaits a fresh
   look.
+- Reviewer: adversarial-reviewer-2, 2026-09-02: accepted. The six operations are the only writers of
+  `queues`, `occupied` and the links; both pushes set the bit after incrementing `count`, `remove`
+  clears it when `count` reaches zero, the three moves are compositions of those, `free_page` is a
+  `remove`, and `Heap::new` starts with every queue empty and no bit set, so a queue with pages
+  always has its bit and an empty queue never does. The shift amount is `queue_index(qi) < 64`. The
+  queue harnesses check the bit of both queues through `validate_queue_inner` and of a symbolic
+  other queue; re-run.
 
 ### HEAP-06: `find_page` and `fresh_page`, the page search and supply
 
@@ -527,6 +583,14 @@ assertion that the candidate is not empty), the `extend` of the candidate, the
 - Reviewer: adversarial-reviewer, 2026-09-02: accepted with a caveat (R-5: the release of an
   empty candidate the sketch treated as live is unreachable), addressed on 2026-09-02 by
   removing the branch; together with the park reset this awaits a fresh look.
+- Reviewer: adversarial-reviewer-2, 2026-09-02: accepted. The candidate argument re-derived: a
+  candidate that reaches the comparison was chosen with `free == 0` (an available page ends the
+  walk) and the walk changes no list, so `used == capacity >= 1`. One addition to the sketch: when
+  `fresh_page` is reached, every member of queue `bin` was parked (the walk only ends early with a
+  candidate), so the `release_empty_pages` inside `acquire_run` walks other queues only and cannot
+  free a page `find_page` refers to. The park reset is a store to a heap-owned byte of a live
+  member. Kani `the_search_parks_a_full_page_in_the_full_queue`,
+  `a_free_brings_a_full_page_back_to_its_queue`, `first_allocation_builds_a_valid_heap` re-run.
 
 ### HEAP-07: retirement and release (`dealloc_transition`, `retire`, `collect_retired`, `release_empty_pages`, `free_page`)
 
@@ -597,6 +661,18 @@ assertion that the candidate is not empty), the `extend` of the candidate, the
   of 2.
 - Reviewer: adversarial-reviewer, 2026-09-02: accepted with a caveat (R-2), addressed by the
   change above; fresh review of the changed blocks pending.
+- Reviewer: adversarial-reviewer-2, 2026-09-02: accepted for the blocks, with a caveat on the
+  promise (R2-1): the walk runs in `acquire_run`, that is before memory grows for a page or a new
+  run, but not before the in-place growth of a run at the top of the heap (`Heap::realloc`, Huge to
+  Huge, through `slices::extend_with_growth`), which grows memory while empty pages sit in their
+  queues (test `in_place_run_growth_grows_memory_while_an_empty_page_is_kept`). Footprint wording,
+  not soundness. The walk itself re-derived: `pending` is a snapshot of the bits, each queue is
+  walked from `first` with `next` read before `free_page`, `free_page` is a `remove` on the page's
+  own queue (invariant 1) plus `slices.free` of exactly the page's slices, and a full-queue page
+  never carries a countdown (only `find_page` parks, after clearing it), so emptying the range
+  afterwards is exact. Kani `a_forced_collection_frees_a_retired_page`,
+  `an_unforced_collection_ages_a_retired_page`, `freeing_the_last_block_retires_the_page`,
+  `freeing_any_live_block_preserves_invariants` re-run, one per invocation (R2-2).
 
 ### HEAP-08: header reads in `needs_transition` and `mostly_used`
 
@@ -661,6 +737,7 @@ Blocks: `&mut *self.heap.get()`, and in each method the call into the heap, with
 - Reviewer: adversarial-reviewer, 2026-09-02: accepted with a caveat (R-6: cite the targets'
   `panic-strategy`, not the profile, and note the debug-hook allocation), both folded into the
   text above on 2026-09-02.
+- Reviewer: adversarial-reviewer-2, 2026-09-02: accepted (the reworded no-unwind argument).
 
 ### GLOBAL-03: `unsafe impl GlobalAlloc for WasmAlloc`
 
@@ -677,6 +754,9 @@ Blocks: `&mut *self.heap.get()`, and in each method the call into the heap, with
 - Reviewer: adversarial-reviewer, 2026-09-02: accepted. Caveat: discharged among this allocator's
   own blocks; on wasi targets wasi-libc's malloc handed out the same bytes (R-1), resolved on
   2026-09-02 by BACKEND-02's per-target heap base.
+- Reviewer: adversarial-reviewer-2, 2026-09-02: accepted. R2-4: the zero-size remark should add that
+  such a block is aligned to 8 whatever the Layout's alignment (HEAP-01), still outside the
+  contract.
 
 ## backend
 
@@ -741,6 +821,19 @@ below argue that the implementations meet it.
   allocators handed out the same bytes whenever the gap held a whole slice).
 - Reviewer: adversarial-reviewer, 2026-09-02: REJECTED (R-1) before the change above. Fresh
   review of the rewritten entry pending.
+- Reviewer: adversarial-reviewer-2, 2026-09-02: accepted. Re-derived for wasi: the base is read
+  once, in `ensure_init`, so growth by anyone before the first allocation lies below it and growth
+  afterwards only makes the regions non-contiguous, which `slices::acquire` sizes from the current
+  end each time (in a single-threaded module nothing can grow memory between its `size_slices` read
+  and its `grow`, so its retry branch is defensive); `initial_free_range` yields zero slices, and a
+  first allocation of any size, huge included, takes the `acquire` path whose room is bounded by
+  `usable_limit`; a memory already at 4 GiB saturates to a base in the last slice, which serves
+  nothing. Claims checked against the toolchains: Rust 1.95.0's `libdlmalloc-*.rlib` for
+  `wasm32-unknown-unknown` names dlmalloc 0.2.11 and holds no `__heap_base` string; the stable
+  wasm32-wasip1 sysroot's `libc.a` exports `try_init_allocator`, `__heap_base`, `__heap_end`,
+  `__wasilibc_populate_preopens` and `__wasilibc_initialize_environ`, and its `libstd` rlib imports
+  `malloc`, `calloc` and `opendir`. `tests/wasi_libc_gap.rs` and `tests/global_wasm.rs` pass under
+  wasmtime with the 8 MiB link.
 
 ### BACKEND-03: `SimMemory::from_region`, `SimMemory::grow` and `unsafe impl Memory for SimMemory`
 
@@ -778,12 +871,22 @@ below argue that the implementations meet it.
   `a_host_region_refuses_zero_slices`.
 - Reviewer: adversarial-reviewer, 2026-09-02: accepted with a caveat (R-7), addressed on
   2026-09-02 by the assertion.
+- Reviewer: adversarial-reviewer-2, 2026-09-02: accepted.
 
 ## slices
 
 `slices` has no unsafe code. The bitmap helpers there gained explicit `w < WORDS` tests
 (2026-09-02) so that the release build carries no bounds-check panic path; they are safe code
 and are covered by the twelve slices Kani harnesses.
+
+Growth floor (adversarial-reviewer-2, 2026-09-02): `GrowPolicy::DEFAULT.min_grow` went from 16 to 2
+slices. In `grow_and_alloc` the request is `want = max(pad + count, step).min(room)` with `room >=
+pad + count` checked first, so a request larger than the step is never cut, the fresh region `[end,
+end + want)` holds the aligned run at `end + pad`, and `add_region` never clips it (`want <= room =
+usable_limit - end`); `grow_and_extend` has the same shape with `need`. The twelve slices harnesses
+(`slices_acquire_stays_inside_memory_and_the_map` and
+`slices_extend_with_growth_extends_only_a_top_run` quantify over `min_grow` and `max_grow` below 8)
+were re-run.
 
 Not listed: the unsafe blocks inside `#[cfg(test)]` test code and the proof-only backends
 under `#[cfg(kani)]` (`page::verify::PageModel`, `heap::verify::HeapModel` and `QueueModel`),
@@ -859,3 +962,82 @@ longer ignored); R-3 and R-4 stated in HEAP-04; R-5 removed from `find_page` (HE
 reworded in GLOBAL-02; R-7 guarded in `HostRegion::new` (BACKEND-04); the PAGE-04 caveat applied
 (PAGE-04, and PAGE-01 for the same division in `init`). Every entry touched says so under
 "Changes" and awaits the reviewer's fresh look.
+
+## Review findings (second adversarial review, 2026-09-02)
+
+Reviewer: adversarial-reviewer-2 (did not write any of the code). Scope: the thirteen entries
+whose Reviewer line said a change awaited a fresh look or was rejected before a change (PAGE-01,
+PAGE-04, HEAP-01 to HEAP-07, GLOBAL-02, GLOBAL-03, BACKEND-02, BACKEND-04), and every unsafe
+block changed since commit 3eacf62: the wasi heap base, the retirement rework and the release
+walk with its occupancy bitmask, the realloc entry and its direct-index shortcut, the queue-head
+service above the direct table, the dealloc kind test without rounding, the `max(1)` divisions,
+and the growth floor. Verdict: 13 accepted (HEAP-07 with a caveat, R2-1), 0 rejected. No
+memory-safety bug and no invariant violation was found. Ranked by severity.
+
+- R2-1 (documented property violated, reproduced; footprint, not memory safety): the heap
+  module documentation and HEAP-07 promise that every empty page is released before linear
+  memory grows. The promise holds on the `acquire_run` road (pages and new runs) but not for the
+  in-place growth of a run at the top of the heap: `Heap::realloc` (Huge to Huge) calls
+  `slices::extend_with_growth`, whose `grow_and_extend` grows memory without the walk.
+  `tests/review_edge_cases.rs`, `in_place_run_growth_grows_memory_while_an_empty_page_is_kept`:
+  a retired page in the first slice and a three-slice run above it fill the initial memory; a
+  realloc of the run to four slices grows memory and the map holds one free slice afterwards,
+  not the two it would hold had the page been released first. Either word the promise as
+  "before memory is grown for a page or a fresh run", or release before `grow_and_extend`,
+  which would also let an extension succeed when the slices in its way are an empty page.
+- R2-2 (machine check as recorded not reproducible): the first review's note says the Kani
+  harnesses were run "at most four per invocation, `KANI_MEM=4G`". After the retirement rework
+  two heap structural harnesses in one invocation exceed the cap: with
+  `scripts/kani --harness a_free_brings_a_full_page_back_to_its_queue --harness
+  the_search_parks_a_full_page_in_the_full_queue` the second is OOM-killed at 4 GiB, while each
+  verifies alone at 4 GiB in at most 47 s (the residue effect `scripts/kani-full` documents).
+  The ledger's recipe should say one heap structural harness per invocation; `kani-full`
+  already does that and `kani-quick` excludes them.
+- R2-3 (documentation, two nits with a footprint side): `fits_in_place` bounds an in-place
+  shrink by half of the held Layout's bin, not by half of the block (mimalloc uses the block's
+  usable size), so a chain of shrinks each above half of the current bin walks a block down
+  through every bin of its kind: `realloc_shortcut_after_an_in_place_shrink_keeps_contents`
+  takes a 1 KiB block to an 8-byte Layout in twelve steps, contents intact, and frees it through
+  the final Layout. Sound (HEAP-03's argument is inductive), but a block can hold a Layout far
+  below its size until it is freed. And `GENERIC_COLLECT_PERIOD` is documented as "every this
+  many slow-path allocations"; since the queue-head service it counts page searches only, so the
+  aging walk runs less often under workloads served from queue heads (the release before growth
+  is what bounds footprint, so nothing else changes).
+- R2-4 (documentation nit): GLOBAL-03 says a zero-size request "still returns a distinct 8-byte
+  block"; with an alignment above `WORD` that block is aligned to 8, not to the Layout
+  (`direct_size` rounds 0 to 0 and slot 0 is bin 1). Outside the contract either way; `dealloc`
+  with the same Layout finds the page.
+
+Answers to the questions the review was asked, in brief: (a) the realloc shortcut fires for a
+proper subset of the same-bin pairs and never for an old alignment above `WORD`; zero sizes
+miss it and are served by the general path. (b) The queue head is a bin-queue member of the
+request's bin and kind, never a full-queue page, possibly retired; the pop keeps the direct
+table (the bin has no entries) and leaves a countdown the collections tolerate. (c) The
+unrounded test equals the rounded one for every power-of-two alignment (mask identity, Kani
+harness models the code as written, every bin edge probed on real memory). (d) The occupancy
+bit is maintained by the six queue operations, the only writers of the queues; the harnesses
+check it for both queues. (e) The wasi base is read once at first use; earlier growth lies
+below it, later growth only makes regions non-contiguous, a huge first request takes the
+`acquire` road bounded by `usable_limit`, and a 4 GiB memory saturates to nothing usable.
+(f) The growth request is at least the padded need and never clipped below it, so the aligned
+run is always inside the fresh region.
+
+Machine checks run for this review (all in the `review2` worktree): host `cargo test` (80 unit
+tests, the model tester, the mutants, `review_edge_cases`), `cargo test --target wasm32-wasip1`
+under wasmtime 48 (the wasi-libc gap test and the end-to-end test included), `cargo fmt --check`
+and `cargo clippy --all-targets -D warnings`; every one of the 33 Kani harnesses at `KANI_MEM=4G`
+(arithmetic, bins, page and slices harnesses in groups, each heap structural harness alone),
+all successful; Miri with `-Zmiri-strict-provenance` over the `heap` (22 tests, the 100 000-step
+census test skipped) and `page` (11 tests) unit tests, clean; a 3-minute `model_heap` fuzz run
+seeded with the mixed and align-heavy profiles (68 159 executions, 901 edges), clean; the new
+probes in `tests/review_edge_cases.rs` (the shrink chain across every direct slot edge, a
+retired page reused through the queue head and released before growth, the R2-1 reproducer, and
+a model-tester profile over sizes to 100 KiB with alignments 16 to 4096 and a fifth reallocs,
+90 000 operations over three memory starts), all passing.
+
+Test speed (`class_boundaries_with_every_natural_alignment`): it scanned every size within
+`align + 1` of seven boundaries, 37 s here and up to 145 s on the CI runner. It now takes, for
+every alignment, the sizes where the rounded size crosses each boundary (`b - a`, `b`, `b + a`
+and their neighbours) for every bin edge and both run boundaries (47 boundaries instead of 7):
+0.7 s alone, 2.7 s for the whole file, with the exhaustive scan over all 47 boundaries behind
+`WASMALLOC_EXHAUSTIVE=1` (107 s).
