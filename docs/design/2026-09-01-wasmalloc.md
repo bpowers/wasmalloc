@@ -327,7 +327,13 @@ to try, each behind a benchmark and a proof, roughly in order of expected payoff
    wasm-opt's memory packing removes it outright; at runtime the pages it initialises are the
    allocator's own state and are touched anyway, so the incremental cost is about 17 KB of
    retained module bytes. Not worth a null test on the allocation fast path (+0.3 ns in Liftoff).
-10. **Verification depth.** Kani harnesses for the heap's queue and direct-table invariants over
+10. **A `small-code` feature for size-sensitive LTO consumers.** With fat LTO the inlined
+    `alloc`/`dealloc` fast paths appear at every call site (18k sites in simlin, +1.46 MB raw,
+    +110 KB brotli) and buy 71 to 103 ms of a 1165 ms compile. Measured in
+    `docs/research/simlin-profile-o3.md`: `#[inline(never)]` on the three fast paths keeps 30
+    to 44 ms of that gain at +30 KB raw (+3 KB brotli). Offer it as a cargo feature, default
+    off; the README's LTO guidance should mention it.
+11. **Verification depth.** Kani harnesses for the heap's queue and direct-table invariants over
    a tiny simulated memory, ledger entries for every unsafe block in `heap.rs` and `global.rs`,
    and an adversarial review of all entries.
 
