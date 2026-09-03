@@ -666,3 +666,202 @@ fn model_profile_aimed_at_the_reviewed_paths() {
         assert!(stats.reallocs > 3_000, "{stats:?}");
     }
 }
+
+/// Third review, on the walk `Heap::realloc` runs before a run grows through memory or moves
+/// (R2-1's fix). The slice in the run's way is an empty medium page: the walk frees all four of
+/// its slices, `try_extend` claims the two the growth needs, and the other two stay free and
+/// serve the next page. The run's new tail, which now covers the old page header, is written
+/// over in full while the new page's block keeps its bytes: the two are disjoint.
+#[test]
+fn a_run_grows_into_part_of_a_released_medium_page() {
+    use wasmalloc::page;
+
+    let mut h = heap(64, 8, 0);
+    let four = layout(4 * SLICE_SIZE, 8);
+    let six = layout(6 * SLICE_SIZE, 8);
+    let medium = layout(MEDIUM_MAX_OBJ_SIZE, 8);
+    let small = layout(16, 8);
+    unsafe {
+        let r = h.alloc(four).unwrap();
+        let start = r.addr().get() / SLICE_SIZE;
+        fill(r, four.size(), 0x41);
+        // The other four initial slices become a medium page, then an empty, retired one.
+        let m = h.alloc(medium).unwrap();
+        assert_eq!(
+            page::header_of(PageKind::Medium, m.addr().get()) / SLICE_SIZE,
+            start + 4
+        );
+        h.dealloc(m, medium);
+        assert_eq!(
+            h.free_slices(),
+            0,
+            "the run and the page fill the initial memory"
+        );
+        let end = h.memory().size_slices();
+        let r2 = h.realloc(r, four, six.size()).unwrap();
+        assert_eq!(r2, r, "the run grew in place into the released page");
+        check(r2, four.size(), 0x41);
+        assert_eq!(h.memory().size_slices(), end, "no memory.grow");
+        assert_eq!(h.free_slices(), 2, "the page's other two slices are free");
+        fill(r2, six.size(), 0x42);
+        // The next small page takes the lowest free slice, right after the grown run.
+        let s = h.alloc(small).unwrap();
+        assert_eq!(
+            page::header_of(PageKind::Small, s.addr().get()) / SLICE_SIZE,
+            start + 6
+        );
+        assert_eq!(h.free_slices(), 1);
+        fill(s, 16, 0x43);
+        check(r2, six.size(), 0x42);
+        fill(r2, six.size(), 0x44);
+        check(s, 16, 0x43);
+        h.dealloc(s, small);
+        h.dealloc(r2, six);
+        assert_eq!(
+            h.free_slices(),
+            7,
+            "the run's six slices and the spare one; the small page is retired"
+        );
+    }
+}
+
+/// The slice in the run's way is an empty page at the top of memory and the growth needs more
+/// than that slice: the walk frees the page, and `extend_with_growth` claims its slice and
+/// grows memory for the rest, all in one realloc that keeps the block where it is. Afterwards
+/// the page is gone for good: the next request of its bin gets a page from fresh memory, not
+/// the block the old page handed out.
+#[test]
+fn a_run_grows_through_a_released_page_and_then_through_memory() {
+    use wasmalloc::page;
+
+    let mut h = heap(64, 4, 0);
+    let three = layout(3 * SLICE_SIZE, 8);
+    let six = layout(6 * SLICE_SIZE, 8);
+    let small = layout(16, 8);
+    unsafe {
+        let r = h.alloc(three).unwrap();
+        let start = r.addr().get() / SLICE_SIZE;
+        fill(r, three.size(), 0x51);
+        let a = h.alloc(small).unwrap();
+        assert_eq!(
+            page::header_of(PageKind::Small, a.addr().get()) / SLICE_SIZE,
+            start + 3
+        );
+        h.dealloc(a, small);
+        assert_eq!(h.free_slices(), 0);
+        let end = h.memory().size_slices();
+        let r2 = h.realloc(r, three, six.size()).unwrap();
+        assert_eq!(r2, r, "the run grew in place");
+        check(r2, three.size(), 0x51);
+        assert_eq!(
+            h.memory().size_slices(),
+            end + 2,
+            "the released slice plus the two missing ones, which is also the step"
+        );
+        assert_eq!(h.free_slices(), 0);
+        fill(r2, six.size(), 0x52);
+        let b = h.alloc(small).unwrap();
+        assert_eq!(
+            page::header_of(PageKind::Small, b.addr().get()) / SLICE_SIZE,
+            start + 6,
+            "the bin's page comes from fresh memory: the old one is part of the run"
+        );
+        assert_eq!(h.memory().size_slices(), end + 4);
+        check(r2, six.size(), 0x52);
+        h.dealloc(b, small);
+        h.dealloc(r2, six);
+    }
+}
+
+/// The walk runs only when the map alone cannot serve the growth: a run that grows into free
+/// slices keeps every retired page, so a size class that oscillates around empty keeps its page
+/// across the in-place growth of a buffer, which is what retirement is for.
+#[test]
+fn a_growth_served_by_the_map_keeps_retired_pages() {
+    use wasmalloc::page::{self, Page};
+
+    let mut h = heap(64, 8, 0);
+    let three = layout(3 * SLICE_SIZE, 8);
+    let five = layout(5 * SLICE_SIZE, 8);
+    let small = layout(16, 8);
+    unsafe {
+        let a = h.alloc(small).unwrap();
+        let page = h
+            .memory()
+            .ptr(page::header_of(PageKind::Small, a.addr().get()))
+            .cast::<Page>();
+        h.dealloc(a, small);
+        assert_eq!((*page).used, 0);
+        assert_ne!((*page).retire_expire, 0, "retired, not freed");
+        let r = h.alloc(three).unwrap();
+        assert_eq!(r.addr().get() / SLICE_SIZE, page as usize / SLICE_SIZE + 1);
+        fill(r, three.size(), 0x61);
+        assert_eq!(h.free_slices(), 4);
+        let end = h.memory().size_slices();
+        let r2 = h.realloc(r, three, five.size()).unwrap();
+        assert_eq!(r2, r);
+        check(r2, three.size(), 0x61);
+        assert_eq!(h.memory().size_slices(), end);
+        assert_eq!(h.free_slices(), 2);
+        assert_eq!((*page).used, 0);
+        assert_ne!(
+            (*page).retire_expire,
+            0,
+            "the retired page survived a growth the map served"
+        );
+        let b = h.alloc(small).unwrap();
+        assert_eq!(b, a, "the retired page still serves its bin");
+        h.dealloc(b, small);
+        h.dealloc(r2, five);
+    }
+}
+
+/// The slice in the run's way is a page in use, so the run has to move. The walk runs anyway
+/// and frees an empty page above the blocker, which joins the free tail, and the moved run
+/// lands at the bottom of that longer tail without a `memory.grow`. The run's bytes and the
+/// live page's block both survive, and the run's old slices are free afterwards.
+#[test]
+fn a_blocked_run_moves_into_the_tail_a_released_page_extends() {
+    use wasmalloc::page;
+
+    let mut h = heap(64, 8, 0);
+    let two = layout(2 * SLICE_SIZE, 8);
+    let five = layout(5 * SLICE_SIZE, 8);
+    let live = layout(24, 8);
+    let small = layout(16, 8);
+    unsafe {
+        let r = h.alloc(two).unwrap();
+        let start = r.addr().get() / SLICE_SIZE;
+        fill(r, two.size(), 0x71);
+        let b = h.alloc(live).unwrap();
+        assert_eq!(
+            page::header_of(PageKind::Small, b.addr().get()) / SLICE_SIZE,
+            start + 2
+        );
+        fill(b, 24, 0x72);
+        let a = h.alloc(small).unwrap();
+        assert_eq!(
+            page::header_of(PageKind::Small, a.addr().get()) / SLICE_SIZE,
+            start + 3
+        );
+        h.dealloc(a, small);
+        assert_eq!(h.free_slices(), 4, "the tail above the retired page");
+        let end = h.memory().size_slices();
+        // Five slices: the tail alone is one short, the tail plus the released slice fits.
+        let r2 = h.realloc(r, two, five.size()).unwrap();
+        assert_ne!(r2, r, "a page in use blocks the growth");
+        assert_eq!(
+            r2.addr().get() / SLICE_SIZE,
+            start + 3,
+            "the run moved into the released page's slice and the tail"
+        );
+        check(r2, two.size(), 0x71);
+        check(b, 24, 0x72);
+        assert_eq!(h.memory().size_slices(), end, "no memory.grow");
+        assert_eq!(h.free_slices(), 2, "the old run's slices");
+        fill(r2, five.size(), 0x73);
+        check(b, 24, 0x72);
+        h.dealloc(b, live);
+        h.dealloc(r2, five);
+    }
+}

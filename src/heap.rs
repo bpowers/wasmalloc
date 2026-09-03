@@ -1801,6 +1801,162 @@ mod tests {
         validate(h);
     }
 
+    /// The walk from `realloc` frees the page in a run's way, then another party's growth
+    /// leaves a foreign slice between the released page and the end of memory: the run is no
+    /// longer at the top, `extend_with_growth` refuses without growing, and the block moves.
+    /// The released page's slice and the run's old slices are free afterwards, the foreign
+    /// slice never enters the map, and the bytes survive the move.
+    #[test]
+    fn a_released_page_stays_free_when_the_run_cannot_grow_after_all() {
+        let mut f = heap(64, 4, 0);
+        let h = &mut f.heap;
+        let three = layout(3 * SLICE_SIZE, 8);
+        let six = layout(6 * SLICE_SIZE, 8);
+        let small = layout(16, 8);
+        let qi = bins::bin(16) as usize;
+        unsafe {
+            let r = h.alloc(three).unwrap();
+            let start = r.as_ptr() as usize / SLICE_SIZE;
+            fill(r, three.size(), 0x81);
+            let a = h.alloc(small).unwrap();
+            assert_eq!(
+                page::header_of(PageKind::Small, a.as_ptr() as usize) / SLICE_SIZE,
+                start + 3
+            );
+            h.dealloc(a, small);
+            assert_eq!(h.queues[qi].count, 1, "retired, not freed");
+            let end = h.mem.size_slices();
+            assert!(h.mem.skip_slices(1));
+            let r2 = h.realloc(r, three, six.size()).unwrap();
+            assert_ne!(
+                r2, r,
+                "a foreign slice above the released page blocks the growth"
+            );
+            check(r2, three.size(), 0x81);
+            assert_eq!(
+                h.queues[qi].count, 0,
+                "the empty page went before memory grew"
+            );
+            for s in 0..4 {
+                assert!(
+                    h.slices.is_free(start + s),
+                    "slice {s} of the old run and the page"
+                );
+            }
+            assert!(
+                !h.slices.is_free(end),
+                "the foreign slice never enters the map"
+            );
+            assert_eq!(r2.as_ptr() as usize / SLICE_SIZE, end + 1);
+            assert_eq!(h.mem.size_slices(), end + 1 + 6, "grew by the moved run");
+            validate(h);
+            h.dealloc(r2, six);
+        }
+        validate(h);
+    }
+
+    /// Memory growth driven by runs: `Heap::realloc` grows a run at the top of the heap in
+    /// place through `memory.grow`, or moves it through `alloc_huge`, and on either road the
+    /// walk runs first (review finding R2-1), so no bin queue holds an empty page when memory
+    /// grows. Three buffers grow by realloc in turn while six size classes churn around empty,
+    /// so retired pages keep appearing between growths. After every Huge-to-Huge realloc that
+    /// grew memory the bin queues are censused: such a realloc frees only a run after the
+    /// growth, so an empty page found then survived the release.
+    #[test]
+    fn a_growth_driven_by_a_run_realloc_finds_no_empty_page() {
+        let mut f = heap(1024, 8, 0);
+        let h = &mut f.heap;
+        let mut state = 0x5eed_0000_c0ff_ee01u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut below = |n: u64| (next() >> 11) % n;
+        let classes = [16usize, 48, 96, 200, 1000, 3000];
+        let mut small: Vec<Vec<NonNull<u8>>> = classes.iter().map(|_| Vec::new()).collect();
+        let mut bufs: [Option<(NonNull<u8>, usize, u8)>; 3] = [None; 3];
+        let (mut in_place, mut moved) = (0, 0);
+        for step in 0..30_000 {
+            unsafe {
+                // A class with fewer than three blocks gains one on a coin toss, otherwise it
+                // loses one: pages of every class empty and refill all the time.
+                let c = below(classes.len() as u64) as usize;
+                let l = layout(classes[c], 8);
+                if small[c].len() < 3 && below(2) == 0 {
+                    small[c].push(h.alloc(l).unwrap());
+                } else if let Some(p) = small[c].pop() {
+                    h.dealloc(p, l);
+                }
+                if step % 3 == 0 {
+                    let k = below(bufs.len() as u64) as usize;
+                    let end = h.mem.size_slices();
+                    match bufs[k] {
+                        None => {
+                            let size = SLICE_SIZE + 1 + below(SLICE_SIZE as u64) as usize;
+                            let p = h.alloc(layout(size, 8)).unwrap();
+                            let tag = below(256) as u8;
+                            fill(p, size, tag);
+                            bufs[k] = Some((p, size, tag));
+                        }
+                        Some((p, size, tag)) if size > 24 * SLICE_SIZE => {
+                            check(p, size, tag);
+                            h.dealloc(p, layout(size, 8));
+                            bufs[k] = None;
+                        }
+                        Some((p, size, tag)) => {
+                            let new_size = size + size / 2;
+                            let q = h.realloc(p, layout(size, 8), new_size).unwrap();
+                            check(q, size, tag);
+                            let tag = tag.wrapping_add(1);
+                            fill(q, new_size, tag);
+                            bufs[k] = Some((q, new_size, tag));
+                            if h.mem.size_slices() > end {
+                                if q == p {
+                                    in_place += 1;
+                                } else {
+                                    moved += 1;
+                                }
+                                for qi in 1..=MAX_BIN as usize {
+                                    let mut cur = h.queues[qi].first;
+                                    while cur != 0 {
+                                        let page = h.page_at(cur);
+                                        assert_ne!(
+                                            (*page).used,
+                                            0,
+                                            "step {step}: an empty page of bin {qi} survived the release before a run grew memory"
+                                        );
+                                        cur = (*page).next;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if step % 2999 == 0 {
+                validate(h);
+            }
+        }
+        assert!(
+            in_place >= 10 && moved >= 3,
+            "runs grew memory in place {in_place} times and by moving {moved} times"
+        );
+        unsafe {
+            for (p, size, tag) in bufs.into_iter().flatten() {
+                check(p, size, tag);
+                h.dealloc(p, layout(size, 8));
+            }
+            for (c, blocks) in small.into_iter().enumerate() {
+                for p in blocks {
+                    h.dealloc(p, layout(classes[c], 8));
+                }
+            }
+        }
+        validate(h);
+    }
+
     #[test]
     fn a_run_that_cannot_extend_moves_to_the_top_of_the_heap() {
         let mut f = heap(256, 4, 0);

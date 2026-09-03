@@ -404,8 +404,11 @@ followed by `self.dealloc(ptr, layout)`.
   (content checks across every move), and in `tests/review_edge_cases.rs`
   `in_place_run_growth_releases_every_empty_page_before_memory_grows` (the R2-1 reproducer,
   asserting the property). Miri as above.
-- Not machine-checked by Kani: the copy on a move (the model has no block bodies); tests and
-  the model tester check contents.
+- Not machine-checked by Kani: the copy on a move (the model has no block bodies), and the
+  `release_empty_pages` call from `realloc` (the model has one slice, so no run can sit beside a
+  page; the HEAP-07 harnesses named under Changes reach the walk from `acquire_run` and directly,
+  never from `realloc`, R3-2); tests and the model tester check contents, and the tests named
+  above check the walk from `realloc`.
 - Changes: 2026-09-02, tuning-c: the direct-index shortcut above (safe code before the unsafe
   blocks), the new Layout classified once and reused for the move, and `#[inline(always)]` on
   `bins::classify`, `fits_in_place` and `huge_slices` (no semantic change; at `opt-level = "z"`
@@ -430,6 +433,27 @@ followed by `self.dealloc(ptr, layout)`.
   `realloc_shortcut_after_an_in_place_shrink_keeps_contents` shows the chain with contents checked
   and the block freed through the final Layout). Kani `realloc_in_place_keeps_the_kind_and_fits`
   re-run.
+- Reviewer: adversarial-reviewer-3, 2026-09-02: accepted (the R2-1 change). Re-derived: at the
+  call `realloc` holds `ptr`, `layout`, `start`, `old_n`, `new_n` and `extra`, all functions of
+  its arguments, and no page pointer. The block is a live run, so its slices are claimed and are
+  no page's (pages and runs are disjoint hand-outs of the map); the walk visits bin-queue members
+  only (`occupied & BIN_QUEUE_BITS`, never the full queue), writes only headers, links, the direct
+  table and the map, and frees only the slices of empty pages, which no block and, after
+  `remove`, no direct entry refers to. So the walk can neither free nor write the run, and the
+  `try_extend` and `grow_and_extend` that follow claim only free slices directly after the run or
+  fresh ones (`slices::verify`), so a run never overlaps a page released in the same call. The
+  released slices enter the run dirty (their zero bits went when the page claimed them), which is
+  fine because `realloc` never treats a claimed tail as zero. The old bytes are untouched on the
+  in-place roads (`grow` zero-fills only the fresh region above the end of memory) and copied
+  before the old run is freed on the move. Every caller of `slices::acquire`,
+  `slices::extend_with_growth` and `Memory::grow` in `src/heap.rs` (`acquire_run`, this call,
+  and the move through `acquire_run`) runs the walk first; the only other `grow` is the proof
+  model's `prepared_page`. Tests added (below, R3): the walk from `realloc` against a medium
+  page, a page at the top with a `memory.grow` after it, a foreign slice above the released
+  page, a live blocker with the freed page lengthening the tail, a growth the map serves (no
+  walk, the retired page survives), and a census of the bin queues after every run-driven
+  growth. The four HEAP-07 harnesses re-run, one per invocation; none reaches this call (R3-2).
+  One performance note, R3-1.
 
 ### HEAP-04: `alloc_generic`, `alloc_huge` and `acquire_run`, the slow-path hand-out
 
@@ -715,6 +739,11 @@ assertion that the candidate is not empty), the `extend` of the candidate, the
   afterwards is exact. Kani `a_forced_collection_frees_a_retired_page`,
   `an_unforced_collection_ages_a_retired_page`, `freeing_the_last_block_retires_the_page`,
   `freeing_any_live_block_preserves_invariants` re-run, one per invocation (R2-2).
+- Reviewer: adversarial-reviewer-3, 2026-09-02: accepted; the R2-1 caveat is resolved (HEAP-03).
+  Every caller of `slices::acquire`, `slices::extend_with_growth` and `Memory::grow` in
+  `src/heap.rs` runs the walk first, and test `a_growth_driven_by_a_run_realloc_finds_no_empty_page`
+  censuses the bin queues after every Huge-to-Huge realloc that grew memory, in place or by a
+  move. The walk itself is unchanged; the four harnesses above re-run, one per invocation.
 
 ### HEAP-08: header reads in `needs_transition` and `mostly_used`
 
@@ -1104,3 +1133,74 @@ every alignment, the sizes where the rounded size crosses each boundary (`b - a`
 and their neighbours) for every bin edge and both run boundaries (47 boundaries instead of 7):
 0.7 s alone, 2.7 s for the whole file, with the exhaustive scan over all 47 boundaries behind
 `WASMALLOC_EXHAUSTIVE=1` (107 s).
+
+## Review findings (third adversarial review, 2026-09-02)
+
+Reviewer: adversarial-reviewer-3 (did not write any of the code). Scope: commit b9bc9ce, the
+`release_empty_pages` call `Heap::realloc` makes before a run grows through memory or moves
+(HEAP-03, HEAP-07). Verdict: accepted; no memory-safety bug and no invariant violation, and the
+promise that every empty page is released before linear memory grows now holds on every road
+that grows memory. Ranked by severity.
+
+- R3-1 (performance, not soundness; recorded, not blocking): the walk now runs on every
+  Huge-to-Huge growth the map cannot serve, which includes every move of a run blocked by a live
+  neighbour, whereas before the change a move the free tail could serve did no walk at all. The
+  walk costs one header read per page in the bin queues, so a blocked realloc of a small run on
+  a heap with many pages pays for the pages, not for the run. Measured on the host (release
+  build, `SimHeap`, N small pages of 4 KiB blocks each in its bin queue with one free block, a
+  one-slice run blocked by a live page, an eight-slice free tail, headers warm in cache): the
+  realloc from one to two slices takes 0.8 us with 64 pages, 4 us with 1024, 14 us with 4096 and
+  28 us with 8192 (a 512 MiB heap of small pages), around a 64 KiB copy that costs about a
+  microsecond; cold headers in a browser cost more per page. A move the tail could serve also
+  frees every retired page now, so a class oscillating around empty pays a page initialisation
+  after it, negligible next to the copy that triggered it. Bounded (a buffer moves O(log n)
+  times) and invisible on the roofline heaps, which is why the commit's numbers are flat. Should
+  it ever matter, the walk can stay on the memory-growing roads: run it here only when the run
+  is at the top (`slices::run_is_free(tail, end - tail)`) and leave the move to `acquire_run`,
+  at the price of the in-place growth into a released neighbour that the commit measured.
+- R3-2 (ledger): HEAP-03 cited the four HEAP-07 harnesses as re-run for the new call, but none
+  of them reaches `realloc` (the model has one slice, so no run can sit beside a page), so the
+  call is covered by tests only; HEAP-03's "Not machine-checked" line now says so.
+
+Also examined, nothing found. The walk cannot touch the run being grown: a live run's slices are
+claimed and are no page's, the walk visits bin-queue members only and frees only the slices of
+empty pages. It cannot invalidate anything `realloc` computed: the start, the two lengths and
+both classes are functions of the arguments. After the walk, `try_extend` and `grow_and_extend`
+claim only free slices directly after the run or fresh ones (`slices::verify`), so a run never
+overlaps a page released in the same call, and the released slices enter the run dirty, which
+`realloc` never mistakes for zero. The old bytes are untouched on the in-place roads (the walk
+writes headers, links, the direct table and the map; `grow` zero-fills only the fresh region)
+and copied before the old run is freed on the move. Every caller of `slices::acquire`,
+`slices::extend_with_growth` and `Memory::grow` in `src/heap.rs` runs the walk first
+(`acquire_run`, `realloc`, and the move through `acquire_run`); the only other `grow` is the
+proof model's `prepared_page`.
+
+Tests added, all passing and all reaching the walk from `realloc`. In `heap::tests`:
+`a_released_page_stays_free_when_the_run_cannot_grow_after_all` (the walk frees the page, a
+foreign slice above it stops the growth, the block moves, the page's and the old run's slices
+are free, the foreign slice never enters the map) and
+`a_growth_driven_by_a_run_realloc_finds_no_empty_page` (three buffers grown by realloc while six
+classes churn around empty; after each of the 26 Huge-to-Huge reallocs that grew memory, 21 in
+place and 5 by a move, no bin queue holds an empty page). In `tests/review_edge_cases.rs`:
+`a_run_grows_into_part_of_a_released_medium_page` (two of a freed medium page's four slices join
+the run, the other two serve the next page, the run's new tail and that page's block are
+disjoint), `a_run_grows_through_a_released_page_and_then_through_memory` (the freed slice and a
+`memory.grow` in one realloc; the bin's next page comes from fresh memory),
+`a_growth_served_by_the_map_keeps_retired_pages` (a growth the map serves runs no walk: the
+retired page survives and still serves its bin) and
+`a_blocked_run_moves_into_the_tail_a_released_page_extends` (a live page blocks the run, the
+freed page lengthens the tail, the moved run needs no `memory.grow`, both blocks keep their
+bytes).
+
+Machine checks run for this review (worktree `review3`): `cargo test --test review_edge_cases`
+(14 tests), `cargo test --lib heap` (26 tests, on the host and under wasmtime for
+wasm32-wasip1), `cargo test --test model_heap` (6 profiles), `cargo fmt --check` and
+`cargo clippy --all-targets -- -D warnings` for the host and wasm32-wasip1; Kani
+`freeing_the_last_block_retires_the_page`, `an_unforced_collection_ages_a_retired_page`,
+`a_forced_collection_frees_a_retired_page` and `freeing_any_live_block_preserves_invariants`,
+one per `scripts/kani` invocation at `KANI_MEM=4G` (17 to 25 s, 1.6 to 3.8 GB peak), all
+successful, none of them modelling the new call (R3-2); Miri with `-Zmiri-strict-provenance`
+over `a_run_grows_in_place_into_an_empty_page_released_before_growth`,
+`a_released_page_stays_free_when_the_run_cannot_grow_after_all` and
+`realloc_grows_a_top_run_through_memory_growth`, clean; a 2-minute `model_heap` fuzz run under
+`scripts/memlimit -m 4G` (393 764 executions), clean.
