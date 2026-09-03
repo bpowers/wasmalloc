@@ -92,7 +92,10 @@ const RETIRE_MAX_PAGES: usize = 3;
 /// Candidate pages inspected after the first usable one when searching a queue
 /// (`mi_option_page_max_candidates`).
 const MAX_CANDIDATES: usize = 4;
-/// Retired pages are collected every this many slow-path allocations.
+/// Retired pages age every this many page searches: entries of `alloc_generic` that the bin
+/// queue's head cannot serve. A request above the direct table whose queue head has a free
+/// block is served without counting, so under such workloads the aging walk runs less often;
+/// what bounds the footprint is the release before memory grows, not this walk.
 const GENERIC_COLLECT_PERIOD: u32 = 1000;
 /// The largest bin the direct table serves; larger bins are found through their queue head.
 const DIRECT_MAX_BIN: u8 = bins::bin(DIRECT_MAX_SIZE);
@@ -319,8 +322,8 @@ impl<M: Memory, const WORDS: usize> Heap<M, WORDS> {
         let new_class = bins::classify(new_layout);
         match (bins::classify(layout), new_class) {
             // Same block if it fits. Shrinking in place is only allowed within the same page
-            // kind (the next dealloc recomputes the kind from the new Layout) and, as in
-            // mimalloc, only while the block stays at least half used.
+            // kind (the next dealloc recomputes the kind from the new Layout) and only down
+            // to half of the bin of the Layout the caller holds; see `fits_in_place`.
             (Class::Bin(old), Class::Bin(new)) if fits_in_place(old, new, new_size) => {
                 return Some(ptr);
             }
@@ -995,8 +998,14 @@ fn direct_size(layout: Layout) -> usize {
 /// bin `new` (the in-place decision of [`Heap::realloc`], kept pure so a proof can quantify over
 /// every pair of Layouts). Growing never fits: bins are tight, so `new > old` means the request
 /// exceeds the block. Shrinking stays in place only within the page kind, because the next
-/// `dealloc` recomputes the kind from the new Layout and masks the address with it, and, as in
-/// mimalloc, only while the block stays at least half used.
+/// `dealloc` recomputes the kind from the new Layout and masks the address with it, and only
+/// while `new_size` is at least half of `bin_size(old)`. That bound is half of the bin of the
+/// Layout the caller holds, not half of the block: after an in-place shrink the block may
+/// belong to a larger bin than the Layout names, so a chain of shrinks, each above half of the
+/// current bin, can walk a block down through every bin of its kind and hold a Layout far
+/// below the block's size until it is freed (review finding R2-3; mimalloc bounds by half of
+/// the block's usable size instead). Sound either way, since the block is always at least the
+/// Layout's bin; the difference is footprint.
 ///
 /// `#[inline(always)]`, like [`huge_slices`] and the `bins` arithmetic: at `opt-level = "z"`
 /// these were out-of-line calls on every `realloc` (`docs/research/simlin-profile.md`, 6).

@@ -369,7 +369,9 @@ followed by `self.dealloc(ptr, layout)`.
   contract (the alignment is a Layout's, hence a power of two). In place within a page:
   `fits_in_place(old, new, new_size)` implies `kind_of_bin(old) == kind_of_bin(new)` and
   `bin_size(old) >= round_up(new_size, align)` (Kani `realloc_in_place_keeps_the_kind_and_fits`,
-  over every pair of Layouts with `align <= MAX_NATURAL_ALIGN`), so the block holds every byte
+  over every pair of Layouts with `align <= MAX_NATURAL_ALIGN`; its shrink bound is half of
+  `bin_size(old)`, the bin of the Layout the caller holds, not half of the block, which may be
+  larger after earlier in-place shrinks, R2-3), so the block holds every byte
   the caller may use through the new Layout and a later `dealloc` or `realloc` with it masks with
   the same page size (HEAP-02); the alignment is unchanged. In place within a run: the length
   becomes `huge_slices(new_layout)`, which a later `dealloc` with the new Layout recomputes;
@@ -788,7 +790,11 @@ Blocks: `&mut *self.heap.get()`, and in each method the call into the heap, with
   page or run from the Layout the caller passes back (HEAP-02, HEAP-03); `realloc` preserves
   `min(old, new)` bytes and leaves the old block untouched on failure (HEAP-03); no method
   unwinds (GLOBAL-02). A zero-size request is undefined behaviour for the caller under the
-  contract; the implementation still returns a distinct 8-byte block.
+  contract; the implementation still returns a distinct block: for an alignment up to
+  `MAX_NATURAL_ALIGN` an 8-byte block of bin 1, aligned to 8 whatever the Layout asks
+  (`direct_size` rounds 0 to 0 and slot 0 is bin 1, HEAP-01), so it may not be aligned for the
+  Layout; for a larger alignment a one-slice run, aligned. Outside the contract either way, and
+  `dealloc` with the same Layout finds the page or the run (HEAP-02).
 - Machine checks: as GLOBAL-02; the model tester (`tests/model_heap.rs`, `tests/model_system.rs`
   against `System` for the tester's own soundness, `tests/model_mutants.rs` for its power).
 - Reviewer: adversarial-reviewer, 2026-09-02: accepted. Caveat: discharged among this allocator's
@@ -796,7 +802,7 @@ Blocks: `&mut *self.heap.get()`, and in each method the call into the heap, with
   2026-09-02 by BACKEND-02's per-target heap base.
 - Reviewer: adversarial-reviewer-2, 2026-09-02: accepted. R2-4: the zero-size remark should add that
   such a block is aligned to 8 whatever the Layout's alignment (HEAP-01), still outside the
-  contract.
+  contract. Added on 2026-09-02.
 
 ## backend
 
@@ -1086,7 +1092,11 @@ grows memory or the block moves (HEAP-03, HEAP-07; the reproducer is now
 growing into a released page instead of moving). HEAP-03 awaits the reviewer's fresh look. R2-2
 stated at the top of the ledger, in the heap section's introduction and next to the first
 review's recipe: structural heap harnesses run one per `scripts/kani` invocation, which is what
-`scripts/kani-full` does and why.
+`scripts/kani-full` does and why. R2-3 worded in `fits_in_place`'s documentation, the
+`realloc` comment and HEAP-03 (the shrink bound is half of the held Layout's bin, not of the
+block), and in `GENERIC_COLLECT_PERIOD`'s documentation (it counts page searches, and the
+release before growth, not the aging walk, bounds the footprint). R2-4 added to GLOBAL-03's
+zero-size remark.
 
 Test speed (`class_boundaries_with_every_natural_alignment`): it scanned every size within
 `align + 1` of seven boundaries, 37 s here and up to 145 s on the CI runner. It now takes, for
